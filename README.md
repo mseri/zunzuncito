@@ -85,9 +85,9 @@ Expect it to take a while though, since it has to re-quantise every tensor.
 ./gemma4 ./g4 "explain MoE routing"
 ```
 
-The prompt is a positional argument (the last non-flag argument).
-Generation defaults to 2048 tokens unless `--max_tokens` overrides it.
-Omit the prompt to generate from bare BOS (it can actually be pretty fun...):
+The prompt is a positional argument (the last non-flag argument), and if 
+missing enters into an interactive multi-turn mode.
+Generation defaults to 2048 tokens unless `--max_tokens` overrides it:
 
 ```sh
 ./gemma4 ./g4 --max_tokens 100

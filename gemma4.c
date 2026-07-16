@@ -2100,19 +2100,14 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--metal")) use_metal = 1;
         else if (!strcmp(argv[i], "--check-gpu")) chk_gpu = 1;
         else if (!strcmp(argv[i], "--mtp")) use_mtp = 1;
+        else if (!prompt) prompt = argv[i];  /* first non-flag positional arg is the prompt */
     }
     /* Default K6/V4 + a 128-token f32 window: the ONLY configuration upstream
      * measured as EXACT on generation. K4/V2 is reachable (--kbits 4 --vbits 2) but
      * upstream's own corrected table has it MISSING the needle at 2K and 4K. */
     if (!kvq_on) kb = vb = 0;
-    /* If not serving, the prompt is a positional argument (the last non-flag arg). */
-    if (!serve_mode && !prompt) {
-        for (int i = argc - 1; i >= 2; i--) {
-            if (argv[i][0] != '-') { prompt = argv[i]; break; }
-        }
-    }
-    /* Default max_tokens when a prompt is given but --max_tokens was not set. */
-    if (!serve_mode && !check && prompt && max_tokens == 0) max_tokens = 2048;
+    /* Default max_tokens when a prompt is given (or interactive mode) but --max_tokens was not set. */
+    if (!serve_mode && !check && max_tokens == 0) max_tokens = 2048;
     if (draft > MAXDRAFT) draft = MAXDRAFT;
     if ((dpath || use_mtp) && draft <= 0) draft = 4;
 #ifdef _OPENMP
@@ -2296,137 +2291,243 @@ int main(int argc, char **argv) {
             if (getenv("G4DBG")) fprintf(stderr, "prompt: %s\n[%d tokens]\n", text, np);
             free(chat);
             if (np <= 0) { fprintf(stderr, "empty prompt\n"); return 1; }
-        } else {
-            ids[np++] = 2;                       /* bare BOS */
         }
 
-        /* ---- prefill: ONE batched forward. Batch-union means each layer reads
-         * each DISTINCT expert once, not topk times per token -- for a long prompt
-         * that is the difference between O(S*topk) and O(experts) reads. ---- */
-        double t0p = now();
-        forward(&m, ids, np, 0, logits, 1, b);
-        double tpre = now() - t0p;
-        long long pre_reads = m.hit + m.miss;
+        /* ---- interactive multi-turn chat (no prompt on command line) ---- */
+        int interactive = (!prompt && !check);
+        int *cached_ids = NULL;
+        int cached_len = 0, cached_cap = 0;
+        char *history = NULL;   /* accumulated chat template text */
+        size_t hist_len = 0, hist_cap = 0;
 
-        char piece[512];
-        int n = 0, steps = 0, acc_tot = 0;
-        float *dlog = dpath ? xmalloc(sizeof(float) * c->vocab) : NULL;
-        PI *dbuf = dpath ? xmalloc(sizeof(PI) * c->vocab) : NULL;
-        float *mlog = use_mtp ? xmalloc(sizeof(float) * c->vocab) : NULL;
-        PI *mbuf = use_mtp ? xmalloc(sizeof(PI) * c->vocab) : NULL;
-        int out[MAXDRAFT + 1];
+        if (interactive) {
+            if (!T) { fprintf(stderr, "interactive mode needs %s\n", tp); return 1; }
+            fprintf(stderr, "[chat] interactive mode (Ctrl-D to exit)\n");
+            fflush(stderr);
+        }
 
-        int dpos = 0;
-        if (dpath) { forward(&dm, ids, np, 0, dlog, 1, db); dpos = np; }   /* drafter prefill */
-        /* Decode timing begins after all prefill work, including the optional
-         * drafter prefill. */
-        double t = now();
+        double tpre = 0;
+        long long pre_reads = 0;
 
-        /* MTP keeps its own state: the last token's KV is not yet in the target, and
-         * hprev is the target hidden ONE POSITION BEFORE it. Its loop is separate
-         * because it does not need (or want) the resync forward the others use. */
-        if (use_mtp) {
-            float *hprev = xmalloc(sizeof(float) * c->hidden);
-            /* h_{np-1}: the LAST row of the prefill. hid_batch holds every row for a
-             * short prefill and only the final row for a long one, so index by
-             * hid_rows rather than assuming row 0. */
-            memcpy(hprev, m.hid_batch + (size_t)(m.hid_rows - 1) * c->hidden,
-                   sizeof(float) * c->hidden);
-
-            /* the first token comes from the prefill's own logits; its KV is pending */
-            int tok0 = sample(logits, c->vocab, temp, topp, topk, pbuf, &rng);
-            if (!(tok0 == 1 || tok0 == 106)) {
-                if (T) { g4tok_decode(T, &tok0, 1, piece, sizeof piece); fputs(piece, stdout); }
-                else printf("%d ", tok0);
+        for (;;) {
+            if (interactive) {
+                /* Read one line of user input. */
+                fprintf(stdout, "> ");
                 fflush(stdout);
-                ids[np + n] = tok0;
-                n++;
+                char line[4096];
+                if (!fgets(line, sizeof line, stdin)) break;  /* Ctrl-D / EOF */
+                size_t len = strlen(line);
+                while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+                    line[--len] = 0;
+                if (!len) continue;  /* empty line */
+
+                /* Build the full chat template text from history + new turn. */
+                size_t need = hist_len + len + 256;
+                char *chat = xmalloc(need);
+                size_t pos = 0;
+                if (hist_len) {
+                    memcpy(chat, history, hist_len);
+                    pos = hist_len;
+                }
+                if (!pos) {
+                    /* First turn: include system message if any. */
+                    pos += snprintf(chat + pos, need - pos, "<bos>");
+                    if (think || (sys && *sys)) {
+                        pos += snprintf(chat + pos, need - pos, "<|turn>system\n");
+                        if (think) pos += snprintf(chat + pos, need - pos, "<|think|>\n");
+                        if (sys && *sys) pos += snprintf(chat + pos, need - pos, "%s", sys);
+                        pos += snprintf(chat + pos, need - pos, "<turn|>\n");
+                    }
+                }
+                pos += snprintf(chat + pos, need - pos, "<|turn>user\n%s<turn|>\n", line);
+                pos += snprintf(chat + pos, need - pos, "<|turn>model\n");
+                if (!think) pos += snprintf(chat + pos, need - pos, "<|channel>thought\n<channel|>");
+
+                /* Encode the full prompt. */
+                np = g4tok_encode(T, chat, ids, c->ctx - max_tokens);
+                if (getenv("G4DBG")) fprintf(stderr, "prompt: %s\n[%d tokens]\n", chat, np);
+                if (np <= 0) { free(chat); continue; }
+
+                /* Update history: append the user turn + model prefix. */
+                if (!hist_cap) { hist_cap = 4096; history = xmalloc(hist_cap); }
+                while (hist_cap < pos + 256) { hist_cap *= 2; history = realloc(history, hist_cap); }
+                memcpy(history, chat, pos);
+                hist_len = pos;
+                free(chat);
+
+                /* Context caching: find common prefix with previous turn. */
+                int common = 0;
+                while (common < cached_len && common < np && cached_ids[common] == ids[common])
+                    common++;
+                if (common == np && np > 0) {
+                    forward(&m, &ids[np - 1], 1, np - 1, logits, 1, b);
+                } else {
+                    forward(&m, ids + common, np - common, common, logits, 1, b);
+                }
+            } else {
+                /* ---- one-shot prefill (prompt given on command line) ---- */
+                double t0p = now();
+                forward(&m, ids, np, 0, logits, 1, b);
+                tpre = now() - t0p;
+                pre_reads = m.hit + m.miss;
+            }
+
+            char piece[512];
+            int n = 0, steps = 0, acc_tot = 0;
+            float *dlog = dpath ? xmalloc(sizeof(float) * c->vocab) : NULL;
+            PI *dbuf = dpath ? xmalloc(sizeof(PI) * c->vocab) : NULL;
+            float *mlog = use_mtp ? xmalloc(sizeof(float) * c->vocab) : NULL;
+            PI *mbuf = use_mtp ? xmalloc(sizeof(PI) * c->vocab) : NULL;
+            int out[MAXDRAFT + 1];
+
+            int dpos = 0;
+            if (dpath) { forward(&dm, ids, np, 0, dlog, 1, db); dpos = np; }
+            double t = now();
+
+            if (use_mtp) {
+                float *hprev = xmalloc(sizeof(float) * c->hidden);
+                memcpy(hprev, m.hid_batch + (size_t)(m.hid_rows - 1) * c->hidden,
+                       sizeof(float) * c->hidden);
+
+                int tok0 = sample(logits, c->vocab, temp, topp, topk, pbuf, &rng);
+                if (!(tok0 == 1 || tok0 == 106)) {
+                    if (T) { g4tok_decode(T, &tok0, 1, piece, sizeof piece); fputs(piece, stdout); }
+                    else printf("%d ", tok0);
+                    fflush(stdout);
+                    ids[np + n] = tok0;
+                    n++;
+                }
+
+                while (n < max_tokens) {
+                    int d = draft;
+                    if (n + d > max_tokens) d = max_tokens - n;
+                    if (d < 1) d = 1;
+                    int acc = 0;
+                    int P = np + n - 1;
+                    int got = mtp_step(&m, b, mb, ids, P, hprev, mlog,
+                                       d, temp, topp, topk, pbuf, mbuf, &rng, out, &acc);
+                    steps++;
+                    acc_tot += acc;
+
+                    int stop = 0;
+                    for (int i = 0; i < got && n < max_tokens; i++) {
+                        int tk = out[i];
+                        if (tk == 1 || tk == 106) { stop = 1; break; }
+                        if (T) { g4tok_decode(T, &tk, 1, piece, sizeof piece); fputs(piece, stdout); }
+                        else printf("%d ", tk);
+                        ids[np + n] = tk;
+                        n++;
+                    }
+                    fflush(stdout);
+                    if (stop) break;
+                }
+                free(hprev);
+                goto done_decode;
             }
 
             while (n < max_tokens) {
-                int d = draft;
-                if (n + d > max_tokens) d = max_tokens - n;
-                if (d < 1) d = 1;
-                int acc = 0;
-                int P = np + n - 1;                  /* index of the last (pending) token */
-                int got = mtp_step(&m, b, mb, ids, P, hprev, mlog,
-                                   d, temp, topp, topk, pbuf, mbuf, &rng, out, &acc);
-                steps++;
-                acc_tot += acc;
+                int got, acc = 0;
+                if (dpath) {
+                    int d = draft;
+                    if (n + d > max_tokens) d = max_tokens - n;
+                    if (d < 1) d = 1;
+                    got = spec_step(&m, &dm, b, db, ids, np + n, &dpos, logits, dlog,
+                                    d, temp, topp, topk, pbuf, dbuf, &rng, out, &acc);
+                    steps++;
+                    acc_tot += acc;
+
+                } else {
+                    out[0] = sample(logits, c->vocab, temp, topp, topk, pbuf, &rng);
+                    got = 1;
+                }
 
                 int stop = 0;
                 for (int i = 0; i < got && n < max_tokens; i++) {
-                    int tk = out[i];
-                    if (tk == 1 || tk == 106) { stop = 1; break; }
-                    if (T) { g4tok_decode(T, &tk, 1, piece, sizeof piece); fputs(piece, stdout); }
-                    else printf("%d ", tk);
-                    ids[np + n] = tk;
+                    int tok = out[i];
+                    if (tok == 1 || tok == 106) { stop = 1; break; }
+                    if (T) {
+                        g4tok_decode(T, &tok, 1, piece, sizeof piece);
+                        fputs(piece, stdout);
+                    } else printf("%d ", tok);
+                    ids[np + n] = tok;
                     n++;
                 }
                 fflush(stdout);
                 if (stop) break;
+
+                if (n < max_tokens) {
+                    int last = ids[np + n - 1];
+                    forward(&m, &last, 1, np + n - 1, logits, 1, b);
+                }
             }
-            free(hprev);
-            goto done_decode;
-        }
+        done_decode:;
+            double el = now() - t;
 
-        while (n < max_tokens) {
-            int got, acc = 0;
-            if (dpath) {
-                int d = draft;
-                if (n + d > max_tokens) d = max_tokens - n;
-                if (d < 1) d = 1;
-                got = spec_step(&m, &dm, b, db, ids, np + n, &dpos, logits, dlog,
-                                d, temp, topp, topk, pbuf, dbuf, &rng, out, &acc);
-                steps++;
-                acc_tot += acc;
+            if (interactive) {
+                /* Accumulate the assistant response into history. */
+                printf("\n");
+                fflush(stdout);
+                /* Append the generated tokens (as text) to history. */
+                char *resp = xmalloc((size_t)n * 16 + 256);
+                size_t rlen = 0;
+                for (int i = 0; i < n; i++) {
+                    char piece2[64];
+                    int pn = g4tok_decode(T, &ids[np + i], 1, piece2, sizeof piece2 - 1);
+                    if (pn > 0 && rlen + (size_t)pn < (size_t)n * 16 + 256 - 16) {
+                        memcpy(resp + rlen, piece2, (size_t)pn);
+                        rlen += (size_t)pn;
+                    }
+                }
+                resp[rlen] = 0;
 
+                /* Extend history: append the assistant response + turn end. */
+                size_t add = rlen + strlen("<turn|>\n");
+                while (hist_cap < hist_len + add + 1) {
+                    hist_cap *= 2;
+                    history = realloc(history, hist_cap);
+                }
+                memcpy(history + hist_len, resp, rlen);
+                hist_len += rlen;
+                memcpy(history + hist_len, "<turn|>\n", strlen("<turn|>\n"));
+                hist_len += strlen("<turn|>\n");
+                history[hist_len] = 0;
+                free(resp);
+
+                /* Update the token cache for next turn. */
+                int final_len = np + n;
+                if (n > 0)
+                    forward(&m, &ids[final_len - 1], 1, final_len - 1, logits, 1, b);
+                if (final_len > cached_cap) {
+                    int cap = cached_cap ? cached_cap : 256;
+                    while (cap < final_len) cap *= 2;
+                    int *c = realloc(cached_ids, (size_t)cap * sizeof *c);
+                    if (c) { cached_ids = c; cached_cap = cap; }
+                }
+                if (cached_ids && final_len <= cached_cap) {
+                    memcpy(cached_ids, ids, (size_t)final_len * sizeof *ids);
+                    cached_len = final_len;
+                }
             } else {
-                out[0] = sample(logits, c->vocab, temp, topp, topk, pbuf, &rng);
-                got = 1;
+                /* One-shot: print stats. */
+                long long tot = m.hit + m.miss;
+                printf("\n\nprefill %d tok in %.2fs (%.1f tok/s, %lld expert reads)\n",
+                       np, tpre, np / tpre, pre_reads);
+                printf("decode  %d tok in %.2fs (%.2f tok/s)\n", n, el, n / el);
+                if ((dpath || use_mtp) && steps)
+                    printf("speculation: %.1f%% acceptance, %.2f tok/target-forward\n",
+                           100.0 * acc_tot / (double)(steps * draft),
+                           n / (double)steps);
+                printf("expert cache: %.1f%% hit (%lld reads total, %d pinned/layer)\n",
+                       100.0 * m.hit / (tot ? tot : 1), tot, m.npin);
+                pin_save(&m);
             }
 
-            int stop = 0;
-            for (int i = 0; i < got && n < max_tokens; i++) {
-                int tok = out[i];
-                if (tok == 1 || tok == 106) { stop = 1; break; }  /* eos from config */
-                if (T) {
-                    g4tok_decode(T, &tok, 1, piece, sizeof piece);
-                    fputs(piece, stdout);
-                } else printf("%d ", tok);
-                ids[np + n] = tok;
-                n++;
-            }
-            fflush(stdout);
-            if (stop) break;
+            free(dlog); free(dbuf); free(mlog); free(mbuf);
 
-            /* Re-sync both models on the LAST emitted token only when another
-             * token is needed. After speculation the target's KV is already correct
-             * for every ACCEPTED position, but its logits correspond to the last
-             * verified position -- and the drafter's KV diverged wherever we
-             * rejected. One forward puts the target back on the accepted prefix.
-             * The final-token resync is unnecessary and must not count as decode. */
-            if (n < max_tokens) {
-                int last = ids[np + n - 1];
-                forward(&m, &last, 1, np + n - 1, logits, 1, b);
-            }
-            /* the drafter is NOT resynced here: spec_step's dpos catch-up feeds it
-             * exactly the accepted prefix on the next call, which is the only
-             * context it may legally condition on. */
+            if (!interactive) break;
         }
-    done_decode:;
-        double el = now() - t;
-        long long tot = m.hit + m.miss;
-        printf("\n\nprefill %d tok in %.2fs (%.1f tok/s, %lld expert reads)\n",
-               np, tpre, np / tpre, pre_reads);
-        printf("decode  %d tok in %.2fs (%.2f tok/s)\n", n, el, n / el);
-        if ((dpath || use_mtp) && steps)
-            printf("speculation: %.1f%% acceptance, %.2f tok/target-forward\n",
-                   100.0 * acc_tot / (double)(steps * draft),
-                   n / (double)steps);
-        printf("expert cache: %.1f%% hit (%lld reads total, %d pinned/layer)\n",
-               100.0 * m.hit / (tot ? tot : 1), tot, m.npin);
-        pin_save(&m);
+        free(cached_ids);
+        free(history);
     }
     return 0;
 }
