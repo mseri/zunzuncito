@@ -2029,22 +2029,33 @@ static int run_g4_server(M *m, Buf *buffers, G4Tok *tokenizer, const char *model
 }
 
 /* ------------------------------------------------------------------ main */
+static void usage(const char *prog, FILE *out) {
+    fprintf(out,
+        "usage: %s <dir> [flags...] [prompt]\n"
+        "         [--system S] [--think] [--raw] [--max_tokens N]\n"
+        "         [--temp F] [--topp F] [--topk N]   (default 1.0 / 0.95 / 64)\n"
+        "         [--pin N] [--draft DIR] [--ndraft N]\n"
+        "         [--mtp]\n"
+        "         [--io N] [--check] [--nobatch] [--threads N]\n"
+        "         [--metal] [--check-gpu]   Metal is OFF by default (it is slower)\n"
+        "         [--serve] [--port N]    OpenAI-compatible local server (default 8484)\n"
+        "         [--kv off|k6v4|k4v2]   KV-cache compression preset\n"
+        "         [--kvq] [--kbits N] [--vbits N] [--rwin N] [--protect N] [--pbits N]\n"
+        "                                override individual TurboQuant settings\n"
+        "         [--help]\n",
+        prog);
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr,
-            "usage: %s <dir> [flags...] [prompt]\n"
-            "         [--system S] [--think] [--raw] [--max_tokens N]\n"
-            "         [--temp F] [--topp F] [--topk N]   (default 1.0 / 0.95 / 64)\n"
-            "         [--pin N] [--draft DIR] [--ndraft N]\n"
-            "         [--mtp]\n"
-            "         [--io N] [--check] [--nobatch] [--threads N]\n"
-            "         [--metal] [--check-gpu]   Metal is OFF by default (it is slower)\n"
-            "         [--serve] [--port N]    OpenAI-compatible local server (default 8484)\n"
-            "         [--kv off|k6v4|k4v2]   KV-cache compression preset\n"
-            "         [--kvq] [--kbits N] [--vbits N] [--rwin N] [--protect N] [--pbits N]\n"
-            "                                override individual TurboQuant settings\n",
-            argv[0]);
+        usage(argv[0], stderr);
         return 1;
+    }
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
+            usage(argv[0], stdout);
+            return 0;
+        }
     }
     const char *dir = argv[1];
     const char *prompt = NULL, *sys = NULL;
@@ -2100,6 +2111,11 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--metal")) use_metal = 1;
         else if (!strcmp(argv[i], "--check-gpu")) chk_gpu = 1;
         else if (!strcmp(argv[i], "--mtp")) use_mtp = 1;
+        else if (argv[i][0] == '-' && argv[i][1] == '-') {
+            fprintf(stderr, "unknown flag: %s\n\n", argv[i]);
+            usage(argv[0], stderr);
+            return 1;
+        }
         else if (!prompt) prompt = argv[i];  /* first non-flag positional arg is the prompt */
     }
     /* Default K6/V4 + a 128-token f32 window: the ONLY configuration upstream
