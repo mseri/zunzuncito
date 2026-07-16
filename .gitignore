@@ -1,0 +1,9 @@
+metal.o
+g4/
+g4-asst/
+gemma4
+gemma4-exact
+test_kvq
+test_metal_sim
+test_q40
+venv/
