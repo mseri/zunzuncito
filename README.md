@@ -6,8 +6,6 @@ Gemma-4 26B-A4B is ~25 B params of which only ~3.8 B activate per token.
 At q4_0 that splits into **1.3 GB of dense weights** (resident) and **12.9 GB of routed experts** (3840 of them, 3.19 MiB each).
 On a 4–8 GB machine the experts don't fit, so we stream them from disk with an expert-granular cache instead of leaving it to the OS page cache.
 
-Note the cli does not implement tool calling, and vision is not implemented at all.
-
 This engine tries to make it as fast as possible mainly with the following tricks (and more):
 
 1. **Exact prefetch.** Gemma-4's router reads the *raw post-attention residual*, so
@@ -24,10 +22,10 @@ This engine tries to make it as fast as possible mainly with the following trick
 MTP speculative decoding is implemented, but on my system the IO slowdown makes it useless.
 
 Note that this is useful only if you have 4–8 GB of RAM.
-With 16 GB you are better off using llama.cpp, though I get similar
-performances on my system by tuning the IO threads (`--io`) and the compute
-threads (`--threads`), see below, and I can keep a lot more ram free also
-at high context (TurboQuant is implemented for the KV and works quite well).
+With 16 GB you are better off using llama.cpp, though I get similar performances on my system by tuning the IO threads (`--io`) and the compute threads (`--threads`), see below, and I can keep a lot more ram free also at high context (TurboQuant is implemented for the KV and works quite well).
+
+This is the pure-text model: vision is not implemented at all. Moreover the cli does NOT implement tool calling.
+
 
 ## Build
 
