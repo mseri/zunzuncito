@@ -9,15 +9,15 @@ On a 4–8 GB machine the experts don't fit, so we stream them from disk with an
 This engine tries to make it as fast as possible mainly with the following tricks (and more):
 
 1. **Exact prefetch.** Gemma-4's router reads the *raw post-attention residual*, so
-   the 8 expert IDs for a layer are known **before** the dense MLP runs. We route
+   the 8 expert IDs for a layer are known before the dense MLP runs. We route
    first, fire the reads, then compute the MLP while they're in flight. In
    this way there is no need to make a prediction.
 2. **Batch-union MoE.** The S tokens of a prefill batch collectively route to at most
-   `min(128, 8·S)` distinct experts per layer. We read each **once**. A 512-token
+   `min(128, 8·S)` distinct experts per layer. We read each once so a 512-token
    prompt drops from 122,880 expert reads to ≤3,840.
 3. **A learned pin set.** Expert usage is heavily skewed and stable across prompts.
    Routing counts persist to `usage.bin` and the next run pins the hot set into slots the
-   LRU may never evict. Measured on a constrained cache: **49.8% → 74.6% hit rate**.
+   LRU may never evict. Measured on a constrained cache one can easily reach 80% cache hits.
 
 MTP speculative decoding is implemented, but on my system the IO slowdown makes it useless.
 
@@ -93,7 +93,7 @@ interactive multi-turn session explicitly, use `--chat`:
 For compatibility, omitting the prompt also still enters interactive mode. If a
 positional prompt is supplied with `--chat`, it is used as the first user turn
 before reading subsequent turns from stdin. `--chat` cannot be combined with
-`--check` or `--serve`.
+`--serve`.
 Generation defaults to 2048 tokens unless `--max_tokens` overrides it:
 
 ```sh
@@ -145,7 +145,6 @@ Useful flags for the CLI generation:
 | `--pin N` | pin N experts/layer from `usage.bin`. Needs one prior run to learn |
 | `--draft DIR` `--ndraft N` | MTP speculative decoding against a drafter container |
 | `--io N` | I/O threads (default 8) |
-| `--check` | teacher-forcing validation against a reference |
 
 Pinning starts happening from the second run: on the first run the `usage.bin`
 is written, containing the necessary routing statistics for later runs to use.
