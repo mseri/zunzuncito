@@ -2032,7 +2032,7 @@ static int run_g4_server(M *m, Buf *buffers, G4Tok *tokenizer, const char *model
 static void usage(const char *prog, FILE *out) {
     fprintf(out,
         "usage: %s <dir> [flags...] [prompt]\n"
-        "         [--system S] [--think] [--raw] [--max_tokens N]\n"
+        "         [--chat] [--system S] [--think] [--raw] [--max_tokens N]\n"
         "         [--temp F] [--topp F] [--topk N]   (default 1.0 / 0.95 / 64)\n"
         "         [--pin N] [--draft DIR] [--ndraft N]\n"
         "         [--mtp]\n"
@@ -2059,7 +2059,7 @@ int main(int argc, char **argv) {
     }
     const char *dir = argv[1];
     const char *prompt = NULL, *sys = NULL;
-    int think = 0, raw = 0;
+    int think = 0, raw = 0, chat_mode = 0;
     int kvq_on = 0, kb = 6, vb = 4, rwin = 128, kv_protect = 2, kv_pbits = 8;
     int no_metal = 0, chk_gpu = 0, use_mtp = 0, use_metal = 0;
     int check = 0, n_io = 8, max_tokens = 0, nobatch = 0, npin = 0, draft = 0, nthreads = 2;
@@ -2083,6 +2083,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--draft") && i + 1 < argc) dpath = argv[++i];
         else if (!strcmp(argv[i], "--ndraft") && i + 1 < argc) draft = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--system") && i + 1 < argc) sys = argv[++i];
+        else if (!strcmp(argv[i], "--chat")) chat_mode = 1;
         else if (!strcmp(argv[i], "--think")) think = 1;
         else if (!strcmp(argv[i], "--raw")) raw = 1;
         else if (!strcmp(argv[i], "--kvq")) kvq_on = 1;
@@ -2122,6 +2123,16 @@ int main(int argc, char **argv) {
      * measured as EXACT on generation. K4/V2 is reachable (--kbits 4 --vbits 2) but
      * upstream's own corrected table has it MISSING the needle at 2K and 4K. */
     if (!kvq_on) kb = vb = 0;
+    if (chat_mode && check) {
+        fprintf(stderr, "--chat cannot be used with --check\n\n");
+        usage(argv[0], stderr);
+        return 1;
+    }
+    if (chat_mode && serve_mode) {
+        fprintf(stderr, "--chat cannot be used with --serve\n\n");
+        usage(argv[0], stderr);
+        return 1;
+    }
     /* Default max_tokens when a prompt is given (or interactive mode) but --max_tokens was not set. */
     if (!serve_mode && !check && max_tokens == 0) max_tokens = 2048;
     if (draft > MAXDRAFT) draft = MAXDRAFT;
@@ -2293,7 +2304,7 @@ int main(int argc, char **argv) {
 
         int *ids = xmalloc(sizeof(int) * c->ctx);
         int np = 0;
-        if (prompt) {
+        if (prompt && !chat_mode) {
             if (!T) { fprintf(stderr, "prompt needs %s\n", tp); return 1; }
             const char *text = prompt;
             char *chat = NULL;
@@ -2309,8 +2320,9 @@ int main(int argc, char **argv) {
             if (np <= 0) { fprintf(stderr, "empty prompt\n"); return 1; }
         }
 
-        /* ---- interactive multi-turn chat (no prompt on command line) ---- */
-        int interactive = (!prompt && !check);
+        /* ---- interactive multi-turn chat (--chat, or no prompt for compatibility) ---- */
+        int interactive = (chat_mode || (!prompt && !check));
+        int first_prompt = (chat_mode && prompt != NULL);
         int *cached_ids = NULL;
         int cached_len = 0, cached_cap = 0;
         char *history = NULL;   /* accumulated chat template text */
@@ -2327,15 +2339,25 @@ int main(int argc, char **argv) {
 
         for (;;) {
             if (interactive) {
-                /* Read one line of user input. */
-                fprintf(stdout, "> ");
-                fflush(stdout);
+                /* Use a positional prompt as the first turn when --chat is explicit;
+                 * subsequent turns are read from stdin. */
                 char line[4096];
-                if (!fgets(line, sizeof line, stdin)) break;  /* Ctrl-D / EOF */
-                size_t len = strlen(line);
-                while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
-                    line[--len] = 0;
-                if (!len) continue;  /* empty line */
+                const char *user_text;
+                size_t len;
+                if (first_prompt) {
+                    user_text = prompt;
+                    len = strlen(user_text);
+                    first_prompt = 0;
+                } else {
+                    fprintf(stdout, "> ");
+                    fflush(stdout);
+                    if (!fgets(line, sizeof line, stdin)) break;  /* Ctrl-D / EOF */
+                    len = strlen(line);
+                    while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+                        line[--len] = 0;
+                    if (!len) continue;  /* empty line */
+                    user_text = line;
+                }
 
                 /* Build the full chat template text from history + new turn. */
                 size_t need = hist_len + len + 256;
@@ -2355,7 +2377,7 @@ int main(int argc, char **argv) {
                         pos += snprintf(chat + pos, need - pos, "<turn|>\n");
                     }
                 }
-                pos += snprintf(chat + pos, need - pos, "<|turn>user\n%s<turn|>\n", line);
+                pos += snprintf(chat + pos, need - pos, "<|turn>user\n%s<turn|>\n", user_text);
                 pos += snprintf(chat + pos, need - pos, "<|turn>model\n");
                 if (!think) pos += snprintf(chat + pos, need - pos, "<|channel>thought\n<channel|>");
 

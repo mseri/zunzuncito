@@ -83,8 +83,17 @@ Expect it to take a while though, since it has to re-quantise every tensor.
 ./gemma4 ./g4 "explain MoE routing"
 ```
 
-The prompt is a positional argument (the last non-flag argument), and if 
-missing enters into an interactive multi-turn mode.
+The prompt is a positional argument (the last non-flag argument). To start an
+interactive multi-turn session explicitly, use `--chat`:
+
+```sh
+./gemma4 ./g4 --chat
+```
+
+For compatibility, omitting the prompt also still enters interactive mode. If a
+positional prompt is supplied with `--chat`, it is used as the first user turn
+before reading subsequent turns from stdin. `--chat` cannot be combined with
+`--check` or `--serve`.
 Generation defaults to 2048 tokens unless `--max_tokens` overrides it:
 
 ```sh
@@ -128,6 +137,7 @@ Useful flags for the CLI generation:
 
 | flag | meaning |
 |------|---------|
+| `--chat` | enter interactive multi-turn chat mode |
 | `--system S` | system prompt |
 | `--think` | enable reasoning (injects `<\|think\|>`) |
 | `--raw` | skip the chat template, feed the prompt verbatim |
