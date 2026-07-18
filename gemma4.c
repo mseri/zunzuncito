@@ -405,6 +405,16 @@ static void matvec(float *y, const W *w, const float *x, int8_t *xq, float *sx) 
 #endif
 }
 
+/* Batched Y = W X, W q4_0 [O,I], X is [S,I] row-major, Y is [S,O] row-major.
+ * One GPU dispatch fills an O*S grid, amortising launch latency and keeping the
+ * device busy -- the whole point of running a block (S>1) through DFlash. Falls
+ * back to S independent matvecs on the CPU path, which is what it did before. */
+static void matmul(float *Y, const W *w, const float *X, int S, int8_t *xq, float *sx) {
+    if (g_use_gpu && gpu_q40_matmul(Y, w->q, X, w->O, w->I, S)) return;
+    for (int s = 0; s < S; s++)
+        matvec(Y + (size_t)s * w->O, w, X + (size_t)s * w->I, xq, sx);
+}
+
 /* rotate_half RoPE. inv_freq's tail is ZERO on p-RoPE global layers (freq 0 =>
  * cos 1, sin 0 => identity), so partial rotary needs no special case here. */
 static void rope(float *x, int H, int D, int pos, float theta, float partial) {
@@ -870,6 +880,9 @@ static void layer_fwd(M *m, int li, float *H, int S, int pos_base, Buf *b) {
         for (int hh = 0; hh < nh; hh++) { mx[hh] = -INFINITY; z[hh] = 0.0f; }
         for (int t = lo; t <= pos; t++) {
             kv_read(m, li, t, pos, nkv, hd, cap, b->kvk, b->kvv);
+            /* Heads are independent given this t; the online-softmax recurrence is
+             * carried per head across t, so parallelise the head loop, not t. */
+            #pragma omp parallel for schedule(static)
             for (int hh = 0; hh < nh; hh++) {
                 const float *qq = b->q + (size_t)hh * hd;
                 const float *kk = b->kvk + (size_t)(hh / rep) * hd;
@@ -1235,13 +1248,15 @@ static MBuf *mtp_bufs(M *m) {
 
         DBuf *b = calloc(1, sizeof *b);
         b->h = xmalloc(sizeof(float) * (size_t)BS * D);
-        b->xn = xmalloc(sizeof(float) * wide);
+        /* xn holds all BS normed rows contiguously so projections batch into one
+         * matmul; gate/up/mlp likewise span the whole block. */
+        b->xn = xmalloc(sizeof(float) * (size_t)BS * (wide < D ? D : wide));
         b->q = xmalloc(sizeof(float) * (size_t)BS * qmax);
         b->ao = xmalloc(sizeof(float) * (size_t)BS * qmax);
-        b->tmp = xmalloc(sizeof(float) * wide);
-        b->gate = xmalloc(sizeof(float) * (m->dflash_inter + 64));
-        b->up = xmalloc(sizeof(float) * (m->dflash_inter + 64));
-        b->mlp = xmalloc(sizeof(float) * (m->dflash_inter + 64));
+        b->tmp = xmalloc(sizeof(float) * (size_t)BS * wide);
+        b->gate = xmalloc(sizeof(float) * ((size_t)BS * m->dflash_inter + 64));
+        b->up = xmalloc(sizeof(float) * ((size_t)BS * m->dflash_inter + 64));
+        b->mlp = xmalloc(sizeof(float) * ((size_t)BS * m->dflash_inter + 64));
         b->nk = xmalloc(sizeof(float) * (size_t)BS * kvmax);
         b->nv = xmalloc(sizeof(float) * (size_t)BS * kvmax);
         b->xq = xmalloc(wide + 64);
@@ -1268,19 +1283,21 @@ static MBuf *mtp_bufs(M *m) {
         int win = m->dflash_types[li] ? 0 : m->dflash_sliding_window;
         const float *CK = m->dflash_ctx_k[li], *CV = m->dflash_ctx_v[li];
 
-        /* ---- Q and the block's own K/V (all from the input_layernorm'd hidden) ---- */
+        /* ---- Q and the block's own K/V (all from the input_layernorm'd hidden) ----
+         * All S rows are normed into b->xn contiguously, then each projection is a
+         * single batched matmul over the block (one GPU dispatch instead of S). */
+        for (int s = 0; s < S; s++)
+            rmsnorm(b->xn + (size_t)s * D, H + (size_t)s * D, L->in_ln.f, D, m->dflash_eps);
+        matmul(b->q,  &L->q_proj, b->xn, S, b->xq, b->sx);
+        matmul(b->nk, &L->k_proj, b->xn, S, b->xq, b->sx);
+        matmul(b->nv, &L->v_proj, b->xn, S, b->xq, b->sx);
         for (int s = 0; s < S; s++) {
-            float *h = H + (size_t)s * D;
-            rmsnorm(b->xn, h, L->in_ln.f, D, m->dflash_eps);
             float *q = b->q + (size_t)s * nh * hd;
-            matvec(q, &L->q_proj, b->xn, b->xq, b->sx);
             for (int i = 0; i < nh; i++)
                 rmsnorm(q + (size_t)i * hd, q + (size_t)i * hd,
                         L->q_norm.f, hd, m->dflash_eps);
             rope(q, nh, hd, pos_base + s, theta, 1.0f);
-            float *k = b->nk + (size_t)s * kvdim, *v = b->nv + (size_t)s * kvdim;
-            matvec(k, &L->k_proj, b->xn, b->xq, b->sx);
-            matvec(v, &L->v_proj, b->xn, b->xq, b->sx);
+            float *k = b->nk + (size_t)s * kvdim;
             for (int i = 0; i < nkv; i++)
                 rmsnorm(k + (size_t)i * hd, k + (size_t)i * hd,
                         L->k_norm.f, hd, m->dflash_eps);
@@ -1332,11 +1349,11 @@ static MBuf *mtp_bufs(M *m) {
             }
         }
 
-        /* output projection + residual */
+        /* output projection + residual (batched over the block) */
+        matmul(b->tmp, &L->o_proj, b->ao, S, b->xq, b->sx);
         for (int s = 0; s < S; s++) {
-            matvec(b->tmp, &L->o_proj, b->ao + (size_t)s * nh * hd, b->xq, b->sx);
-            float *h = H + (size_t)s * D;
-            for (int i = 0; i < D; i++) h[i] += b->tmp[i];
+            float *h = H + (size_t)s * D, *o = b->tmp + (size_t)s * D;
+            for (int i = 0; i < D; i++) h[i] += o[i];
         }
     }
 
@@ -1351,17 +1368,21 @@ static MBuf *mtp_bufs(M *m) {
             /* Post-attention residual add happens inside dflash_attn */
             dflash_attn(m, li, H, S, pos_base, b);
 
-            /* FFN: plain MLP with SiLU activation (Qwen3-style, not Gemma4's gelu_tanh) */
+            /* FFN: plain MLP with SiLU activation (Qwen3-style, not Gemma4's gelu_tanh).
+             * Batched over the block: gate/up/down are each one matmul. */
             Layer *L = &m->dflash_layers[li];
+            int MI = m->dflash_inter;
+            for (int s = 0; s < S; s++)
+                rmsnorm(b->xn + (size_t)s * D, H + (size_t)s * D,
+                        L->post_attn_ln.f, D, m->dflash_eps);
+            matmul(b->gate, &L->mlp_gate, b->xn, S, b->xq, b->sx);
+            matmul(b->up, &L->mlp_up, b->xn, S, b->xq, b->sx);
+            for (size_t i = 0; i < (size_t)S * MI; i++)
+                b->mlp[i] = silu(b->gate[i]) * b->up[i];
+            matmul(b->tmp, &L->mlp_down, b->mlp, S, b->xq, b->sx);
             for (int s = 0; s < S; s++) {
-                float *h = H + (size_t)s * D;
-                rmsnorm(b->xn, h, L->post_attn_ln.f, D, m->dflash_eps);
-                matvec(b->gate, &L->mlp_gate, b->xn, b->xq, b->sx);
-                matvec(b->up, &L->mlp_up, b->xn, b->xq, b->sx);
-                for (int i = 0; i < m->dflash_inter; i++)
-                    b->mlp[i] = silu(b->gate[i]) * b->up[i];
-                matvec(b->tmp, &L->mlp_down, b->mlp, b->xq, b->sx);
-                for (int i = 0; i < D; i++) h[i] += b->tmp[i];
+                float *h = H + (size_t)s * D, *o = b->tmp + (size_t)s * D;
+                for (int i = 0; i < D; i++) h[i] += o[i];
             }
         }
 
