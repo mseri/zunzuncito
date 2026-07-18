@@ -951,11 +951,11 @@ static void forward(M *m, const int *ids, int S, int pos_base,
             /* Check if this layer is a target */
             for (int ti = 0; ti < ntl; ti++) {
                 if (m->dflash_target_ids[ti] == l) {
-                    /* HF's hidden_states[l+1] = post-norm of layer l's output.
-                     * The offset is 1 because hidden_states[0] is the embedding. */
+                    /* HF's hidden_states[l+1] = RAW output of layer l (no final norm).
+                     * The DFlash fc + hidden_norm was trained on these raw states. */
                     for (int s = 0; s < S; s++)
-                        rmsnorm(m->dflash_target_hidden + (size_t)ti * (MAXDRAFT + 2) * D + (size_t)s * D,
-                                H + (size_t)s * D, fnorm->f, D, c->eps);
+                        memcpy(m->dflash_target_hidden + (size_t)ti * (MAXDRAFT + 2) * D + (size_t)s * D,
+                               H + (size_t)s * D, sizeof(float) * D);
                     break;
                 }
             }
@@ -2191,10 +2191,13 @@ static int dflash_step(M *m, Buf *bt, DBuf *bd, int *ids, int pos,
     }
     free(concat_h);
 
-    /* ---- 2. Initialize draft block ---- */
-    /* First position: the target's sampled token. Rest: mask tokens. */
+    /* ---- 2. Initialize draft block ----
+     * Python: block_output_ids[0] = target's sampled token (NOT drafted).
+     *         block_output_ids[1..B-1] = mask tokens, then filled by DFlash.
+     * The DFlash model only drafts B-1 tokens (positions 1..B-1). */
     int block_ids[MAXDRAFT];
-    block_ids[0] = sample(tlog, V, temp, topp, topk, pbuf, rng);
+    int first_tok = sample(tlog, V, temp, topp, topk, pbuf, rng);
+    block_ids[0] = first_tok;
     for (int i = 1; i < d; i++) block_ids[i] = mask_id;
 
     /* Embed the block tokens using the TARGET's embedding table */
@@ -2205,15 +2208,15 @@ static int dflash_step(M *m, Buf *bt, DBuf *bd, int *ids, int pos,
     /* ---- 3. Run DFlash forward ---- */
     dflash_forward(m, H, target_h, d, ctx_len, pos, bd);
 
-    /* ---- 4. Compute logits through target's lm_head ---- */
+    /* ---- 4. Compute logits for positions 1..d-1 only (skip position 0).
+     * Python: draft_logits = target.lm_head(model(...)[:, 1-B:, :])
+     * The slice [:, 1-B:, :] takes the last B-1 positions. */
     float *dlog = bd->dlog;
+    float *dprob = bd->dprob;
     W *embed = &m->L[MAXL - 1].q_proj;
-    W *fnorm = &m->L[MAXL - 1].o_proj;
-    for (int i = 0; i < d; i++) {
-        /* H is already post-norm from dflash_forward, but we need to re-norm with
-         * the target's final norm for the lm_head */
-        rmsnorm(bd->xn, H + (size_t)i * D, fnorm->f, D, c->eps);
-        matvec(dlog + (size_t)i * V, embed, bd->xn, bd->xq, bd->sx);
+    int ndraft = d - 1;  /* number of tokens we actually draft */
+    for (int i = 0; i < ndraft; i++) {
+        matvec(dlog + (size_t)i * V, embed, H + (size_t)(i + 1) * D, bd->xq, bd->sx);
         if (c->final_logit_softcap > 0) {
             float cap = c->final_logit_softcap;
             for (int j = 0; j < V; j++)
@@ -2221,10 +2224,9 @@ static int dflash_step(M *m, Buf *bt, DBuf *bd, int *ids, int pos,
         }
     }
 
-    /* ---- 5. Sample draft tokens (greedy for the drafter) ---- */
+    /* ---- 5. Sample draft tokens (greedy) for positions 1..d-1 ---- */
     int draft[MAXDRAFT];
-    float *dprob = bd->dprob;
-    for (int i = 0; i < d; i++) {
+    for (int i = 0; i < ndraft; i++) {
         float mx = -1e30f;
         for (int j = 0; j < V; j++) if (dlog[(size_t)i * V + j] > mx) mx = dlog[(size_t)i * V + j];
         double sum = 0;
@@ -2243,20 +2245,52 @@ static int dflash_step(M *m, Buf *bt, DBuf *bd, int *ids, int pos,
     }
 
     /* ---- 6. Verify with ONE batched target forward ----
-     * Feed [last_confirmed, draft[0], ..., draft[d-1]] at positions [pos-1, pos, ..., pos+d-1].
-     * The token at pos-1 is already in KV; repeating it gives us the hidden state for
-     * row 0 (which verifies draft[0]). */
+     * Python: target(block_output_ids, ...) where block_output_ids =
+     *   [first_tok, draft[0], draft[1], ..., draft[ndraft-1]]
+     * We feed [ids[pos-1], first_tok, draft[0], ..., draft[ndraft-1]]
+     * at positions [pos-1, pos, pos+1, ..., pos+ndraft].
+     * Row 0 (pos-1) predicts pos: compared against first_tok.
+     * Row 1 (pos)   predicts pos+1: compared against draft[0].
+     * Row i predicts pos+i: compared against draft[i-1]. */
     int batch[MAXDRAFT + 1];
-    batch[0] = ids[pos - 1];  /* the last confirmed token */
-    for (int i = 0; i < d; i++) batch[i + 1] = draft[i];
-    m->kv_conf = pos - 1;  /* only pos-1 is confirmed; pos..pos+d-1 are speculative */
-    forward(m, batch, d + 1, pos - 1, NULL, 0, bt);
+    batch[0] = ids[pos - 1];
+    batch[1] = first_tok;
+    for (int i = 0; i < ndraft; i++) batch[i + 2] = draft[i];
+    int nbatch = ndraft + 2;  /* last_confirmed + first_tok + ndraft drafts */
+    m->kv_conf = pos - 1;
+    forward(m, batch, nbatch, pos - 1, NULL, 0, bt);
 
-    /* ---- 7. Verify each draft token ---- */
+    /* ---- 7. Verify: compare first_tok against target row 0,
+     *         draft[i] against target row i+1 ---- */
     float *q = xmalloc(sizeof(float) * V);
-    int n;
-    for (n = 0; n < d; n++) {
-        lm_head_row(m, m->hid_batch + (size_t)n * c->hidden, q, bt);
+    int n = 0;  /* number of DRAFT tokens accepted (not counting first_tok) */
+
+    /* Verify first_tok (target's own token at block position 0) */
+    lm_head_row(m, m->hid_batch + (size_t)0 * c->hidden, q, bt);
+    int ok0;
+    if (temp <= 0) {
+        int am = 0;
+        for (int j = 1; j < V; j++) if (q[j] > q[am]) am = j;
+        ok0 = (am == first_tok);
+    } else {
+        /* For temp > 0, first_tok is always "accepted" — it's the target's own
+         * sample, not a draft. The Python code doesn't verify it at all. */
+        ok0 = 1;
+    }
+    if (!ok0) {
+        /* first_tok rejected: emit bonus from row 0, accept nothing */
+        out[0] = sample(q, V, temp, topp, topk, pbuf, rng);
+        *accepted = 0;
+        m->kv_conf = pos - 1;
+        if (next_logits) lm_head_row(m, m->hid_batch + (size_t)0 * c->hidden, next_logits, bt);
+        free(target_h); free(H); free(q);
+        return 1;
+    }
+    out[0] = first_tok;
+
+    /* Verify draft[0..ndraft-1] against target rows 1..ndraft */
+    for (n = 0; n < ndraft; n++) {
+        lm_head_row(m, m->hid_batch + (size_t)(n + 1) * c->hidden, q, bt);
         int t = draft[n], ok;
         if (temp <= 0) {
             int am = 0;
@@ -2277,35 +2311,28 @@ static int dflash_step(M *m, Buf *bt, DBuf *bd, int *ids, int pos,
             ok = (pt <= 0) || (r < (double)qt / pt);
         }
         if (!ok) break;
-        out[n] = t;
+        out[n + 1] = t;
     }
 
-    /* Bonus token from target's distribution */
-    if (n == d) lm_head_row(m, m->hid_batch + (size_t)n * c->hidden, q, bt);
-    out[n] = sample(q, V, temp, topp, topk, pbuf, rng);
+    /* Bonus token from target's distribution at the first rejected position.
+     * Row n+1 holds the hidden state for the last accepted draft (or first_tok if
+     * n=0). Its lm_head predicts position pos+n+1 — the bonus position. */
+    int bonus_src_row = n + 1;  /* row whose lm_head predicts the bonus position */
+    if (n == ndraft) bonus_src_row = ndraft + 1;
+    lm_head_row(m, m->hid_batch + (size_t)bonus_src_row * c->hidden, q, bt);
+    out[n + 1] = sample(q, V, temp, topp, topk, pbuf, rng);
 
-    /* rows 0..n of the batch are on the accepted path (row 0 = pos-1, row 1 = pos, ...).
-     * So positions (pos-1)..(pos-1+n) are confirmed. */
-    m->kv_conf = pos - 1 + n;
+    /* Positions pos-1..pos-1+(n+1) are confirmed (n drafts + first_tok). */
+    m->kv_conf = pos - 1 + n + 1;
     *accepted = n;
 
-    /* The verify forward already populated hid_batch and dflash_target_hidden.
-     * Compute the next-target logits from the last accepted row so the caller
-     * can skip the redundant forward() call. */
-    if (next_logits) {
-        W *fnorm = &m->L[MAXL - 1].o_proj;
-        W *embed = &m->L[MAXL - 1].q_proj;
-        rmsnorm(bd->xn, m->hid_batch + (size_t)n * c->hidden, fnorm->f, D, c->eps);
-        matvec(next_logits, embed, bd->xn, bd->xq, bd->sx);
-        if (c->final_logit_softcap > 0) {
-            float cap = c->final_logit_softcap;
-            for (int i = 0; i < V; i++)
-                next_logits[i] = tanhf(next_logits[i] / cap) * cap;
-        }
-    }
+    /* We cannot compute next_logits from the verify forward alone when all drafts
+     * are accepted (the bonus token's hidden state isn't in the batch). The caller
+     * does a cheap single-token forward for the bonus instead. */
+    (void)next_logits;
 
     free(target_h); free(H); free(q);
-    return n + 1;
+    return n + 2;  /* first_tok + n drafts + bonus */
 }
 
 /* ------------------------------------------------------------------ OpenAI-compatible local server */
@@ -3007,9 +3034,9 @@ int main(int argc, char **argv) {
 
             if (use_dflash) {
                 /* DFlash block-parallel speculative decode.
-                 * dflash_step does the verify forward internally, which populates
-                 * both hid_batch and dflash_target_hidden. It also writes the
-                 * next-target logits directly — no separate forward() needed. */
+                 * dflash_step does the verify forward (d+2 tokens). After emitting
+                 * the accepted tokens, we do one cheap single-token forward for the
+                 * bonus to get the next target distribution and target hidden states. */
                 while (n < max_tokens) {
                     int d = draft;
                     if (d > m.dflash_block_size) d = m.dflash_block_size;
@@ -3020,7 +3047,7 @@ int main(int argc, char **argv) {
                     int got = dflash_step(&m, b, dfb, ids, pos,
                                           m.dflash_target_hidden_rows,
                                           logits, d, temp, topp, topk,
-                                          pbuf, &rng, out, &acc, logits);
+                                          pbuf, &rng, out, &acc, NULL);
                     steps++;
                     acc_tot += acc;
 
@@ -3035,6 +3062,14 @@ int main(int argc, char **argv) {
                     }
                     fflush(stdout);
                     if (stop) break;
+
+                    /* Single-token forward for the last emitted token (the bonus).
+                     * This gives us the next target distribution AND captures fresh
+                     * target hidden states for the next dflash_step. */
+                    if (n < max_tokens) {
+                        int last = ids[np + n - 1];
+                        forward(&m, &last, 1, np + n - 1, logits, 1, b);
+                    }
                 }
                 goto done_decode;
             }
