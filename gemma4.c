@@ -369,6 +369,9 @@ static void rmsnorm(float *o, const float *x, const float *w, int D, float eps) 
 static inline float gelu_tanh(float x) {
     return 0.5f * x * (1.0f + tanhf(0.7978845608028654f * (x + 0.044715f * x * x * x)));
 }
+static inline float silu(float x) {
+    return x / (1.0f + expf(-x));
+}
 /* y = W x, W q4_0 [O,I].
  * COLI_F32ACT keeps activations in f32 (weights still q4_0). Only for validation:
  * it lets --check separate the int8-activation approximation from an actual bug. */
@@ -965,7 +968,7 @@ static void forward(M *m, const int *ids, int S, int pos_base,
     /* Stash the post-norm hidden (HF's last_hidden_state) of every row for a small
      * batch, or just the final row for a long prefill. The head needs a specific
      * row -- the last ACCEPTED one -- which is only known after verification. */
-    if (m->mtp) {
+    if (m->mtp || m->dflash) {
         if (S <= MAXDRAFT + 1) {
             for (int s = 0; s < S; s++)
                 rmsnorm(m->hid_batch + (size_t)s * D, H + (size_t)s * D, fnorm->f, D, c->eps);
@@ -1157,20 +1160,22 @@ static MBuf *mtp_bufs(M *m) {
     typedef struct {
         /* Per-row hidden states for the draft block [block_size * D] */
         float *h;
-        /* Scratch: norm, q, k, v, o, tmp, gate, up, mlp */
-        float *xn, *q, *k, *v, *o, *tmp, *gate, *up, *mlp;
+        /* Scratch: norm, q (per-position), o, tmp, gate, up, mlp */
+        float *xn, *q, *o, *tmp, *gate, *up, *mlp;
         /* Target hidden context: [ctx_len * D] */
         float *target_h;
         /* K/V for the concatenated context+draft sequence */
         float *ctx_k, *ctx_v;
         int8_t *xq; float *sx;
+        /* Persistent logit/draft-prob buffers (avoid alloc/free per step) */
+        float *dlog, *dprob;
     } DBuf;
 
     static DBuf *dflash_bufs(M *m) {
         int D = m->dflash_D, BS = m->dflash_block_size;
         int nh = m->dflash_nh, hd = m->dflash_hd, nkv = m->dflash_nkv;
-        int qmax = nh * hd;
-        int kvmax = nkv * hd;
+        int qmax = nh * hd;          /* one head's query vector */
+        int kvmax = nkv * hd;        /* one position's K/V */
         int wide = D;
         if (wide < qmax) wide = qmax;
         if (wide < m->dflash_inter) wide = m->dflash_inter;
@@ -1179,21 +1184,23 @@ static MBuf *mtp_bufs(M *m) {
         DBuf *b = calloc(1, sizeof *b);
         b->h = xmalloc(sizeof(float) * (size_t)BS * D);
         b->xn = xmalloc(sizeof(float) * wide);
-        b->q = xmalloc(sizeof(float) * qmax);
-        b->k = xmalloc(sizeof(float) * (size_t)BS * kvmax);
-        b->v = xmalloc(sizeof(float) * (size_t)BS * kvmax);
+        /* q: one query vector per draft position [BS * nh * hd] */
+        b->q = xmalloc(sizeof(float) * (size_t)BS * qmax);
         b->o = xmalloc(sizeof(float) * qmax);
         b->tmp = xmalloc(sizeof(float) * wide);
         b->gate = xmalloc(sizeof(float) * (m->dflash_inter + 64));
         b->up = xmalloc(sizeof(float) * (m->dflash_inter + 64));
         b->mlp = xmalloc(sizeof(float) * (m->dflash_inter + 64));
-        /* target_h: enough for the context (1 row) + draft block */
+        /* target_h: enough for the context (1 row) */
         b->target_h = xmalloc(sizeof(float) * (size_t)(1 + BS) * D);
-        /* ctx_k/v: concatenated context + draft */
+        /* ctx_k/v: concatenated context + draft positions */
         b->ctx_k = xmalloc(sizeof(float) * (size_t)(1 + BS) * kvmax);
         b->ctx_v = xmalloc(sizeof(float) * (size_t)(1 + BS) * kvmax);
         b->xq = xmalloc(wide + 64);
         b->sx = xmalloc(sizeof(float) * (wide / Q40_BLK + 8));
+        /* Persistent logit/draft-prob buffers: [BS * V] each */
+        b->dlog = xmalloc(sizeof(float) * (size_t)BS * m->dflash_vocab);
+        b->dprob = xmalloc(sizeof(float) * (size_t)BS * m->dflash_vocab);
         return b;
     }
 
@@ -1251,23 +1258,11 @@ static MBuf *mtp_bufs(M *m) {
         }
 
         /* ---- Attention: for each draft position, attend to all ctx + draft positions.
-         * Bidirectional within the draft block. Sliding window layers only attend to
-         * positions within the window. ---- */
+         * Bidirectional within the draft block. The sliding window (2048) is much larger
+         * than the block size (16), so it never restricts attention during decode. */
         for (int s = 0; s < S; s++) {
-            int lo = 0;
-            if (!glob && m->dflash_sliding_window > 0) {
-                int abs_pos = pos_base + s;
-                lo = abs_pos - m->dflash_sliding_window;
-                if (lo < 0) lo = 0;
-                /* Convert absolute position to index in the concatenated sequence.
-                 * The context starts at pos_base, draft at pos_base..pos_base+S-1.
-                 * So position p maps to index (p - pos_base) + ctx_len if p >= pos_base,
-                 * or we can't attend to it if p < pos_base (prefill context not in our
-                 * concatenated K/V). For decode, ctx_len=1 and pos_base is the current
-                 * position, so we attend to all positions. */
-                lo = lo - pos_base + ctx_len;
-                if (lo < 0) lo = 0;
-            }
+            int lo = 0;  /* attend to all positions in the concatenated sequence */
+            (void)glob;  /* sliding window is a no-op for block_size << window */
 
             float mx[256], z[256];
             if (nh > 256) { fprintf(stderr, "too many DFlash heads\n"); exit(1); }
@@ -1314,7 +1309,7 @@ static MBuf *mtp_bufs(M *m) {
             /* Post-attention residual add happens inside dflash_attn */
             dflash_attn(m, li, H, S, ctx_len, pos_base, b);
 
-            /* FFN: plain MLP (no MoE) */
+            /* FFN: plain MLP with SiLU activation (Qwen3-style, not Gemma4's gelu_tanh) */
             Layer *L = &m->dflash_layers[li];
             for (int s = 0; s < S; s++) {
                 float *h = H + (size_t)s * D;
@@ -1322,7 +1317,7 @@ static MBuf *mtp_bufs(M *m) {
                 matvec(b->gate, &L->mlp_gate, b->xn, b->xq, b->sx);
                 matvec(b->up, &L->mlp_up, b->xn, b->xq, b->sx);
                 for (int i = 0; i < m->dflash_inter; i++)
-                    b->mlp[i] = gelu_tanh(b->gate[i]) * b->up[i];
+                    b->mlp[i] = silu(b->gate[i]) * b->up[i];
                 matvec(b->tmp, &L->mlp_down, b->mlp, b->xq, b->sx);
                 for (int i = 0; i < D; i++) h[i] += b->tmp[i];
             }
@@ -2207,7 +2202,7 @@ static int dflash_step(M *m, Buf *bt, DBuf *bd, int *ids, int pos,
     dflash_forward(m, H, target_h, d, ctx_len, pos, bd);
 
     /* ---- 4. Compute logits through target's lm_head ---- */
-    float *dlog = xmalloc(sizeof(float) * (size_t)d * V);
+    float *dlog = bd->dlog;
     W *embed = &m->L[MAXL - 1].q_proj;
     W *fnorm = &m->L[MAXL - 1].o_proj;
     for (int i = 0; i < d; i++) {
@@ -2224,7 +2219,7 @@ static int dflash_step(M *m, Buf *bt, DBuf *bd, int *ids, int pos,
 
     /* ---- 5. Sample draft tokens (greedy for the drafter) ---- */
     int draft[MAXDRAFT];
-    float *dprob = xmalloc(sizeof(float) * (size_t)d * V);
+    float *dprob = bd->dprob;
     for (int i = 0; i < d; i++) {
         float mx = -1e30f;
         for (int j = 0; j < V; j++) if (dlog[(size_t)i * V + j] > mx) mx = dlog[(size_t)i * V + j];
@@ -2243,12 +2238,15 @@ static int dflash_step(M *m, Buf *bt, DBuf *bd, int *ids, int pos,
         draft[i] = am;
     }
 
-    /* ---- 6. Verify with ONE batched target forward ---- */
+    /* ---- 6. Verify with ONE batched target forward ----
+     * Feed [last_confirmed, draft[0], ..., draft[d-1]] at positions [pos-1, pos, ..., pos+d-1].
+     * The token at pos-1 is already in KV; repeating it gives us the hidden state for
+     * row 0 (which verifies draft[0]). */
     int batch[MAXDRAFT + 1];
-    batch[0] = ids[pos];  /* the last confirmed token, at position pos */
+    batch[0] = ids[pos - 1];  /* the last confirmed token */
     for (int i = 0; i < d; i++) batch[i + 1] = draft[i];
-    m->kv_conf = pos;  /* anything beyond pos is speculative */
-    forward(m, batch, d + 1, pos, NULL, 0, bt);
+    m->kv_conf = pos - 1;  /* only pos-1 is confirmed; pos..pos+d-1 are speculative */
+    forward(m, batch, d + 1, pos - 1, NULL, 0, bt);
 
     /* ---- 7. Verify each draft token ---- */
     float *q = xmalloc(sizeof(float) * V);
@@ -2282,10 +2280,12 @@ static int dflash_step(M *m, Buf *bt, DBuf *bd, int *ids, int pos,
     if (n == d) lm_head_row(m, m->hid_batch + (size_t)n * c->hidden, q, bt);
     out[n] = sample(q, V, temp, topp, topk, pbuf, rng);
 
-    m->kv_conf = pos + n;
+    /* rows 0..n of the batch are on the accepted path (row 0 = pos-1, row 1 = pos, ...).
+     * So positions (pos-1)..(pos-1+n) are confirmed. */
+    m->kv_conf = pos - 1 + n;
     *accepted = n;
 
-    free(target_h); free(H); free(dlog); free(dprob); free(q);
+    free(target_h); free(H); free(q);
     return n + 1;
 }
 
