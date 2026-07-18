@@ -2150,10 +2150,14 @@ static int mtp_step(M *m, Buf *bt, MBuf *bd, int *ids, int P, float *hprev,
  *
  * `target_hidden_rows` tells us how many rows of target hidden we have (1 for decode,
  * more for prefill). `pos` is the absolute position of the first draft token. */
+/* Returns tokens produced. Also writes the next-target logits into `next_logits`
+ * (caller must provide a [V] buffer) so the caller does NOT need a separate
+ * forward() call — the verify forward already computed everything. */
 static int dflash_step(M *m, Buf *bt, DBuf *bd, int *ids, int pos,
                         int target_hidden_rows, float *tlog,
                         int d, float temp, float topp, int topk,
-                        PI *pbuf, uint64_t *rng, int *out, int *accepted) {
+                        PI *pbuf, uint64_t *rng, int *out, int *accepted,
+                        float *next_logits) {
     Cfg *c = &m->c;
     int V = c->vocab, D = c->hidden;
     int BS = m->dflash_block_size;
@@ -2284,6 +2288,21 @@ static int dflash_step(M *m, Buf *bt, DBuf *bd, int *ids, int pos,
      * So positions (pos-1)..(pos-1+n) are confirmed. */
     m->kv_conf = pos - 1 + n;
     *accepted = n;
+
+    /* The verify forward already populated hid_batch and dflash_target_hidden.
+     * Compute the next-target logits from the last accepted row so the caller
+     * can skip the redundant forward() call. */
+    if (next_logits) {
+        W *fnorm = &m->L[MAXL - 1].o_proj;
+        W *embed = &m->L[MAXL - 1].q_proj;
+        rmsnorm(bd->xn, m->hid_batch + (size_t)n * c->hidden, fnorm->f, D, c->eps);
+        matvec(next_logits, embed, bd->xn, bd->xq, bd->sx);
+        if (c->final_logit_softcap > 0) {
+            float cap = c->final_logit_softcap;
+            for (int i = 0; i < V; i++)
+                next_logits[i] = tanhf(next_logits[i] / cap) * cap;
+        }
+    }
 
     free(target_h); free(H); free(q);
     return n + 1;
@@ -2988,12 +3007,9 @@ int main(int argc, char **argv) {
 
             if (use_dflash) {
                 /* DFlash block-parallel speculative decode.
-                 * The prefill already captured target hidden states in
-                 * m.dflash_target_hidden. Each step:
-                 *   1. dflash_step drafts a block, verifies, returns accepted tokens.
-                 *   2. Feed the last accepted token back through a single forward
-                 *      to get the next target distribution AND capture new target
-                 *      hidden states for the next draft block. */
+                 * dflash_step does the verify forward internally, which populates
+                 * both hid_batch and dflash_target_hidden. It also writes the
+                 * next-target logits directly — no separate forward() needed. */
                 while (n < max_tokens) {
                     int d = draft;
                     if (d > m.dflash_block_size) d = m.dflash_block_size;
@@ -3004,7 +3020,7 @@ int main(int argc, char **argv) {
                     int got = dflash_step(&m, b, dfb, ids, pos,
                                           m.dflash_target_hidden_rows,
                                           logits, d, temp, topp, topk,
-                                          pbuf, &rng, out, &acc);
+                                          pbuf, &rng, out, &acc, logits);
                     steps++;
                     acc_tot += acc;
 
@@ -3019,13 +3035,6 @@ int main(int argc, char **argv) {
                     }
                     fflush(stdout);
                     if (stop) break;
-
-                    /* Feed the last token back to get the next target distribution
-                     * AND capture new target hidden states for the next draft. */
-                    if (n < max_tokens) {
-                        int last = ids[np + n - 1];
-                        forward(&m, &last, 1, np + n - 1, logits, 1, b);
-                    }
                 }
                 goto done_decode;
             }
