@@ -9,3 +9,4 @@ test_q40
 venv/
 .venv/
 vendor/
+__pycache__/
