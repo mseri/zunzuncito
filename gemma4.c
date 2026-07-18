@@ -187,6 +187,17 @@ typedef struct {
  * (returning 0) and the CPU path runs instead, so this is never load-bearing. */
 static int g_use_gpu = 0;
 
+/* DFlash iterative refinement (block-diffusion denoising). The reference drafts a
+ * block in a single greedy pass; because the drafter is ~1000x smaller than the
+ * target, we can optionally run extra denoising passes: after a pass, positions
+ * whose drafted token is confident (max softmax prob >= g_dflash_conf) are frozen
+ * as real input embeddings, the rest re-masked, and the block re-drafted. This is
+ * in-distribution for the model and raises the accepted prefix at near-zero cost
+ * relative to the target verify. g_dflash_refine = number of EXTRA passes (0 = off,
+ * i.e. reference behaviour). */
+static int g_dflash_refine = 0;
+static float g_dflash_conf = 0.9f;
+
 /* Ring capacity of a layer's KV. Sliding layers need MORE than `sliding_window`
  * slots, for two independent reasons -- and neither is slack:
  *
@@ -2241,45 +2252,75 @@ static int dflash_step(M *m, Buf *bt, DBuf *bd, int first_tok, int pos,
     if (d > BS) d = BS;
     if (d < 1) d = 1;
 
-    /* Embed the block tokens using the TARGET's embedding table */
     float *H = bd->h;
-    embed_row(m, first_tok, H);
-    embed_row(m, mask_id, H + D);
-    for (int i = 2; i < d; i++) memcpy(H + (size_t)i * D, H + D, sizeof(float) * D);
-
-    /* ---- 2. Run DFlash forward. Context K/V for positions [0, pos) come from the
-     * persistent draft cache, filled by every target forward (prefill included). */
-    double t0 = now();
-    dflash_forward(m, H, d, pos, bd);
-    double t1 = now();
-
-    /* ---- 3. Compute logits for positions 1..d-1 only (skip position 0).
-     * Python: draft_logits = target.lm_head(model(...)[:, 1-B:, :])
-     * The slice [:, 1-B:, :] takes the last B-1 positions. */
     float *dlog = bd->dlog;
     float *dprob = bd->dprob;
     W *embed = &m->L[MAXL - 1].q_proj;
     int ndraft = d - 1;  /* number of tokens we actually draft */
     int draft[MAXDRAFT];
-    for (int i = 0; i < ndraft; i++) {
-        float *dl = dlog + (size_t)i * V;
-        matvec(dl, embed, H + (size_t)(i + 1) * D, bd->xq, bd->sx);
-        int am = 0;
-        for (int j = 1; j < V; j++) if (dl[j] > dl[am]) am = j;
-        draft[i] = am;   /* the drafter is greedy, like the reference */
-        /* The softcap + softmax over the 262k vocab are only needed for the
-         * temp > 0 rejection test (tanh is monotone, so argmax is unaffected). */
-        if (temp > 0) {
-            float cap = c->final_logit_softcap;
-            float mx = cap > 0 ? tanhf(dl[am] / cap) * cap : dl[am];
-            double sum = 0;
-            float *dp = dprob + (size_t)i * V;
-            for (int j = 0; j < V; j++) {
-                float lg = cap > 0 ? tanhf(dl[j] / cap) * cap : dl[j];
-                dp[j] = expf((lg - mx) / temp);
-                sum += dp[j];
+    /* frozen[i] (draft index) = position i+1 held a confident token last pass and is
+     * fed as a real embedding this pass instead of the mask token. Once set it stays
+     * set (monotone denoising). All zero when refinement is off -> reference path. */
+    int frozen[MAXDRAFT] = {0};
+    float cap = c->final_logit_softcap;
+    int npass = g_dflash_refine + 1;
+    double t0 = now(), t1 = t0;
+
+    /* ---- 2/3. One or more denoising passes. Each pass: (re)embed the block with the
+     * currently frozen tokens, run the DFlash forward, then take greedy drafts from
+     * the logits. On non-final passes we also measure per-position confidence and
+     * freeze the confident ones so the next pass conditions on them. */
+    for (int pass = 0; pass < npass; pass++) {
+        int last_pass = (pass == npass - 1);
+
+        /* Embed the block using the TARGET's embedding table: position 0 is the bonus
+         * token, the rest are either a frozen draft or the mask token. */
+        embed_row(m, first_tok, H);
+        for (int i = 1; i < d; i++) {
+            if (frozen[i - 1]) embed_row(m, draft[i - 1], H + (size_t)i * D);
+            else               embed_row(m, mask_id,      H + (size_t)i * D);
+        }
+
+        /* Context K/V for positions [0, pos) come from the persistent draft cache,
+         * filled by every target forward (prefill included). dflash_forward mutates
+         * H in place but touches no persistent state, so re-running it is safe. */
+        dflash_forward(m, H, d, pos, bd);
+        if (pass == 0) t1 = now();
+
+        /* Logits for positions 1..d-1 only (skip position 0). Python:
+         * draft_logits = target.lm_head(model(...)[:, 1-B:, :]). */
+        for (int i = 0; i < ndraft; i++) {
+            float *dl = dlog + (size_t)i * V;
+            matvec(dl, embed, H + (size_t)(i + 1) * D, bd->xq, bd->sx);
+            int am = 0;
+            for (int j = 1; j < V; j++) if (dl[j] > dl[am]) am = j;
+            draft[i] = am;   /* the drafter is greedy, like the reference */
+
+            if (!last_pass) {
+                /* Confidence = max softmax prob (temperature-independent, softcapped).
+                 * Freeze this position for the next pass if it clears the threshold.
+                 * Skip positions already frozen -- their token is fixed. */
+                if (frozen[i]) continue;
+                float mx = cap > 0 ? tanhf(dl[am] / cap) * cap : dl[am];
+                double sum = 0;
+                for (int j = 0; j < V; j++) {
+                    float lg = cap > 0 ? tanhf(dl[j] / cap) * cap : dl[j];
+                    sum += expf(lg - mx);
+                }
+                if (1.0f / (float)sum >= g_dflash_conf) frozen[i] = 1;
+            } else if (temp > 0) {
+                /* Final pass: the softcap + softmax over the 262k vocab are only needed
+                 * for the temp > 0 rejection test (tanh is monotone, argmax unaffected). */
+                float mx = cap > 0 ? tanhf(dl[am] / cap) * cap : dl[am];
+                double sum = 0;
+                float *dp = dprob + (size_t)i * V;
+                for (int j = 0; j < V; j++) {
+                    float lg = cap > 0 ? tanhf(dl[j] / cap) * cap : dl[j];
+                    dp[j] = expf((lg - mx) / temp);
+                    sum += dp[j];
+                }
+                for (int j = 0; j < V; j++) dp[j] /= (float)sum;
             }
-            for (int j = 0; j < V; j++) dp[j] /= (float)sum;
         }
     }
 
@@ -2596,7 +2637,9 @@ static void usage(const char *prog, FILE *out) {
         "         [--chat] [--system S] [--think] [--raw] [--max_tokens N]\n"
         "         [--temp F] [--topp F] [--topk N]   (default 1.0 / 0.95 / 64)\n"
         "         [--pin N] [--draft DIR] [--ndraft N]\n"
-        "         [--mtp] [--dflash]\n"
+        "         [--mtp] [--dflash] [--drefine N] [--dconf F]\n"
+        "                                DFlash extra denoising passes (default 0) and\n"
+        "                                per-token freeze confidence (default 0.9)\n"
         "         [--io N] [--nobatch] [--threads N]\n"
         "         [--metal] Metal is OFF by default (it is slower if gemma is not fully in RAM)\n"
         "         [--serve] [--port N]    OpenAI-compatible local server (default 8484)\n"
@@ -2643,6 +2686,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--pin") && i + 1 < argc) npin = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--draft") && i + 1 < argc) dpath = argv[++i];
         else if (!strcmp(argv[i], "--ndraft") && i + 1 < argc) draft = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--drefine") && i + 1 < argc) g_dflash_refine = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--dconf") && i + 1 < argc) g_dflash_conf = atof(argv[++i]);
         else if (!strcmp(argv[i], "--system") && i + 1 < argc) sys = argv[++i];
         else if (!strcmp(argv[i], "--chat")) chat_mode = 1;
         else if (!strcmp(argv[i], "--think")) think = 1;
