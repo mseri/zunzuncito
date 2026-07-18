@@ -2194,33 +2194,31 @@ static int mtp_step(M *m, Buf *bt, MBuf *bd, int *ids, int P, float *hprev,
  * `block_size` tokens at once using bidirectional attention. The draft is conditioned
  * on hidden states extracted from specific backbone layers.
  *
- * Algorithm:
- *   1. Initialize block: first position = target's sampled token, rest = mask tokens.
+ * Algorithm (mirrors dflash_generate in the reference):
+ *   1. Initialize block: position 0 = `first_tok` (already sampled by the previous
+ *      step -- the "bonus" token), rest = mask tokens.
  *   2. Run DFlash forward (context = the persistent draft KV cache, which every
  *      target forward, prefill included, keeps up to date via dflash_absorb).
- *   3. Pass through target's lm_head; sample draft tokens (greedy, like the paper).
- *   4. Verify with ONE batched target forward; accept the matching prefix plus one
- *      bonus token from the target.
+ *   3. Pass through target's lm_head; draft tokens greedily (like the paper).
+ *   4. Verify with ONE batched target forward; accept the matching prefix and
+ *      sample the next step's first token (the bonus) from the target's
+ *      distribution at the first unverified position. That token's KV and draft
+ *      context are computed by the NEXT verify forward -- no extra forward needed.
  *
- * `pos` is the absolute position of the first draft token. Returns tokens produced. */
-static int dflash_step(M *m, Buf *bt, DBuf *bd, int *ids, int pos,
-                        float *tlog,
+ * `pos` is the absolute position of first_tok, whose KV is written here too.
+ * Writes first_tok + the accepted drafts to out[0..n], the bonus to *next_tok,
+ * and returns n+1 (= tokens of `out` to emit). */
+static int dflash_step(M *m, Buf *bt, DBuf *bd, int first_tok, int pos,
                         int d, float temp, float topp, int topk,
-                        PI *pbuf, uint64_t *rng, int *out, int *accepted) {
+                        PI *pbuf, uint64_t *rng, int *out, int *accepted,
+                        int *next_tok) {
     Cfg *c = &m->c;
     int V = c->vocab, D = c->hidden;
     int BS = m->dflash_block_size;
     int mask_id = m->dflash_mask_token_id;
-    (void)ids;
 
     if (d > BS) d = BS;
     if (d < 1) d = 1;
-
-    /* ---- 1. Initialize draft block ----
-     * Python: block_output_ids[0] = target's sampled token (NOT drafted).
-     *         block_output_ids[1..B-1] = mask tokens, then filled by DFlash.
-     * The DFlash model only drafts B-1 tokens (positions 1..B-1). */
-    int first_tok = sample(tlog, V, temp, topp, topk, pbuf, rng);
 
     /* Embed the block tokens using the TARGET's embedding table */
     float *H = bd->h;
@@ -2230,7 +2228,9 @@ static int dflash_step(M *m, Buf *bt, DBuf *bd, int *ids, int pos,
 
     /* ---- 2. Run DFlash forward. Context K/V for positions [0, pos) come from the
      * persistent draft cache, filled by every target forward (prefill included). */
+    double t0 = now();
     dflash_forward(m, H, d, pos, bd);
+    double t1 = now();
 
     /* ---- 3. Compute logits for positions 1..d-1 only (skip position 0).
      * Python: draft_logits = target.lm_head(model(...)[:, 1-B:, :])
@@ -2271,7 +2271,12 @@ static int dflash_step(M *m, Buf *bt, DBuf *bd, int *ids, int pos,
     batch[0] = first_tok;
     for (int i = 0; i < ndraft; i++) batch[i + 1] = draft[i];
     m->kv_conf = pos - 1;
+    double t2 = now();
     forward(m, batch, d, pos, NULL, 0, bt);
+    double t3 = now();
+    if (getenv("G4DBG"))
+        fprintf(stderr, "[dflash] pos %d: draft-fwd %.0fms lm_head %.0fms verify-fwd %.0fms\n",
+                pos, (t1 - t0) * 1e3, (t2 - t1) * 1e3, (t3 - t2) * 1e3);
 
     float *q = xmalloc(sizeof(float) * V);
     int n;  /* number of DRAFT tokens accepted (not counting first_tok) */
@@ -2302,18 +2307,18 @@ static int dflash_step(M *m, Buf *bt, DBuf *bd, int *ids, int pos,
         out[n + 1] = t;
     }
 
-    /* Bonus token from the target's distribution at the first unverified position.
-     * Row n's lm_head predicts position pos+n+1 -- the bonus position. */
+    /* Next step's first token ("bonus") from the target's distribution at the
+     * first unverified position: row n's lm_head predicts position pos+n+1. */
     lm_head_row(m, m->hid_batch + (size_t)n * c->hidden, q, bt);
-    out[n + 1] = sample(q, V, temp, topp, topk, pbuf, rng);
+    *next_tok = sample(q, V, temp, topp, topk, pbuf, rng);
 
     /* Positions pos..pos+n are confirmed (first_tok + n drafts). The bonus token's
-     * KV is written by the caller's single-token forward. */
+     * KV and draft context are computed by the next step's verify forward. */
     m->kv_conf = pos + n;
     *accepted = n;
 
     free(q);
-    return n + 2;  /* first_tok + n drafts + bonus */
+    return n + 1;  /* first_tok + n drafts */
 }
 
 /* ------------------------------------------------------------------ OpenAI-compatible local server */
@@ -3014,20 +3019,22 @@ int main(int argc, char **argv) {
             }
 
             if (use_dflash) {
-                /* DFlash block-parallel speculative decode.
-                 * dflash_step does the verify forward (d+2 tokens). After emitting
-                 * the accepted tokens, we do one cheap single-token forward for the
-                 * bonus to get the next target distribution and target hidden states. */
+                /* DFlash block-parallel speculative decode. ONE target forward per
+                 * step: it verifies the drafts AND writes the KV / draft context of
+                 * the previous step's bonus token (block position 0), exactly like
+                 * the reference's rolling block. */
+                int cur = sample(logits, c->vocab, temp, topp, topk, pbuf, &rng);
                 while (n < max_tokens) {
                     int d = draft;
                     if (d > m.dflash_block_size) d = m.dflash_block_size;
                     if (n + d > max_tokens) d = max_tokens - n;
+                    int pos = np + n;      /* absolute position of `cur` */
+                    if (pos + d > c->ctx) d = c->ctx - pos;   /* KV ring bound */
                     if (d < 1) d = 1;
-                    int acc = 0;
-                    int pos = np + n;
-                    int got = dflash_step(&m, b, dfb, ids, pos,
-                                          logits, d, temp, topp, topk,
-                                          pbuf, &rng, out, &acc);
+                    int acc = 0, nxt = -1;
+                    int got = dflash_step(&m, b, dfb, cur, pos,
+                                          d, temp, topp, topk,
+                                          pbuf, &rng, out, &acc, &nxt);
                     steps++;
                     acc_tot += acc;
 
@@ -3042,14 +3049,7 @@ int main(int argc, char **argv) {
                     }
                     fflush(stdout);
                     if (stop) break;
-
-                    /* Single-token forward for the last emitted token (the bonus).
-                     * This gives us the next target distribution AND captures fresh
-                     * target hidden states for the next dflash_step. */
-                    if (n < max_tokens) {
-                        int last = ids[np + n - 1];
-                        forward(&m, &last, 1, np + n - 1, logits, 1, b);
-                    }
+                    cur = nxt;
                 }
                 goto done_decode;
             }
