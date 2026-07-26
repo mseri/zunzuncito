@@ -1720,11 +1720,23 @@ static int mtp_load(M *m, const char *dir) {
 }
 
 /* ------------------------------------------------------------------ setup */
-static void init(M *m, const char *dir, int n_io,
+static void init(M *m, const char *dir, int n_io, int ctx_override,
                  int kb, int vb, int kv_protect, int rwin, int kv_pbits) {
     m->rwin = rwin > 0 ? rwin : 128;
     manifest(m, dir);
     Cfg *c = &m->c;
+
+    /* --ctx overrides what the container was converted with. It is allowed to go
+     * UP: the container's ctx only fixed slots_per_layer (the expert-cache plan),
+     * and the weights do not care. Only the GLOBAL layers grow anyway -- the
+     * sliding ones are capped by sliding_window at any context.
+     *
+     * Whether that is a problem is a question about BYTES, not about the context
+     * number: with --kvq a much longer context can fit in less than the plan
+     * assumed, and warning there would be nonsense. The comparison is made below,
+     * once the real figure is known. */
+    int ctx_planned = c->ctx;
+    if (ctx_override > 0) c->ctx = ctx_override;
     if (c->slots_per_layer < c->topk) {
         fprintf(stderr, "slots_per_layer=%d < topk=%d: raise --ram\n",
                 c->slots_per_layer, c->topk);
@@ -1788,10 +1800,32 @@ static void init(M *m, const char *dir, int n_io,
             kvb += (m->qk[l].bytes + m->qv[l].bytes) * (size_t)cap * nkv;
         }
     }
-    fprintf(stderr, "kv: %.0f MiB", kvb / 1048576.0);
+    fprintf(stderr, "kv: %.0f MiB for ctx %d", kvb / 1048576.0, c->ctx);
     if (kb > 0) fprintf(stderr, " (K%d/V%d, rwin %d, %d protected layers at %d bits)",
                         kb, vb, m->rwin, kv_protect, kv_pbits);
+    else        fprintf(stderr, " (f32; --kvq would cut this a lot)");
     fprintf(stderr, "\n");
+
+    /* Compare against what the conversion budgeted -- an f32 KV at the container's
+     * own ctx. Only an ACTUAL overshoot is worth a warning: --kvq routinely buys a
+     * longer context for fewer bytes than the plan assumed, and that deserves
+     * silence, not a scare. */
+    {
+        size_t planned = 0;
+        for (int l = 0; l < c->n_layers; l++) {
+            int glob = c->layer_types[l];
+            int hd  = glob ? c->global_head_dim : c->head_dim;
+            int nkv = glob ? c->n_global_kv_heads : c->n_kv_heads;
+            int cap = glob ? ctx_planned : c->sliding_window + MAXDRAFT + 2;
+            planned += 2 * sizeof(float) * (size_t)cap * nkv * hd;
+        }
+        if (kvb > planned)
+            fprintf(stderr, "warning: that is %.0f MiB more KV than the container's "
+                    "plan budgeted (%.0f MiB for ctx %d, f32), so total RAM will "
+                    "exceed the conversion's --ram%s\n",
+                    (kvb - planned) / 1048576.0, planned / 1048576.0, ctx_planned,
+                    kb > 0 ? "" : "; --kvq would cut it a lot");
+    }
 
     m->kv_conf = INT_MAX;                   /* nothing speculative yet */
 
@@ -2545,7 +2579,13 @@ static int g4_serve_chat(G4ServerContext *ctx, int fd, jval *root) {
     int np = g4tok_encode(tok, prompt.data, ids, c->ctx);
     free(prompt.data);
     if (np <= 0) { free(ids); free(logits); free(pbuf); return samosa_http_json_error(fd,400,"invalid_prompt","The prompt produced no tokens."); }
-    if (np >= c->ctx) { free(ids); free(logits); free(pbuf); return samosa_http_json_error(fd,400,"context_limit","The prompt leaves no room for completion."); }
+    if (np >= c->ctx) {
+        char msg[256];
+        snprintf(msg, sizeof msg, "The prompt is %d tokens and the context window is "
+                 "%d; it leaves no room for a completion.", np, c->ctx);
+        free(ids); free(logits); free(pbuf);
+        return samosa_http_json_error(fd, 400, "context_limit", msg);
+    }
     if (max_tokens > c->ctx - np) max_tokens = c->ctx - np;
 
     pthread_mutex_lock(&ctx->generation_mu);
@@ -2603,7 +2643,10 @@ static int g4_serve_handler(SamosaHttpServer *server, int fd, const SamosaHttpRe
     if (!strcmp(request->method,"GET") && !strcmp(request->path,"/healthz"))
         return samosa_http_response(fd,200,"application/json","{\"status\":\"ok\"}",NULL);
     if (!strcmp(request->method,"GET") && !strcmp(request->path,"/v1/models")) {
-        char body[512]; snprintf(body,sizeof body,"{\"object\":\"list\",\"data\":[{\"id\":\"%s\",\"object\":\"model\",\"owned_by\":\"local\"}]}",ctx->model_id);
+        char body[512]; snprintf(body,sizeof body,
+            "{\"object\":\"list\",\"data\":[{\"id\":\"%s\",\"object\":\"model\","
+            "\"owned_by\":\"local\",\"context_length\":%d,\"max_model_len\":%d}]}",
+            ctx->model_id, ctx->model->c.ctx, ctx->model->c.ctx);
         return samosa_http_response(fd,200,"application/json",body,NULL);
     }
     if (!strcmp(request->method,"POST") && !strcmp(request->path,"/v1/cancel")) {
@@ -2640,6 +2683,7 @@ static void usage(const char *prog, FILE *out) {
         "         [--mtp] [--dflash] [--drefine N] [--dconf F]\n"
         "                                DFlash extra denoising passes (default 0) and\n"
         "                                per-token freeze confidence (default 0.9)\n"
+        "         [--ctx N]              override the container's context length\n"
         "         [--io N] [--nobatch] [--threads N]\n"
         "         [--metal] Metal is OFF by default (it is slower if gemma is not fully in RAM)\n"
         "         [--serve] [--port N]    OpenAI-compatible local server (default 8484)\n"
@@ -2667,7 +2711,7 @@ int main(int argc, char **argv) {
     int kvq_on = 0, kb = 6, vb = 4, rwin = 128, kv_protect = 2, kv_pbits = 8;
     int no_metal = 0, chk_gpu = 0, use_mtp = 0, use_dflash = 0, use_metal = 0;
     int check = 0, n_io = 8, max_tokens = 0, nobatch = 0, npin = 0, draft = 0, nthreads = 2;
-    int serve_mode = 0, serve_port = 8484;
+    int serve_mode = 0, serve_port = 8484, ctx_override = 0;
     const char *dpath = NULL;
     float temp = 1.0f, topp = 0.95f;   /* Gemma-4 generation defaults */
     int topk = 64;
@@ -2678,6 +2722,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--nobatch")) nobatch = 1;
         else if (!strcmp(argv[i], "--threads") && i + 1 < argc) nthreads = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--io") && i + 1 < argc) n_io = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--ctx") && i + 1 < argc) ctx_override = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--max_tokens") && i + 1 < argc) max_tokens = atoi(argv[++i]);
 
         else if (!strcmp(argv[i], "--temp") && i + 1 < argc) temp = atof(argv[++i]);
@@ -2766,7 +2811,7 @@ int main(int argc, char **argv) {
 
     M m; memset(&m, 0, sizeof m);
     double t0 = now();
-    init(&m, dir, n_io, kb, vb, kv_protect, rwin, kv_pbits);
+    init(&m, dir, n_io, ctx_override, kb, vb, kv_protect, rwin, kv_pbits);
     if (g_use_gpu)
         fprintf(stderr, "metal: %s (q4_0 matmul offloaded; --no-metal to disable)\n",
                 gpu_name());
@@ -2818,7 +2863,9 @@ int main(int argc, char **argv) {
     M dm; memset(&dm, 0, sizeof dm);
     Buf *db = NULL;
     if (dpath) {
-        init(&dm, dpath, n_io, 0, 0, 0, rwin, 8);  /* drafter KV stays f32: it is tiny */
+        /* same ctx as the target: the drafter has to span the same positions.
+         * Its KV stays f32 -- it is tiny. */
+        init(&dm, dpath, n_io, c->ctx, 0, 0, 0, rwin, 8);
         db = bufs(&dm, dm.c.ctx);
         if (dm.c.vocab != c->vocab) {
             fprintf(stderr, "drafter vocab %d != target %d\n", dm.c.vocab, c->vocab);

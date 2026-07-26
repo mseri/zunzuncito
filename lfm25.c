@@ -1125,11 +1125,23 @@ static void pin_save(M *m) {
 }
 
 /* ------------------------------------------------------------------ init */
-static void init(M *m, const char *dir, int n_io,
+static void init(M *m, const char *dir, int n_io, int ctx_override,
                  int kb, int vb, int kv_protect, int rwin, int kv_pbits) {
     m->rwin = rwin > 0 ? rwin : 128;
     manifest(m, dir);
     Cfg *c = &m->c;
+
+    /* --ctx overrides what the container was converted with. It is allowed to go UP:
+     * the container's ctx only fixed slots_per_layer (the expert-cache plan), and the
+     * weights do not care.
+     *
+     * Whether that is a problem is a question about BYTES, not about the context
+     * number. The conversion budgeted for an f32 KV at its own ctx; with --kvq a
+     * much longer context can fit in less than that, and warning there would be
+     * nonsense. So we compare the KV we are actually about to allocate against the
+     * one the plan assumed, below, once both are known. */
+    int ctx_planned = c->ctx;
+    if (ctx_override > 0) c->ctx = ctx_override;
     if (c->slots_per_layer < c->topk) {
         fprintf(stderr, "slots_per_layer=%d < topk=%d: raise --ram\n",
                 c->slots_per_layer, c->topk);
@@ -1196,10 +1208,29 @@ static void init(M *m, const char *dir, int n_io,
             kvb += (m->qk[l].bytes + m->qv[l].bytes) * (size_t)cap * nkv;
         }
     }
-    fprintf(stderr, "kv: %.0f MiB", kvb / 1048576.0);
+    fprintf(stderr, "kv: %.0f MiB for ctx %d", kvb / 1048576.0, c->ctx);
     if (quant) fprintf(stderr, " (K%d/V%d, rwin %d, %d protected layers at %d bits)",
                        kb, vb, m->rwin, kv_protect, kv_pbits);
+    else       fprintf(stderr, " (f32; --kvq would cut this a lot)");
     fprintf(stderr, ";  conv state: %.0f KiB\n", cvb / 1024.0);
+
+    /* Now that the real figure is known, compare it against what the conversion
+     * budgeted -- an f32 KV at the container's own ctx. Only an ACTUAL overshoot is
+     * worth a warning: --kvq routinely buys a longer context for fewer bytes than
+     * the plan assumed, and that deserves silence, not a scare. */
+    {
+        size_t planned = 0;
+        for (int l = 0; l < c->n_layers; l++)
+            if (c->layer_types[l])
+                planned += 2 * sizeof(float) * (size_t)ctx_planned
+                         * c->n_kv_heads * c->head_dim;
+        if (kvb > planned)
+            fprintf(stderr, "warning: that is %.0f MiB more KV than the container's "
+                    "plan budgeted (%.0f MiB for ctx %d, f32), so total RAM will "
+                    "exceed the conversion's --ram%s\n",
+                    (kvb - planned) / 1048576.0, planned / 1048576.0, ctx_planned,
+                    quant ? "" : "; --kvq would cut it a lot");
+    }
 
     m->qcap = 2 * c->slots_per_layer;
     if (m->qcap < 2) m->qcap = 2;
@@ -1498,8 +1529,17 @@ static int lfm_serve_chat(LfmServerContext *ctx, int fd, jval *root) {
     int np = lfmtok_encode(tok, prompt.data, ids, c->ctx);
     free(prompt.data);
     if (np <= 0) { free(ids); free(logits); free(pbuf); return samosa_http_json_error(fd,400,"invalid_prompt","The prompt produced no tokens."); }
-    if (np >= c->ctx) { free(ids); free(logits); free(pbuf); return samosa_http_json_error(fd,400,"context_limit","The prompt leaves no room for completion."); }
-    if (max_tokens > c->ctx - np) max_tokens = c->ctx - np;
+    /* The context window is whatever --ctx sized the KV for at startup (advertised
+     * as context_length on /v1/models). Report the actual numbers: "context limit"
+     * with no figures is the least useful error a client can get. */
+    if (np >= c->ctx) {
+        char msg[256];
+        snprintf(msg, sizeof msg, "The prompt is %d tokens and the context window is "
+                 "%d; it leaves no room for a completion.", np, c->ctx);
+        free(ids); free(logits); free(pbuf);
+        return samosa_http_json_error(fd, 400, "context_limit", msg);
+    }
+    if (max_tokens > c->ctx - np) max_tokens = c->ctx - np;   /* clamp, do not fail */
 
     pthread_mutex_lock(&ctx->generation_mu);
     atomic_store(&ctx->cancel, 0);
@@ -1558,7 +1598,10 @@ static int lfm_serve_handler(SamosaHttpServer *server, int fd, const SamosaHttpR
     if (!strcmp(request->method,"GET") && !strcmp(request->path,"/healthz"))
         return samosa_http_response(fd,200,"application/json","{\"status\":\"ok\"}",NULL);
     if (!strcmp(request->method,"GET") && !strcmp(request->path,"/v1/models")) {
-        char body[512]; snprintf(body,sizeof body,"{\"object\":\"list\",\"data\":[{\"id\":\"%s\",\"object\":\"model\",\"owned_by\":\"local\"}]}",ctx->model_id);
+        char body[512]; snprintf(body,sizeof body,
+            "{\"object\":\"list\",\"data\":[{\"id\":\"%s\",\"object\":\"model\","
+            "\"owned_by\":\"local\",\"context_length\":%d,\"max_model_len\":%d}]}",
+            ctx->model_id, ctx->model->c.ctx, ctx->model->c.ctx);
         return samosa_http_response(fd,200,"application/json",body,NULL);
     }
     if (!strcmp(request->method,"POST") && !strcmp(request->path,"/v1/cancel")) {
@@ -1593,7 +1636,8 @@ static void usage(const char *prog, FILE *out) {
         "usage: %s <dir> [flags...] [prompt]\n"
         "         [--chat] [--system S] [--think] [--raw] [--max_tokens N]\n"
         "         [--temp F] [--topp F] [--topk N]   (default 0.2 / 1.0 / 80)\n"
-        "         [--pin N] [--io N] [--threads N] [--nobatch]\n"
+        "         [--ctx N]               override the container's context length\n"
+        "         [--pin N] [--io N] [--threads N] [--batch N] [--nobatch]\n"
         "         [--serve] [--port N]    OpenAI-compatible local server (default 8484)\n"
         "         [--kv off|k6v4|k4v2]    KV-cache compression preset\n"
         "         [--kvq] [--kbits N] [--vbits N] [--rwin N] [--protect N] [--pbits N]\n"
@@ -1613,7 +1657,7 @@ int main(int argc, char **argv) {
     int think = 0, raw = 0, chat_mode = 0;
     int kvq_on = 0, kb = 6, vb = 4, rwin = 128, kv_protect = 2, kv_pbits = 8;
     int check = 0, n_io = 8, max_tokens = 0, nobatch = 0, npin = 0, nthreads = 2;
-    int batch = 128;
+    int batch = 128, ctx_override = 0;
     int serve_mode = 0, serve_port = 8484;
     float temp = 0.2f, topp = 1.0f;      /* LFM2.5 generation defaults */
     int topk = 80;
@@ -1625,6 +1669,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--threads") && i + 1 < argc) nthreads = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--io") && i + 1 < argc) n_io = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--batch") && i + 1 < argc) batch = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--ctx") && i + 1 < argc) ctx_override = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--max_tokens") && i + 1 < argc) max_tokens = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--temp") && i + 1 < argc) temp = atof(argv[++i]);
         else if (!strcmp(argv[i], "--topp") && i + 1 < argc) topp = atof(argv[++i]);
@@ -1674,7 +1719,7 @@ int main(int argc, char **argv) {
 
     M m; memset(&m, 0, sizeof m);
     double t0 = now();
-    init(&m, dir, n_io, kb, vb, kv_protect, rwin, kv_pbits);
+    init(&m, dir, n_io, ctx_override, kb, vb, kv_protect, rwin, kv_pbits);
     Cfg *c = &m.c;
     pin_load(&m, npin);
     /* Prefill batch size. Bigger reuses each streamed weight row over more rows --

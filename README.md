@@ -236,6 +236,35 @@ Here: `--protect N` protects the first and last N layers with `--pbits` (default
 Flags: `--kbits` `--vbits` `--pbits` `--protect` `--rwin`.
 The residual window (rwin) is necessary at low bit-widths, if you try a 3-4 bit compression without a residual window, you just get garbage.
 
+## Context length
+
+Both engines take `--ctx N` to override the context the container was converted with.
+It is applied before the KV cache is sized, so lowering it simply returns RAM and
+raising it is allowed with a warning — the container's `ctx` only fixed
+`slots_per_layer` (the expert-cache plan), the weights do not care. Raising it does
+mean the total exceeds the RAM budget the conversion planned for, hence the warning.
+
+The startup line reports what you actually got, and it accounts for `--kvq`:
+
+```
+kv:  567 MiB for ctx 4096  (f32; --kvq would cut this a lot)   # gemma4, container default
+kv: 1047 MiB for ctx 16384 (f32; --kvq would cut this a lot)   # gemma4 --ctx 16384
+   warning: that is 480 MiB more KV than the container's plan budgeted ...
+kv:  238 MiB for ctx 16384 (K6/V4, rwin 128, 2 protected layers at 8 bits)
+```
+
+The warning is about BYTES, not about the context number: it fires only when the KV
+you are actually allocating exceeds what the conversion budgeted (an f32 KV at the
+container's own `ctx`). With `--kvq` a 4x longer context routinely costs *less* than
+the plan assumed — 4x the context for a third of the RAM, above — and that is
+silent, as it should be.
+
+Under `--serve` this is the server's context window: it is advertised as
+`context_length` / `max_model_len` on `GET /v1/models`, and a prompt that leaves no
+room for a completion is rejected with both figures in the error. There is no
+per-request context parameter — changing the window means restarting with a
+different `--ctx`, because the KV cache is allocated once.
+
 ## Tuning
 
 You can improve the generation speed quite a lot by playing around with these flags
@@ -308,12 +337,14 @@ python3 tools/convert_lfm_tokenizer.py /path/to/LFM2.5-8B-A1B/tokenizer.json ./l
 ```
 
 At `--ram 8 --ctx 4096 --expert-edge 2` that gives 606 MiB dense resident, 4.72 GiB
-of experts, 96 MiB KV and 29 of 32 slots/layer. Measured on an Intel Mac: ~8 tok/s
-prefill, ~12 tok/s decode, 89% expert-cache hit.
+of experts, 96 MiB KV and 29 of 32 slots/layer. Measured on an Intel Mac at 8 threads:
+~24 tok/s prefill, ~16 tok/s decode, ~90% expert-cache hit.
 
 Flags mirror `gemma4` where they mean the same thing (`--chat`, `--serve`, `--system`,
-`--raw`, `--temp/--topp/--topk`, `--pin`, `--io`, `--threads`, `--kv`/`--kvq` and the
-individual TurboQuant knobs). Sampling defaults are LFM2.5's own: temp 0.2, top_k 80.
+`--raw`, `--temp/--topp/--topk`, `--pin`, `--io`, `--threads`, `--ctx`, `--kv`/`--kvq`
+and the individual TurboQuant knobs). Sampling defaults are LFM2.5's own: temp 0.2,
+top_k 80. `--batch N` (default 128) sets the prefill batch: it is what gives each
+streamed weight row its reuse, so lowering it costs prefill speed and saves scratch.
 `--think` forces a reasoning block by pre-filling `<think>` — the chat template has
 no thinking toggle, the model decides for itself.
 
