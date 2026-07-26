@@ -7,3 +7,6 @@ test_kvq
 test_metal_sim
 test_q40
 venv/
+.venv/
+vendor/
+__pycache__/

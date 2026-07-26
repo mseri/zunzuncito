@@ -119,6 +119,35 @@ typedef struct {
     float *hid_batch;                       /* [(MAXDRAFT+2) * hidden] */
     int hid_rows;
 
+    /* DFlash block-parallel drafter (DFlashDraftModel). Drafts an entire block of
+     * tokens at once using bidirectional attention conditioned on backbone hidden
+     * states extracted from specific layers. */
+    int dflash;                             /* head loaded */
+    int dflash_L, dflash_D, dflash_nh, dflash_hd, dflash_nkv, dflash_inter, dflash_vocab;
+    float dflash_eps, dflash_theta;
+    int dflash_block_size, dflash_mask_token_id, dflash_sliding_window;
+    int dflash_n_target_layers, dflash_target_ids[16];
+    int dflash_types[MAXL];
+    const uint8_t *dflash_blob;
+    Layer dflash_layers[MAXL];
+    W dflash_fc, dflash_hidden_norm, dflash_norm;
+    /* Intermediate hidden states captured from the backbone at target layers.
+     * Sized per-forward: [n_target_layers * rows * hidden], grown on demand so a
+     * long prefill can be captured too (the drafter must condition on the WHOLE
+     * prompt, not just the last batch -- acceptance collapses otherwise). */
+    float *dflash_target_hidden;
+    int dflash_target_hidden_cap;           /* capacity, in rows */
+    /* Persistent draft-side context KV cache, one entry per ABSOLUTE position, per
+     * draft layer: [ctx * nkv * hd]. This mirrors past_key_values_draft in the
+     * reference implementation: every confirmed position's projected target hidden
+     * (fc + hidden_norm + k/v_proj + k_norm + rope at its own position) is cached
+     * once and reused by every subsequent draft block. */
+    float *dflash_ctx_k[MAXL], *dflash_ctx_v[MAXL];
+    int dflash_ctx_len;                     /* positions [0, len) are absorbed */
+    /* absorb scratch */
+    float *dfa_concat, *dfa_th, *dfa_kv, *dfa_sx;
+    int8_t *dfa_xq;
+
     int64_t *ucount;                        /* [n_layers * n_experts] routing counts */
     int npin;                               /* pinned slots per layer */
     char usage_path[4096];
@@ -157,6 +186,17 @@ typedef struct {
  * by --no-metal, or when gpu_init() fails for any reason. Every GPU call can decline
  * (returning 0) and the CPU path runs instead, so this is never load-bearing. */
 static int g_use_gpu = 0;
+
+/* DFlash iterative refinement (block-diffusion denoising). The reference drafts a
+ * block in a single greedy pass; because the drafter is ~1000x smaller than the
+ * target, we can optionally run extra denoising passes: after a pass, positions
+ * whose drafted token is confident (max softmax prob >= g_dflash_conf) are frozen
+ * as real input embeddings, the rest re-masked, and the block re-drafted. This is
+ * in-distribution for the model and raises the accepted prefix at near-zero cost
+ * relative to the target verify. g_dflash_refine = number of EXTRA passes (0 = off,
+ * i.e. reference behaviour). */
+static int g_dflash_refine = 0;
+static float g_dflash_conf = 0.9f;
 
 /* Ring capacity of a layer's KV. Sliding layers need MORE than `sliding_window`
  * slots, for two independent reasons -- and neither is slack:
@@ -352,6 +392,9 @@ static void rmsnorm(float *o, const float *x, const float *w, int D, float eps) 
 static inline float gelu_tanh(float x) {
     return 0.5f * x * (1.0f + tanhf(0.7978845608028654f * (x + 0.044715f * x * x * x)));
 }
+static inline float silu(float x) {
+    return x / (1.0f + expf(-x));
+}
 /* y = W x, W q4_0 [O,I].
  * COLI_F32ACT keeps activations in f32 (weights still q4_0). Only for validation:
  * it lets --check separate the int8-activation approximation from an actual bug. */
@@ -371,6 +414,16 @@ static void matvec(float *y, const W *w, const float *x, int8_t *xq, float *sx) 
     for (int o = 0; o < w->O; o++)
         y[o] = q40_dot(w->q + (size_t)o * q40_row_bytes(w->I), xq, sx, w->I);
 #endif
+}
+
+/* Batched Y = W X, W q4_0 [O,I], X is [S,I] row-major, Y is [S,O] row-major.
+ * One GPU dispatch fills an O*S grid, amortising launch latency and keeping the
+ * device busy -- the whole point of running a block (S>1) through DFlash. Falls
+ * back to S independent matvecs on the CPU path, which is what it did before. */
+static void matmul(float *Y, const W *w, const float *X, int S, int8_t *xq, float *sx) {
+    if (g_use_gpu && gpu_q40_matmul(Y, w->q, X, w->O, w->I, S)) return;
+    for (int s = 0; s < S; s++)
+        matvec(Y + (size_t)s * w->O, w, X + (size_t)s * w->I, xq, sx);
 }
 
 /* rotate_half RoPE. inv_freq's tail is ZERO on p-RoPE global layers (freq 0 =>
@@ -838,6 +891,9 @@ static void layer_fwd(M *m, int li, float *H, int S, int pos_base, Buf *b) {
         for (int hh = 0; hh < nh; hh++) { mx[hh] = -INFINITY; z[hh] = 0.0f; }
         for (int t = lo; t <= pos; t++) {
             kv_read(m, li, t, pos, nkv, hd, cap, b->kvk, b->kvv);
+            /* Heads are independent given this t; the online-softmax recurrence is
+             * carried per head across t, so parallelise the head loop, not t. */
+            #pragma omp parallel for schedule(static)
             for (int hh = 0; hh < nh; hh++) {
                 const float *qq = b->q + (size_t)hh * hd;
                 const float *kk = b->kvk + (size_t)(hh / rep) * hd;
@@ -909,6 +965,41 @@ static void embed_row(M *m, int tok, float *h) {
     for (int i = 0; i < D; i++) h[i] *= c->embed_scale;
 }
 
+/* Absorb `rows` captured target-hidden rows (positions pos0..pos0+rows-1) into the
+ * persistent draft context KV cache: concat the target layers, project through
+ * fc + hidden_norm, then per draft layer compute K (k_norm + rope at the row's own
+ * absolute position) and V, stored at the absolute position. Overwrites are fine:
+ * a position rewritten by a later forward always carries the confirmed token, so
+ * the LAST write is the correct one (same argument as kv_write for the target).
+ * This is the C equivalent of past_key_values_draft + crop(start). */
+static void dflash_absorb(M *m, int pos0, int rows) {
+    int D = m->dflash_D, ntl = m->dflash_n_target_layers;
+    int nkv = m->dflash_nkv, hd = m->dflash_hd;
+    size_t kvdim = (size_t)nkv * hd;
+    for (int r = 0; r < rows; r++) {
+        int p = pos0 + r;
+        if (p >= m->c.ctx) break;
+        for (int ti = 0; ti < ntl; ti++)
+            memcpy(m->dfa_concat + (size_t)ti * D,
+                   m->dflash_target_hidden + ((size_t)ti * rows + r) * D,
+                   sizeof(float) * D);
+        matvec(m->dfa_th, &m->dflash_fc, m->dfa_concat, m->dfa_xq, m->dfa_sx);
+        rmsnorm(m->dfa_th, m->dfa_th, m->dflash_hidden_norm.f, D, m->dflash_eps);
+        for (int li = 0; li < m->dflash_L; li++) {
+            Layer *L = &m->dflash_layers[li];
+            float *k = m->dflash_ctx_k[li] + (size_t)p * kvdim;
+            float *v = m->dflash_ctx_v[li] + (size_t)p * kvdim;
+            matvec(k, &L->k_proj, m->dfa_th, m->dfa_xq, m->dfa_sx);
+            for (int i = 0; i < nkv; i++)
+                rmsnorm(k + (size_t)i * hd, k + (size_t)i * hd,
+                        L->k_norm.f, hd, m->dflash_eps);
+            rope(k, nkv, hd, p, m->dflash_theta, 1.0f);
+            matvec(v, &L->v_proj, m->dfa_th, m->dfa_xq, m->dfa_sx);
+        }
+    }
+    if (pos0 + rows > m->dflash_ctx_len) m->dflash_ctx_len = pos0 + rows;
+}
+
 /* Run S tokens. logits may be NULL (prefill), or [S, vocab], or -- the common
  * case -- only the LAST row is wanted, which `last_only` gives. */
 static void forward(M *m, const int *ids, int S, int pos_base,
@@ -920,12 +1011,40 @@ static void forward(M *m, const int *ids, int S, int pos_base,
 
     float *H = b->x;
     for (int s = 0; s < S; s++) embed_row(m, ids[s], H + (size_t)s * D);
-    for (int l = 0; l < c->n_layers; l++) layer_fwd(m, l, H, S, pos_base, b);
+
+    /* DFlash: capture hidden states at specific backbone layers.
+     * We snapshot H after each target layer, BEFORE the next layer overwrites it.
+     * The hidden states are post-norm (HF's hidden_states[layer_idx]). */
+    if (m->dflash) {
+        int ntl = m->dflash_n_target_layers;
+        if (S > m->dflash_target_hidden_cap) {
+            m->dflash_target_hidden_cap = S;
+            free(m->dflash_target_hidden);
+            m->dflash_target_hidden = xmalloc(sizeof(float) * (size_t)ntl * S * D);
+        }
+        for (int l = 0; l < c->n_layers; l++) {
+            layer_fwd(m, l, H, S, pos_base, b);
+            /* Check if this layer is a target */
+            for (int ti = 0; ti < ntl; ti++) {
+                if (m->dflash_target_ids[ti] == l) {
+                    /* HF's hidden_states[l+1] = RAW output of layer l (no final norm).
+                     * The DFlash fc + hidden_norm was trained on these raw states. */
+                    for (int s = 0; s < S; s++)
+                        memcpy(m->dflash_target_hidden + ((size_t)ti * S + s) * D,
+                               H + (size_t)s * D, sizeof(float) * D);
+                    break;
+                }
+            }
+        }
+        dflash_absorb(m, pos_base, S);
+    } else {
+        for (int l = 0; l < c->n_layers; l++) layer_fwd(m, l, H, S, pos_base, b);
+    }
 
     /* Stash the post-norm hidden (HF's last_hidden_state) of every row for a small
      * batch, or just the final row for a long prefill. The head needs a specific
      * row -- the last ACCEPTED one -- which is only known after verification. */
-    if (m->mtp) {
+    if (m->mtp || m->dflash) {
         if (S <= MAXDRAFT + 1) {
             for (int s = 0; s < S; s++)
                 rmsnorm(m->hid_batch + (size_t)s * D, H + (size_t)s * D, fnorm->f, D, c->eps);
@@ -1083,14 +1202,334 @@ static MBuf *mtp_bufs(M *m) {
     if (gkv > mkv) mkv = gkv;
     b->kbuf = xmalloc(sizeof(float) * mkv);
     b->vbuf = xmalloc(sizeof(float) * mkv);
-    b->xq = xmalloc(wide + 64);
-    b->sx = xmalloc(sizeof(float) * (wide / Q40_BLK + 8));
-    return b;
-}
+    	b->xq = xmalloc(wide + 64);
+    	b->sx = xmalloc(sizeof(float) * (wide / Q40_BLK + 8));
+    	return b;
+    }
 
-/* one draft step. `bh` is the backbone-space hidden [2816] (in/out), `tok` the token
- * to condition on, `pos` its absolute position. Writes vocab logits. */
-static void mtp_forward(M *m, float *bh, int tok, int pos, float *logits, MBuf *b) {
+    /* ------------------------------------------------------------------ DFlash
+     *
+     * DFlash is a block-parallel drafter: instead of drafting one token at a time, it
+     * drafts an entire block of `block_size` tokens simultaneously using bidirectional
+     * attention. It conditions on hidden states extracted from specific layers of the
+     * target backbone (e.g. layers 1, 6, 11, 17, 22, 27 for Gemma-4 26B).
+     *
+     * The attention is special: for each position in the draft block, K and V come from
+     * BOTH the target hidden context (cross-attention) AND the draft block's own tokens
+     * (bidirectional self-attention). The two are concatenated along the sequence dim.
+     *
+     * The model is Qwen3-based (not Gemma4): each layer has q_proj, k_proj, v_proj,
+     * o_proj, q_norm, k_norm, and a plain MLP (gate/up/down). No MoE, no sliding window
+     * in the backbone sense -- the sliding_window config only affects the attention mask.
+     *
+     * The draft loop:
+     *   1. Extract target hidden states from backbone layers (done in forward()).
+     *   2. Project through fc + hidden_norm to get target_hidden.
+     *   3. Initialize block with mask tokens, first position = target's sampled token.
+     *   4. Run 5 decoder layers with DFlash attention.
+     *   5. Pass through target's lm_head to get logits.
+     *   6. Sample draft tokens from logits.
+     *   7. Verify with ONE batched target forward.
+     *   8. Accept matching tokens + one bonus token from target.
+     */
+
+    typedef struct {
+        /* Per-row hidden states for the draft block [block_size * D] */
+        float *h;
+        /* Scratch: norm, q (per-position), tmp, gate, up, mlp */
+        float *xn, *q, *tmp, *gate, *up, *mlp;
+        /* Per-(position, head) attention output [BS * nh * hd] */
+        float *ao;
+        /* K/V of the draft block's own tokens [BS * nkv * hd] */
+        float *nk, *nv;
+        int8_t *xq; float *sx;
+        /* Persistent logit/draft-prob buffers (avoid alloc/free per step) */
+        float *dlog, *dprob;
+    } DBuf;
+
+    static DBuf *dflash_bufs(M *m) {
+        int D = m->dflash_D, BS = m->dflash_block_size;
+        int nh = m->dflash_nh, hd = m->dflash_hd, nkv = m->dflash_nkv;
+        int qmax = nh * hd;          /* one position's query vector */
+        int kvmax = nkv * hd;        /* one position's K/V */
+        int wide = D;
+        if (wide < qmax) wide = qmax;
+        if (wide < m->dflash_inter) wide = m->dflash_inter;
+        if (wide < m->dflash_vocab) wide = m->dflash_vocab;
+
+        DBuf *b = calloc(1, sizeof *b);
+        b->h = xmalloc(sizeof(float) * (size_t)BS * D);
+        /* xn holds all BS normed rows contiguously so projections batch into one
+         * matmul; gate/up/mlp likewise span the whole block. */
+        b->xn = xmalloc(sizeof(float) * (size_t)BS * (wide < D ? D : wide));
+        b->q = xmalloc(sizeof(float) * (size_t)BS * qmax);
+        b->ao = xmalloc(sizeof(float) * (size_t)BS * qmax);
+        b->tmp = xmalloc(sizeof(float) * (size_t)BS * wide);
+        b->gate = xmalloc(sizeof(float) * ((size_t)BS * m->dflash_inter + 64));
+        b->up = xmalloc(sizeof(float) * ((size_t)BS * m->dflash_inter + 64));
+        b->mlp = xmalloc(sizeof(float) * ((size_t)BS * m->dflash_inter + 64));
+        b->nk = xmalloc(sizeof(float) * (size_t)BS * kvmax);
+        b->nv = xmalloc(sizeof(float) * (size_t)BS * kvmax);
+        b->xq = xmalloc(wide + 64);
+        b->sx = xmalloc(sizeof(float) * (wide / Q40_BLK + 8));
+        /* Persistent logit/draft-prob buffers: [BS * V] each */
+        b->dlog = xmalloc(sizeof(float) * (size_t)BS * m->dflash_vocab);
+        b->dprob = xmalloc(sizeof(float) * (size_t)BS * m->dflash_vocab);
+        return b;
+    }
+
+    /* DFlash attention for one layer. `S` is the number of draft positions,
+     * `pos_base` the absolute position of the first one. Context K/V for positions
+     * [0, pos_base) come from the persistent cache (m->dflash_ctx_k/v, filled by
+     * dflash_absorb); only the block's own K/V are computed here. Bidirectional
+     * within the block; layers 0-3 apply the 2048 sliding window over the context. */
+    static void dflash_attn(M *m, int li, float *H, int S, int pos_base, DBuf *b) {
+        int D = m->dflash_D, nh = m->dflash_nh, hd = m->dflash_hd;
+        int nkv = m->dflash_nkv, rep = nh / nkv;
+        size_t kvdim = (size_t)nkv * hd;
+        float theta = m->dflash_theta;
+        float scale = 1.0f / sqrtf((float)hd);
+        Layer *L = &m->dflash_layers[li];
+        int ctx = pos_base < m->dflash_ctx_len ? pos_base : m->dflash_ctx_len;
+        int win = m->dflash_types[li] ? 0 : m->dflash_sliding_window;
+        const float *CK = m->dflash_ctx_k[li], *CV = m->dflash_ctx_v[li];
+
+        /* ---- Q and the block's own K/V (all from the input_layernorm'd hidden) ----
+         * All S rows are normed into b->xn contiguously, then each projection is a
+         * single batched matmul over the block (one GPU dispatch instead of S). */
+        for (int s = 0; s < S; s++)
+            rmsnorm(b->xn + (size_t)s * D, H + (size_t)s * D, L->in_ln.f, D, m->dflash_eps);
+        matmul(b->q,  &L->q_proj, b->xn, S, b->xq, b->sx);
+        matmul(b->nk, &L->k_proj, b->xn, S, b->xq, b->sx);
+        matmul(b->nv, &L->v_proj, b->xn, S, b->xq, b->sx);
+        for (int s = 0; s < S; s++) {
+            float *q = b->q + (size_t)s * nh * hd;
+            for (int i = 0; i < nh; i++)
+                rmsnorm(q + (size_t)i * hd, q + (size_t)i * hd,
+                        L->q_norm.f, hd, m->dflash_eps);
+            rope(q, nh, hd, pos_base + s, theta, 1.0f);
+            float *k = b->nk + (size_t)s * kvdim;
+            for (int i = 0; i < nkv; i++)
+                rmsnorm(k + (size_t)i * hd, k + (size_t)i * hd,
+                        L->k_norm.f, hd, m->dflash_eps);
+            rope(k, nkv, hd, pos_base + s, theta, 1.0f);
+        }
+
+        /* ---- Attention: each block position attends to the whole cached context
+         * plus every block position (bidirectional). Two-pass softmax per (s, head)
+         * with a thread-private score buffer; parallel over the S*nh tasks. */
+        #pragma omp parallel for collapse(2) schedule(static)
+        for (int s = 0; s < S; s++) {
+            for (int hh = 0; hh < nh; hh++) {
+                int qpos = pos_base + s;
+                int lo = 0;
+                if (win && qpos - win + 1 > 0) lo = qpos - win + 1;
+                if (lo > ctx) lo = ctx;
+                int nctx = ctx - lo, total = nctx + S;
+                float sc[total];   /* <= sliding_window + block on 4 of 5 layers */
+                const float *qq = b->q + ((size_t)s * nh + hh) * hd;
+                size_t koff = (size_t)(hh / rep) * hd;
+                float mx = -INFINITY;
+                for (int t = 0; t < nctx; t++) {
+                    const float *kk = CK + (size_t)(lo + t) * kvdim + koff;
+                    float sco = 0.0f;
+                    for (int d = 0; d < hd; d++) sco += qq[d] * kk[d];
+                    sc[t] = sco * scale;
+                    if (sc[t] > mx) mx = sc[t];
+                }
+                for (int t = 0; t < S; t++) {
+                    const float *kk = b->nk + (size_t)t * kvdim + koff;
+                    float sco = 0.0f;
+                    for (int d = 0; d < hd; d++) sco += qq[d] * kk[d];
+                    sc[nctx + t] = sco * scale;
+                    if (sc[nctx + t] > mx) mx = sc[nctx + t];
+                }
+                float *ov = b->ao + ((size_t)s * nh + hh) * hd;
+                memset(ov, 0, sizeof(float) * hd);
+                float z = 0.0f;
+                for (int t = 0; t < total; t++) {
+                    float w = expf(sc[t] - mx);
+                    z += w;
+                    const float *vv = (t < nctx)
+                        ? CV + (size_t)(lo + t) * kvdim + koff
+                        : b->nv + (size_t)(t - nctx) * kvdim + koff;
+                    for (int d = 0; d < hd; d++) ov[d] += w * vv[d];
+                }
+                float inv = 1.0f / z;
+                for (int d = 0; d < hd; d++) ov[d] *= inv;
+            }
+        }
+
+        /* output projection + residual (batched over the block) */
+        matmul(b->tmp, &L->o_proj, b->ao, S, b->xq, b->sx);
+        for (int s = 0; s < S; s++) {
+            float *h = H + (size_t)s * D, *o = b->tmp + (size_t)s * D;
+            for (int i = 0; i < D; i++) h[i] += o[i];
+        }
+    }
+
+    /* DFlash forward: run all layers over the draft block.
+     * H: [S * D] draft hidden states (initialized with noise embeddings).
+     * pos_base: absolute position of the first draft token; context K/V for
+     * positions [0, pos_base) come from the persistent draft cache. */
+    static void dflash_forward(M *m, float *H, int S, int pos_base, DBuf *b) {
+        int D = m->dflash_D;
+
+        for (int li = 0; li < m->dflash_L; li++) {
+            /* Post-attention residual add happens inside dflash_attn */
+            dflash_attn(m, li, H, S, pos_base, b);
+
+            /* FFN: plain MLP with SiLU activation (Qwen3-style, not Gemma4's gelu_tanh).
+             * Batched over the block: gate/up/down are each one matmul. */
+            Layer *L = &m->dflash_layers[li];
+            int MI = m->dflash_inter;
+            for (int s = 0; s < S; s++)
+                rmsnorm(b->xn + (size_t)s * D, H + (size_t)s * D,
+                        L->post_attn_ln.f, D, m->dflash_eps);
+            matmul(b->gate, &L->mlp_gate, b->xn, S, b->xq, b->sx);
+            matmul(b->up, &L->mlp_up, b->xn, S, b->xq, b->sx);
+            for (size_t i = 0; i < (size_t)S * MI; i++)
+                b->mlp[i] = silu(b->gate[i]) * b->up[i];
+            matmul(b->tmp, &L->mlp_down, b->mlp, S, b->xq, b->sx);
+            for (int s = 0; s < S; s++) {
+                float *h = H + (size_t)s * D, *o = b->tmp + (size_t)s * D;
+                for (int i = 0; i < D; i++) h[i] += o[i];
+            }
+        }
+
+        /* Final norm */
+        for (int s = 0; s < S; s++)
+            rmsnorm(H + (size_t)s * D, H + (size_t)s * D, m->dflash_norm.f, D, m->dflash_eps);
+    }
+
+    /* Load the DFlash head from dflash.manifest.txt / dflash.bin. */
+    static int dflash_load(M *m, const char *dir) {
+        char p[4096];
+        snprintf(p, sizeof p, "%s/dflash.manifest.txt", dir);
+        FILE *f = fopen(p, "r");
+        if (!f) return 0;
+
+        char line[1024];
+        int ndense = 0, di = 0;
+        DEnt *dd = NULL;
+        while (fgets(line, sizeof line, f)) {
+            char k[64];
+            if (sscanf(line, "cfg %63s", k) == 1) {
+                char *v = line + 4 + strlen(k) + 1;
+                if (!strcmp(k, "layer_types")) {
+                    int n = 0;
+                    for (char *t = strtok(v, " \n"); t && n < MAXL; t = strtok(NULL, " \n"))
+                        m->dflash_types[n++] = atoi(t);
+                }
+                else if (!strcmp(k, "target_layer_ids")) {
+                    int n = 0;
+                    for (char *t = strtok(v, " \n"); t && n < 16; t = strtok(NULL, " \n"))
+                        m->dflash_target_ids[n++] = atoi(t);
+                    m->dflash_n_target_layers = n;
+                }
+                else if (!strcmp(k, "hidden"))            m->dflash_D = atoi(v);
+                else if (!strcmp(k, "n_layers"))          m->dflash_L = atoi(v);
+                else if (!strcmp(k, "n_heads"))           m->dflash_nh = atoi(v);
+                else if (!strcmp(k, "head_dim"))          m->dflash_hd = atoi(v);
+                else if (!strcmp(k, "n_kv_heads"))        m->dflash_nkv = atoi(v);
+                else if (!strcmp(k, "intermediate_size")) m->dflash_inter = atoi(v);
+                else if (!strcmp(k, "vocab_size"))        m->dflash_vocab = atoi(v);
+                else if (!strcmp(k, "eps"))               m->dflash_eps = atof(v);
+                else if (!strcmp(k, "rope_theta"))        m->dflash_theta = atof(v);
+                else if (!strcmp(k, "block_size"))        m->dflash_block_size = atoi(v);
+                else if (!strcmp(k, "mask_token_id"))     m->dflash_mask_token_id = atoi(v);
+                else if (!strcmp(k, "sliding_window"))    m->dflash_sliding_window = atoi(v);
+                continue;
+            }
+            if (sscanf(line, "ndense %d", &ndense) == 1) { dd = calloc(ndense, sizeof *dd); continue; }
+            char nm[96]; long long off, len; int fmt, O, I;
+            if (sscanf(line, "dense %95s %lld %lld %d %d %d", nm, &off, &len, &fmt, &O, &I) == 6) {
+                snprintf(dd[di].name, sizeof dd[di].name, "%s", nm);
+                dd[di].off = off; dd[di].len = len; dd[di].fmt = fmt;
+                dd[di].O = O; dd[di].I = I; di++;
+            }
+        }
+        fclose(f);
+
+        snprintf(p, sizeof p, "%s/dflash.bin", dir);
+        int fd = open(p, O_RDONLY);
+        if (fd < 0) { free(dd); return 0; }
+        off_t sz = lseek(fd, 0, SEEK_END);
+        uint8_t *blob = xmalloc(sz);
+        for (off_t o = 0; o < sz;) {
+            ssize_t r = pread(fd, blob + o, sz - o, o);
+            if (r <= 0) { perror("read dflash.bin"); exit(1); }
+            o += r;
+        }
+        close(fd);
+        m->dflash_blob = blob;
+        if (g_use_gpu) gpu_map(blob, (size_t)sz);
+
+        m->dflash_fc = dense_bind(dd, ndense, blob, "fc");
+        m->dflash_hidden_norm = dense_bind(dd, ndense, blob, "hidden_norm");
+        m->dflash_norm = dense_bind(dd, ndense, blob, "norm");
+
+        char nm[128];
+        for (int l = 0; l < m->dflash_L; l++) {
+            Layer *L = &m->dflash_layers[l];
+            #define DB(f, str) do { snprintf(nm, sizeof nm, "layers.%d." str, l); \
+                                    L->f = dense_bind(dd, ndense, blob, nm); } while (0)
+            DB(in_ln, "input_layernorm");
+            DB(post_attn_ln, "post_attention_layernorm");
+            DB(q_proj, "q_proj");
+            DB(k_proj, "k_proj");
+            DB(v_proj, "v_proj");
+            DB(o_proj, "o_proj");
+            DB(q_norm, "q_norm");
+            DB(k_norm, "k_norm");
+            DB(mlp_gate, "mlp_gate");
+            DB(mlp_up, "mlp_up");
+            DB(mlp_down, "mlp_down");
+            #undef DB
+        }
+        free(dd);
+
+        if (m->dflash_vocab != m->c.vocab) {
+            fprintf(stderr, "dflash: vocab %d != target %d\n", m->dflash_vocab, m->c.vocab);
+            return 0;
+        }
+        if (m->dflash_D != m->c.hidden) {
+            fprintf(stderr, "dflash: hidden %d != target %d\n", m->dflash_D, m->c.hidden);
+            return 0;
+        }
+
+        /* Capture buffer starts small and grows to the largest forward batch (prefill). */
+        m->dflash_target_hidden_cap = MAXDRAFT + 2;
+        m->dflash_target_hidden = xmalloc(sizeof(float) * (size_t)m->dflash_n_target_layers
+                                           * m->dflash_target_hidden_cap * m->c.hidden);
+        /* Persistent draft context KV cache: one K/V per absolute position per layer. */
+        size_t kvdim = (size_t)m->dflash_nkv * m->dflash_hd;
+        for (int l = 0; l < m->dflash_L; l++) {
+            m->dflash_ctx_k[l] = xmalloc(sizeof(float) * (size_t)m->c.ctx * kvdim);
+            m->dflash_ctx_v[l] = xmalloc(sizeof(float) * (size_t)m->c.ctx * kvdim);
+        }
+        m->dflash_ctx_len = 0;
+        /* absorb scratch */
+        int wideA = m->dflash_n_target_layers * m->dflash_D;
+        m->dfa_concat = xmalloc(sizeof(float) * wideA);
+        m->dfa_th = xmalloc(sizeof(float) * m->dflash_D);
+        m->dfa_kv = xmalloc(sizeof(float) * kvdim);
+        m->dfa_xq = xmalloc(wideA + 64);
+        m->dfa_sx = xmalloc(sizeof(float) * (wideA / Q40_BLK + 8));
+
+        m->dflash = 1;
+        fprintf(stderr, "dflash: %d layers, hidden %d, block_size %d, %d target layers\n",
+                m->dflash_L, m->dflash_D, m->dflash_block_size, m->dflash_n_target_layers);
+        fprintf(stderr, "dflash: target layer ids: ");
+        for (int i = 0; i < m->dflash_n_target_layers; i++)
+            fprintf(stderr, "%d ", m->dflash_target_ids[i]);
+        fprintf(stderr, "\n");
+        return 1;
+    }
+
+    /* one draft step. `bh` is the backbone-space hidden [2816] (in/out), `tok` the token
+     * to condition on, `pos` its absolute position. Writes vocab logits. */
+    static void mtp_forward(M *m, float *bh, int tok, int pos, float *logits, MBuf *b) {
     Cfg *c = &m->c;
     int D = m->mtp_D, BB = m->mtp_BB, nh = m->mtp_nh;
 
@@ -1781,6 +2220,169 @@ static int mtp_step(M *m, Buf *bt, MBuf *bd, int *ids, int P, float *hprev,
     return n + 1;
 }
 
+/* DFlash block-parallel speculative step.
+ *
+ * Unlike MTP (which drafts one token at a time), DFlash drafts an entire block of
+ * `block_size` tokens at once using bidirectional attention. The draft is conditioned
+ * on hidden states extracted from specific backbone layers.
+ *
+ * Algorithm (mirrors dflash_generate in the reference):
+ *   1. Initialize block: position 0 = `first_tok` (already sampled by the previous
+ *      step -- the "bonus" token), rest = mask tokens.
+ *   2. Run DFlash forward (context = the persistent draft KV cache, which every
+ *      target forward, prefill included, keeps up to date via dflash_absorb).
+ *   3. Pass through target's lm_head; draft tokens greedily (like the paper).
+ *   4. Verify with ONE batched target forward; accept the matching prefix and
+ *      sample the next step's first token (the bonus) from the target's
+ *      distribution at the first unverified position. That token's KV and draft
+ *      context are computed by the NEXT verify forward -- no extra forward needed.
+ *
+ * `pos` is the absolute position of first_tok, whose KV is written here too.
+ * Writes first_tok + the accepted drafts to out[0..n], the bonus to *next_tok,
+ * and returns n+1 (= tokens of `out` to emit). */
+static int dflash_step(M *m, Buf *bt, DBuf *bd, int first_tok, int pos,
+                        int d, float temp, float topp, int topk,
+                        PI *pbuf, uint64_t *rng, int *out, int *accepted,
+                        int *next_tok) {
+    Cfg *c = &m->c;
+    int V = c->vocab, D = c->hidden;
+    int BS = m->dflash_block_size;
+    int mask_id = m->dflash_mask_token_id;
+
+    if (d > BS) d = BS;
+    if (d < 1) d = 1;
+
+    float *H = bd->h;
+    float *dlog = bd->dlog;
+    float *dprob = bd->dprob;
+    W *embed = &m->L[MAXL - 1].q_proj;
+    int ndraft = d - 1;  /* number of tokens we actually draft */
+    int draft[MAXDRAFT];
+    /* frozen[i] (draft index) = position i+1 held a confident token last pass and is
+     * fed as a real embedding this pass instead of the mask token. Once set it stays
+     * set (monotone denoising). All zero when refinement is off -> reference path. */
+    int frozen[MAXDRAFT] = {0};
+    float cap = c->final_logit_softcap;
+    int npass = g_dflash_refine + 1;
+    double t0 = now(), t1 = t0;
+
+    /* ---- 2/3. One or more denoising passes. Each pass: (re)embed the block with the
+     * currently frozen tokens, run the DFlash forward, then take greedy drafts from
+     * the logits. On non-final passes we also measure per-position confidence and
+     * freeze the confident ones so the next pass conditions on them. */
+    for (int pass = 0; pass < npass; pass++) {
+        int last_pass = (pass == npass - 1);
+
+        /* Embed the block using the TARGET's embedding table: position 0 is the bonus
+         * token, the rest are either a frozen draft or the mask token. */
+        embed_row(m, first_tok, H);
+        for (int i = 1; i < d; i++) {
+            if (frozen[i - 1]) embed_row(m, draft[i - 1], H + (size_t)i * D);
+            else               embed_row(m, mask_id,      H + (size_t)i * D);
+        }
+
+        /* Context K/V for positions [0, pos) come from the persistent draft cache,
+         * filled by every target forward (prefill included). dflash_forward mutates
+         * H in place but touches no persistent state, so re-running it is safe. */
+        dflash_forward(m, H, d, pos, bd);
+        if (pass == 0) t1 = now();
+
+        /* Logits for positions 1..d-1 only (skip position 0). Python:
+         * draft_logits = target.lm_head(model(...)[:, 1-B:, :]). */
+        for (int i = 0; i < ndraft; i++) {
+            float *dl = dlog + (size_t)i * V;
+            matvec(dl, embed, H + (size_t)(i + 1) * D, bd->xq, bd->sx);
+            int am = 0;
+            for (int j = 1; j < V; j++) if (dl[j] > dl[am]) am = j;
+            draft[i] = am;   /* the drafter is greedy, like the reference */
+
+            if (!last_pass) {
+                /* Confidence = max softmax prob (temperature-independent, softcapped).
+                 * Freeze this position for the next pass if it clears the threshold.
+                 * Skip positions already frozen -- their token is fixed. */
+                if (frozen[i]) continue;
+                float mx = cap > 0 ? tanhf(dl[am] / cap) * cap : dl[am];
+                double sum = 0;
+                for (int j = 0; j < V; j++) {
+                    float lg = cap > 0 ? tanhf(dl[j] / cap) * cap : dl[j];
+                    sum += expf(lg - mx);
+                }
+                if (1.0f / (float)sum >= g_dflash_conf) frozen[i] = 1;
+            } else if (temp > 0) {
+                /* Final pass: the softcap + softmax over the 262k vocab are only needed
+                 * for the temp > 0 rejection test (tanh is monotone, argmax unaffected). */
+                float mx = cap > 0 ? tanhf(dl[am] / cap) * cap : dl[am];
+                double sum = 0;
+                float *dp = dprob + (size_t)i * V;
+                for (int j = 0; j < V; j++) {
+                    float lg = cap > 0 ? tanhf(dl[j] / cap) * cap : dl[j];
+                    dp[j] = expf((lg - mx) / temp);
+                    sum += dp[j];
+                }
+                for (int j = 0; j < V; j++) dp[j] /= (float)sum;
+            }
+        }
+    }
+
+    /* ---- 4. Verify with ONE batched target forward, exactly the reference's
+     * block: [first_tok, draft[0], ..., draft[ndraft-1]] at positions pos..pos+ndraft.
+     * Row i's lm_head predicts position pos+i+1, so it verifies draft[i]. (Position
+     * pos-1's KV is already written by the previous forward; first_tok is the
+     * target's OWN sample and needs no verification.) */
+    int batch[MAXDRAFT + 1];
+    batch[0] = first_tok;
+    for (int i = 0; i < ndraft; i++) batch[i + 1] = draft[i];
+    m->kv_conf = pos - 1;
+    double t2 = now();
+    forward(m, batch, d, pos, NULL, 0, bt);
+    double t3 = now();
+    if (getenv("G4DBG"))
+        fprintf(stderr, "[dflash] pos %d: draft-fwd %.0fms lm_head %.0fms verify-fwd %.0fms\n",
+                pos, (t1 - t0) * 1e3, (t2 - t1) * 1e3, (t3 - t2) * 1e3);
+
+    float *q = xmalloc(sizeof(float) * V);
+    int n;  /* number of DRAFT tokens accepted (not counting first_tok) */
+    out[0] = first_tok;
+
+    for (n = 0; n < ndraft; n++) {
+        lm_head_row(m, m->hid_batch + (size_t)n * c->hidden, q, bt);
+        int t = draft[n], ok;
+        if (temp <= 0) {
+            int am = 0;
+            for (int j = 1; j < V; j++) if (q[j] > q[am]) am = j;
+            ok = (am == t);
+        } else {
+            float mx = -1e30f;
+            for (int j = 0; j < V; j++) if (q[j] > mx) mx = q[j];
+            double sum = 0;
+            for (int j = 0; j < V; j++) {
+                pbuf[j].p = expf((q[j] - mx) / temp);
+                sum += pbuf[j].p;
+            }
+            float qt = (float)(pbuf[t].p / sum);
+            float pt = dprob[(size_t)n * V + t];
+            *rng = *rng * 6364136223846793005ULL + 1442695040888963407ULL;
+            double r = (*rng >> 11) / (double)(1ULL << 53);
+            ok = (pt <= 0) || (r < (double)qt / pt);
+        }
+        if (!ok) break;
+        out[n + 1] = t;
+    }
+
+    /* Next step's first token ("bonus") from the target's distribution at the
+     * first unverified position: row n's lm_head predicts position pos+n+1. */
+    lm_head_row(m, m->hid_batch + (size_t)n * c->hidden, q, bt);
+    *next_tok = sample(q, V, temp, topp, topk, pbuf, rng);
+
+    /* Positions pos..pos+n are confirmed (first_tok + n drafts). The bonus token's
+     * KV and draft context are computed by the next step's verify forward. */
+    m->kv_conf = pos + n;
+    *accepted = n;
+
+    free(q);
+    return n + 1;  /* first_tok + n drafts */
+}
+
 /* ------------------------------------------------------------------ OpenAI-compatible local server */
 typedef struct {
     M *model;
@@ -2035,7 +2637,9 @@ static void usage(const char *prog, FILE *out) {
         "         [--chat] [--system S] [--think] [--raw] [--max_tokens N]\n"
         "         [--temp F] [--topp F] [--topk N]   (default 1.0 / 0.95 / 64)\n"
         "         [--pin N] [--draft DIR] [--ndraft N]\n"
-        "         [--mtp]\n"
+        "         [--mtp] [--dflash] [--drefine N] [--dconf F]\n"
+        "                                DFlash extra denoising passes (default 0) and\n"
+        "                                per-token freeze confidence (default 0.9)\n"
         "         [--io N] [--nobatch] [--threads N]\n"
         "         [--metal] Metal is OFF by default (it is slower if gemma is not fully in RAM)\n"
         "         [--serve] [--port N]    OpenAI-compatible local server (default 8484)\n"
@@ -2061,7 +2665,7 @@ int main(int argc, char **argv) {
     const char *prompt = NULL, *sys = NULL;
     int think = 0, raw = 0, chat_mode = 0;
     int kvq_on = 0, kb = 6, vb = 4, rwin = 128, kv_protect = 2, kv_pbits = 8;
-    int no_metal = 0, chk_gpu = 0, use_mtp = 0, use_metal = 0;
+    int no_metal = 0, chk_gpu = 0, use_mtp = 0, use_dflash = 0, use_metal = 0;
     int check = 0, n_io = 8, max_tokens = 0, nobatch = 0, npin = 0, draft = 0, nthreads = 2;
     int serve_mode = 0, serve_port = 8484;
     const char *dpath = NULL;
@@ -2082,6 +2686,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--pin") && i + 1 < argc) npin = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--draft") && i + 1 < argc) dpath = argv[++i];
         else if (!strcmp(argv[i], "--ndraft") && i + 1 < argc) draft = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--drefine") && i + 1 < argc) g_dflash_refine = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--dconf") && i + 1 < argc) g_dflash_conf = atof(argv[++i]);
         else if (!strcmp(argv[i], "--system") && i + 1 < argc) sys = argv[++i];
         else if (!strcmp(argv[i], "--chat")) chat_mode = 1;
         else if (!strcmp(argv[i], "--think")) think = 1;
@@ -2112,6 +2718,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--metal")) use_metal = 1;
         else if (!strcmp(argv[i], "--check-gpu")) chk_gpu = 1;
         else if (!strcmp(argv[i], "--mtp")) use_mtp = 1;
+        else if (!strcmp(argv[i], "--dflash")) use_dflash = 1;
         else if (argv[i][0] == '-' && argv[i][1] == '-') {
             fprintf(stderr, "unknown flag: %s\n\n", argv[i]);
             usage(argv[0], stderr);
@@ -2136,6 +2743,7 @@ int main(int argc, char **argv) {
     /* Default max_tokens when a prompt is given (or interactive mode) but --max_tokens was not set. */
     if (!serve_mode && !check && max_tokens == 0) max_tokens = 2048;
     if (draft > MAXDRAFT) draft = MAXDRAFT;
+    if (use_dflash && draft <= 0) draft = 16;  /* DFlash default block size */
     if ((dpath || use_mtp) && draft <= 0) draft = 4;
 #ifdef _OPENMP
     if (nthreads > 0) omp_set_num_threads(nthreads);
@@ -2192,6 +2800,19 @@ int main(int argc, char **argv) {
             return 1;
         }
         mb = mtp_bufs(&m);
+    }
+
+    DBuf *dfb = NULL;
+    if (use_dflash) {
+        if (!dflash_load(&m, dir)) {
+            fprintf(stderr, "--dflash: no usable dflash.* in %s "
+                    "(run tools/convert_gemma4_dflash.py)\n", dir);
+            return 1;
+        }
+        dfb = dflash_bufs(&m);
+        /* DFlash needs the hid_batch for verification (same as MTP) */
+        if (!m.hid_batch)
+            m.hid_batch = xmalloc(sizeof(float) * (size_t)(MAXDRAFT + 2) * c->hidden);
     }
 
     M dm; memset(&dm, 0, sizeof dm);
@@ -2463,6 +3084,42 @@ int main(int argc, char **argv) {
                 goto done_decode;
             }
 
+            if (use_dflash) {
+                /* DFlash block-parallel speculative decode. ONE target forward per
+                 * step: it verifies the drafts AND writes the KV / draft context of
+                 * the previous step's bonus token (block position 0), exactly like
+                 * the reference's rolling block. */
+                int cur = sample(logits, c->vocab, temp, topp, topk, pbuf, &rng);
+                while (n < max_tokens) {
+                    int d = draft;
+                    if (d > m.dflash_block_size) d = m.dflash_block_size;
+                    if (n + d > max_tokens) d = max_tokens - n;
+                    int pos = np + n;      /* absolute position of `cur` */
+                    if (pos + d > c->ctx) d = c->ctx - pos;   /* KV ring bound */
+                    if (d < 1) d = 1;
+                    int acc = 0, nxt = -1;
+                    int got = dflash_step(&m, b, dfb, cur, pos,
+                                          d, temp, topp, topk,
+                                          pbuf, &rng, out, &acc, &nxt);
+                    steps++;
+                    acc_tot += acc;
+
+                    int stop = 0;
+                    for (int i = 0; i < got && n < max_tokens; i++) {
+                        int tk = out[i];
+                        if (tk == 1 || tk == 106) { stop = 1; break; }
+                        if (T) { g4tok_decode(T, &tk, 1, piece, sizeof piece); fputs(piece, stdout); }
+                        else printf("%d ", tk);
+                        ids[np + n] = tk;
+                        n++;
+                    }
+                    fflush(stdout);
+                    if (stop) break;
+                    cur = nxt;
+                }
+                goto done_decode;
+            }
+
             while (n < max_tokens) {
                 int got, acc = 0;
                 if (dpath) {
@@ -2551,7 +3208,7 @@ int main(int argc, char **argv) {
                 printf("\n\nprefill %d tok in %.2fs (%.1f tok/s, %lld expert reads)\n",
                        np, tpre, np / tpre, pre_reads);
                 printf("decode  %d tok in %.2fs (%.2f tok/s)\n", n, el, n / el);
-                if ((dpath || use_mtp) && steps)
+                if ((dpath || use_mtp || use_dflash) && steps)
                     printf("speculation: %.1f%% acceptance, %.2f tok/target-forward\n",
                            100.0 * acc_tot / (double)(steps * draft),
                            n / (double)steps);
