@@ -69,7 +69,7 @@ endif
 CFLAGS  ?= $(OPT) $(WARN) $(ARCHFLAGS) $(OMPFLAGS) $(METAL_CFLAGS) -I.
 LDFLAGS ?= -lm -lpthread $(OMPLIBS) $(METAL_LDFLAGS)
 
-all: gemma4
+all: gemma4 lfm25
 
 # -fno-objc-arc on purpose: ARC forbids Objective-C pointers as C-struct members, and
 # the pointer->MTLBuffer map needs exactly that. Manual retain, and nothing is ever
@@ -84,6 +84,23 @@ gemma4: gemma4.c q40.h g4tok.h kvq.h gpu.h openai_http.h openai_json.h $(METAL_O
 # separate the int8-activation approximation from an actual bug when validating.
 gemma4-exact: gemma4.c q40.h g4tok.h kvq.h gpu.h $(METAL_OBJ)
 	$(CC) $(CFLAGS) -DCOLI_F32ACT gemma4.c $(METAL_OBJ) -o $@ $(LDFLAGS)
+
+# LFM2.5-8B-A1B. No Metal: the gpu.h kernel only speaks q4_0, and lfm25's dense
+# tensors are mostly q8_0 (the apex gradient), so there is nothing for it to do.
+LFM_DEPS = lfm25.c q40.h lfmtok.h kvq.h openai_http.h openai_json.h
+LFM_CFLAGS = $(OPT) $(WARN) $(ARCHFLAGS) $(OMPFLAGS) -I.
+LFM_LDFLAGS = -lm -lpthread $(OMPLIBS)
+
+lfm25: $(LFM_DEPS)
+	$(CC) $(LFM_CFLAGS) lfm25.c -o $@ $(LFM_LDFLAGS)
+
+# COLI_F32ACT keeps activations in f32 (weights stay quantised). Slower; used only
+# to separate the int8-activation approximation from an actual bug when validating.
+lfm25-exact: $(LFM_DEPS)
+	$(CC) $(LFM_CFLAGS) -DCOLI_F32ACT lfm25.c -o $@ $(LFM_LDFLAGS)
+
+test_lfmtok: tests/test_lfmtok.c lfmtok.h
+	$(CC) $(OPT) $(ARCHFLAGS) -I. tests/test_lfmtok.c -o $@ -lm
 
 test_q40: tests/test_q40.c q40.h
 	$(CC) $(OPT) $(ARCHFLAGS) -I. tests/test_q40.c -o $@ -lm
@@ -112,7 +129,25 @@ check: gemma4 gemma4-exact test_q40 test_kvq test_metal_sim
 	python3 tools/convert_gemma4_mtp.py /tmp/g4mtp /tmp/g4fix
 	python3 tools/gemma4_mtp_check.py /tmp/g4fix /tmp/g4mtp   # MTP head vs HF
 
-clean:
-	rm -f gemma4 gemma4-exact test_q40 test_kvq test_metal_sim metal.o
+# lfm25 regression: the tokenizer against HF (or the in-file reference), and the
+# engine against a numpy oracle run on the DEQUANTISED container weights.
+# PYTHON is overridable: these need numpy, and lfmtok_check wants `tokenizers` for
+# an authoritative comparison (it falls back to a bundled reference without it).
+#   make check-lfm25 PYTHON=.venv/bin/python
+PYTHON ?= python3
+LFMFIX ?= /tmp/lfmfix
 
-.PHONY: all check clean
+check-lfm25: lfm25 lfm25-exact test_lfmtok
+	$(PYTHON) tools/lfmtok_check.py ./lfm ./lfm-ct/tok.bin
+	$(PYTHON) tools/convert_lfm25.py --fixture --ctx 64 --ram 8 --expert-edge 1 $(LFMFIX)
+	$(PYTHON) tools/lfm25_oracle.py $(LFMFIX)
+	./lfm25-exact $(LFMFIX) --check            # engine vs oracle, must be ~1e-6
+	./lfm25-exact $(LFMFIX) --check --nobatch  # batched == sequential
+	./lfm25       $(LFMFIX) --check            # int8-activation build
+	./lfm25-exact $(LFMFIX) --check --pin 3    # pinning must not change the logits
+
+clean:
+	rm -f gemma4 gemma4-exact lfm25 lfm25-exact \
+	      test_q40 test_kvq test_metal_sim test_lfmtok metal.o
+
+.PHONY: all check check-lfm25 clean

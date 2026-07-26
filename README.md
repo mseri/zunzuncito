@@ -1,4 +1,19 @@
-# zunzuncito — Gemma-4 26B-A4B colibrì engine for a small-RAM machine
+# zunzuncito — colibrì-style MoE engines for a small-RAM machine
+
+Two engines share this repo, the same q4_0/q8_0 kernels (`q40.h`), the same
+TurboQuant KV cache (`kvq.h`), the same OpenAI server, and the same idea — stream
+the routed experts from disk under an expert-granular cache instead of leaving it
+to the OS page cache:
+
+| binary | model | notes |
+|--------|-------|-------|
+| `gemma4` | Gemma-4 26B-A4B | 30 attention layers, 128 experts/layer, MTP + DFlash speculation |
+| `lfm25`  | [LFM2.5-8B-A1B](https://huggingface.co/LiquidAI/LFM2.5-8B-A1B) | hybrid 18 short-conv + 6 attention layers, 32 tiny experts/layer, apex-quant mixed precision |
+
+Most of this README is about `gemma4`; see [LFM2.5-8B-A1B](#lfm25--lfm25-8b-a1b) for
+the other one.
+
+## gemma4 — Gemma-4 26B-A4B
 
 A Gemma-4 26B-4B [colibrì-style inference engine](https://github.com/JustVugg/colibri) for MacOS (may work on linux, but I never tried). The openai webserver follows closely [samosa-chat (a Qwen3.6-35b colibrì-style inference engine)](https://github.com/deepanwadhwa/samosa-chat). It allows to run the model (quantized or unquantized) also on very RAM-constrained systems (e.g. runs fine on a mac with 8Gb of ram, while doing other things, and also older intel macs).
 
@@ -241,6 +256,88 @@ Python converter         ──►  C q40 kernel       bit-identical
 HF tokenizer             ──►  g4tok.h            416/416 exact (incl. 400 fuzzed)
 TurboQuant paper bounds  ──►  kvq.h              MSE within bounds at 1/2/3/4-bit
 chat_template.jinja      ──►  chat_prompt()      5/5 exact
+```
+
+## lfm25 — LFM2.5-8B-A1B
+
+`lfm25` runs [LiquidAI/LFM2.5-8B-A1B](https://huggingface.co/LiquidAI/LFM2.5-8B-A1B)
+(8.3 B total / 1.5 B active). The bet is different from Gemma-4's: the experts are
+**tiny** — 32 per layer at `moe_intermediate_size` 1792, ~5.9 MiB each at q4_0, of
+which only 4 fire per token — so a miss is cheap and a layer's whole expert set is
+only 32 of them. At an 8 GB budget essentially the entire model is cacheable.
+
+It is also a **hybrid** architecture, and that shapes the engine:
+
+- 24 layers, of which only **6 are attention**; the other 18 mix along the sequence
+  with a short causal depthwise convolution (`y = C * conv(B * x)`, kernel 3).
+  Conv layers hold **no KV at all**, so the KV cache costs a quarter of what the
+  layer count suggests (96 MiB at ctx 4096).
+- The conv carries a **recurrent state**, and unlike a KV cache it cannot be
+  rewound. So prompt-prefix reuse (chat, server) is only taken when the new prompt
+  strictly *extends* what was already absorbed; anything else is reprocessed.
+- The router is **sigmoid, not softmax**, and `expert_bias` affects *selection
+  only* — the weight applied to an expert is the unbiased sigmoid, renormalised.
+- First 2 layers use a dense SwiGLU MLP rather than the MoE.
+
+No MTP, no DFlash (this model ships neither). No Metal.
+
+### Mixed precision (apex-quant, ported)
+
+[apex-quant](https://github.com/localai-org/apex-quant) is a llama.cpp recipe: it
+does not invent a format, it assigns *different* quant types per tensor class,
+exploiting that routed experts are ~97% idle and so tolerate far more error than
+the always-on tensors. We keep the idea and drop the GGUF dependency, mapping its
+Q3_K..Q8_0 gradient onto the two block formats this engine has kernels for:
+
+| tensors | format |
+|---------|--------|
+| attention, conv, dense MLP (always on) | q8_0 |
+| routed experts, edge layers | q8_0 |
+| routed experts, middle layers | q4_0 |
+| norms, router, expert bias, depthwise conv | f32 |
+
+`--expert-edge N` is the size/quality dial (default 2, `0` = uniform q4_0). Each
+q8_0 layer costs ~1.9x its q4_0 equivalent, straight out of the expert cache.
+
+### Convert and run
+
+```sh
+python3 tools/convert_lfm25.py /path/to/LFM2.5-8B-A1B ./lfm-ct --ram 8 --ctx 4096
+python3 tools/convert_lfm_tokenizer.py /path/to/LFM2.5-8B-A1B/tokenizer.json ./lfm-ct/tok.bin
+./lfm25 ./lfm-ct "explain MoE routing"
+```
+
+At `--ram 8 --ctx 4096 --expert-edge 2` that gives 606 MiB dense resident, 4.72 GiB
+of experts, 96 MiB KV and 29 of 32 slots/layer. Measured on an Intel Mac: ~8 tok/s
+prefill, ~12 tok/s decode, 89% expert-cache hit.
+
+Flags mirror `gemma4` where they mean the same thing (`--chat`, `--serve`, `--system`,
+`--raw`, `--temp/--topp/--topk`, `--pin`, `--io`, `--threads`, `--kv`/`--kvq` and the
+individual TurboQuant knobs). Sampling defaults are LFM2.5's own: temp 0.2, top_k 80.
+`--think` forces a reasoning block by pre-filling `<think>` — the chat template has
+no thinking toggle, the model decides for itself.
+
+The tokenizer is a **different family** from Gemma's: GPT-2-style ByteLevel BPE with
+the Qwen2/Llama-3 pre-tokenizer split regex and `ignore_merges`, so it has its own
+container (`lfmtok.h`, magic `LFTK`) rather than reusing `g4tok.h`.
+
+### Checking it
+
+```sh
+make check-lfm25          # add PYTHON=... if numpy/tokenizers live in a venv
+```
+
+That runs the tokenizer against HF's (falling back to a bundled reference
+implementation, loudly, if `tokenizers` is not installed), then builds a tiny random
+fixture and diffs the engine against `tools/lfm25_oracle.py` — an independent numpy
+forward pass run on the **dequantised container weights**, so quantisation error
+cannot mask an engine bug.
+
+```
+numpy oracle          ──►  lfm25.c            1.8e-7   (exact-activation build)
+batch prefill         ──►  sequential         bit-identical
+expert pinning        ──►  unpinned           bit-identical
+HF tokenizer          ──►  lfmtok.h           475/475 exact (incl. 400 fuzzed)
 ```
 
 ## GenAI use warning
