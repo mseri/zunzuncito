@@ -141,6 +141,11 @@ typedef struct {
     float **conv_state;
     int conv_pos;
 
+    /* RoPE inverse frequencies, [head_dim/2]. Precomputed because they depend only
+     * on the dimension: recomputing powf() inside the rotation loop cost one powf
+     * per (head, dim) pair per position per layer. */
+    float *inv_freq;
+
     /* I/O threads */
     pthread_t *io;
     int n_io;
@@ -371,19 +376,65 @@ static void matvec(float *y, const W *w, const float *x, int8_t *xq, float *sx) 
 #endif
 }
 
-/* rotate_half RoPE, full rotation (LFM2.5 has no partial rotary factor). */
-static void rope(float *x, int H, int D, int pos, float theta) {
+/* rotate_half RoPE, full rotation (LFM2.5 has no partial rotary factor).
+ *
+ * The dimension loop is OUTSIDE the head loop on purpose: cos/sin depend only on
+ * (pos, i), not on the head, so this computes head_dim/2 transcendentals per call
+ * instead of n_heads * head_dim/2 of them -- a 32x cut on the attention layers. */
+static void rope(float *x, int H, int D, int pos, const float *invf) {
     int half = D / 2;
-    for (int h = 0; h < H; h++) {
-        float *v = x + (size_t)h * D;
-        for (int i = 0; i < half; i++) {
-            float f = powf(theta, -(float)(2 * i) / (float)D);
-            float a = pos * f, co = cosf(a), si = sinf(a);
+    for (int i = 0; i < half; i++) {
+        float a = pos * invf[i], co = cosf(a), si = sinf(a);
+        for (int h = 0; h < H; h++) {
+            float *v = x + (size_t)h * D;
             float x1 = v[i], x2 = v[i + half];
             v[i]        = x1 * co - x2 * si;
             v[i + half] = x2 * co + x1 * si;
         }
     }
+}
+
+/* Y[S,O] = X[S,I] * W^T.
+ *
+ * THE POINT IS WEIGHT REUSE, not arithmetic. A matvec streams the entire [O,I]
+ * weight matrix to produce one output vector, so doing S of them streams it S
+ * times -- and at ~453 M dense params per position this engine is squarely
+ * bandwidth-bound, which is why prefill used to be SLOWER per token than decode.
+ * Here the row is loaded once and dotted against all S activations while it is
+ * still in cache. */
+static void matmul(float *Y, const W *w, const float *X, int S,
+                   int8_t *xq, float *sx) {
+    if (S == 1) { matvec(Y, w, X, xq, sx); return; }
+    int I = w->I, O = w->O, nb = I / Q40_BLK;
+    int64_t rb = fmt_row_bytes(w->fmt, I);
+#ifdef COLI_F32ACT
+    (void)xq; (void)sx; (void)nb;
+    #pragma omp parallel for schedule(static)
+    for (int o = 0; o < O; o++) {
+        const uint8_t *row = w->q + (size_t)o * rb;
+        for (int s = 0; s < S; s++)
+            Y[(size_t)s * O + o] = wdot_f32(w->fmt, row, X + (size_t)s * I, I);
+    }
+#else
+    if (w->fmt == FMT_F32) {
+        #pragma omp parallel for schedule(static)
+        for (int o = 0; o < O; o++) {
+            const uint8_t *row = w->q + (size_t)o * rb;
+            for (int s = 0; s < S; s++)
+                Y[(size_t)s * O + o] = wdot_f32(FMT_F32, row, X + (size_t)s * I, I);
+        }
+        return;
+    }
+    for (int s = 0; s < S; s++)
+        q40_quant_act(X + (size_t)s * I, xq + (size_t)s * I, sx + (size_t)s * nb, I);
+    #pragma omp parallel for schedule(static)
+    for (int o = 0; o < O; o++) {
+        const uint8_t *row = w->q + (size_t)o * rb;
+        for (int s = 0; s < S; s++)
+            Y[(size_t)s * O + o] = wdot(w->fmt, row, xq + (size_t)s * I,
+                                        sx + (size_t)s * nb, I);
+    }
+#endif
 }
 
 /* ------------------------------------------------------------------ expert I/O */
@@ -450,6 +501,7 @@ static int slot_for(M *m, int layer, int eid, int *need_io) {
 typedef struct {
     float *x, *xn, *q, *k, *v, *o, *tmp, *mlp;
     float *gate, *up, *eout, *h2, *bcx, *cy;
+    int8_t *mxq; float *msx;         /* batched-activation scratch for matmul */
     float *kvk, *kvv;
     int moe_nu, moe_chunk_n, moe_prefetch, moe_slots[MAXEXPERTS];
     /* Per-row CPU prefill scratch: avoids OpenMP fork/join for every row. */
@@ -512,49 +564,68 @@ static void route_row(M *m, int li, const float *xn, int *idx, float *wts, Buf *
 }
 
 /* Apply one loaded expert to every row that routed to it. SwiGLU, silu (not gelu):
- * w2( silu(w1 x) * w3 x ). For CPU prefill, process all rows of an expert in two
- * OpenMP passes rather than launching two parallel regions per row. */
+ * w2( silu(w1 x) * w3 x ).
+ *
+ * THE LOOP ORDER IS THE WHOLE POINT. Parallelising over ROWS -- the obvious shape,
+ * one thread per token -- makes every thread walk the entire expert, so the expert's
+ * ~5.9 MiB is streamed once PER ROW. In a 128-token prefill batch an expert collects
+ * ~16 rows, so that is ~16x redundant weight traffic, and it is why batching the
+ * prefill barely helped until this was fixed: batch-union had cut the expert READS
+ * but the arithmetic was still re-reading each expert per row.
+ *
+ * Parallelising over OUTPUT rows instead loads a weight row once and dots it against
+ * every activation while it is still in L1. Same flops, nrows-fold less bandwidth. */
 static void expert_apply_batch_cpu(M *m, int fmt, const uint8_t *G, const uint8_t *U,
         const uint8_t *Dn, size_t grb, size_t drb, const float *X, float *OUT,
         const int *rows, int nrows, const float *w, Buf *b) {
     Cfg *c = &m->c; int D = c->hidden, MI = c->moe_inter;
+    size_t gst = (size_t)MI + 64;                    /* per-row stride of egate/ehq */
 #ifdef COLI_F32ACT
     #pragma omp parallel for schedule(static)
-    for (int r = 0; r < nrows; r++) {
-        const float *x = X + (size_t)rows[r] * D;
-        float *gate = b->egate + (size_t)r * (MI + 64);
-        for (int o = 0; o < MI; o++)
-            gate[o] = silu(wdot_f32(fmt, G + (size_t)o * grb, x, D)) *
-                            wdot_f32(fmt, U + (size_t)o * grb, x, D);
+    for (int o = 0; o < MI; o++) {
+        const uint8_t *g = G + (size_t)o * grb, *u = U + (size_t)o * grb;
+        for (int r = 0; r < nrows; r++) {
+            const float *x = X + (size_t)rows[r] * D;
+            b->egate[(size_t)r * gst + o] = silu(wdot_f32(fmt, g, x, D)) *
+                                                 wdot_f32(fmt, u, x, D);
+        }
     }
     #pragma omp parallel for schedule(static)
-    for (int r = 0; r < nrows; r++) {
-        float *out = OUT + (size_t)rows[r] * D;
-        const float *gate = b->egate + (size_t)r * (MI + 64); float ww = w[r];
-        for (int o = 0; o < D; o++)
-            out[o] += ww * wdot_f32(fmt, Dn + (size_t)o * drb, gate, MI);
+    for (int o = 0; o < D; o++) {
+        const uint8_t *d = Dn + (size_t)o * drb;
+        for (int r = 0; r < nrows; r++)
+            OUT[(size_t)rows[r] * D + o] +=
+                w[r] * wdot_f32(fmt, d, b->egate + (size_t)r * gst, MI);
     }
 #else
+    /* quantise each participating activation row once, up front */
     #pragma omp parallel for schedule(static)
-    for (int r = 0; r < nrows; r++) {
-        const float *x = X + (size_t)rows[r] * D;
-        int8_t *xq = b->exq + (size_t)r * (D + 64);
-        float *sx = b->esx + (size_t)r * (D / Q40_BLK + 8);
-        float *gate = b->egate + (size_t)r * (MI + 64);
-        q40_quant_act(x, xq, sx, D);
-        for (int o = 0; o < MI; o++)
-            gate[o] = silu(wdot(fmt, G + (size_t)o * grb, xq, sx, D)) *
-                           wdot(fmt, U + (size_t)o * grb, xq, sx, D);
-        q40_quant_act(gate, b->ehq + (size_t)r * (MI + 64),
-                      b->ehs + (size_t)r * (MI / Q40_BLK + 8), MI);
+    for (int r = 0; r < nrows; r++)
+        q40_quant_act(X + (size_t)rows[r] * D, b->exq + (size_t)r * (D + 64),
+                      b->esx + (size_t)r * (D / Q40_BLK + 8), D);
+
+    #pragma omp parallel for schedule(static)
+    for (int o = 0; o < MI; o++) {
+        const uint8_t *g = G + (size_t)o * grb, *u = U + (size_t)o * grb;
+        for (int r = 0; r < nrows; r++) {
+            const int8_t *xq = b->exq + (size_t)r * (D + 64);
+            const float *sx = b->esx + (size_t)r * (D / Q40_BLK + 8);
+            b->egate[(size_t)r * gst + o] = silu(wdot(fmt, g, xq, sx, D)) *
+                                                 wdot(fmt, u, xq, sx, D);
+        }
     }
     #pragma omp parallel for schedule(static)
-    for (int r = 0; r < nrows; r++) {
-        float *out = OUT + (size_t)rows[r] * D;
-        const int8_t *hq = b->ehq + (size_t)r * (MI + 64);
-        const float *hs = b->ehs + (size_t)r * (MI / Q40_BLK + 8); float ww = w[r];
-        for (int o = 0; o < D; o++)
-            out[o] += ww * wdot(fmt, Dn + (size_t)o * drb, hq, hs, MI);
+    for (int r = 0; r < nrows; r++)
+        q40_quant_act(b->egate + (size_t)r * gst, b->ehq + (size_t)r * gst,
+                      b->ehs + (size_t)r * (MI / Q40_BLK + 8), MI);
+
+    #pragma omp parallel for schedule(static)
+    for (int o = 0; o < D; o++) {
+        const uint8_t *d = Dn + (size_t)o * drb;
+        for (int r = 0; r < nrows; r++)
+            OUT[(size_t)rows[r] * D + o] +=
+                w[r] * wdot(fmt, d, b->ehq + (size_t)r * gst,
+                            b->ehs + (size_t)r * (MI / Q40_BLK + 8), MI);
     }
 #endif
 }
@@ -735,23 +806,9 @@ static void kv_write(M *m, int li, int pos, int nkv, int hd, int cap,
     memcpy(m->kv_v[li] + (size_t)slot * vec, v, sizeof(float) * vec);
 }
 
-static void kv_read(M *m, int li, int t, int nkv, int hd, int cap,
-                    float *kb, float *vb) {
-    int quant = m->pk[li] != NULL;
-    int W = quant ? (m->rwin < cap ? m->rwin : cap) : cap;
-    size_t vec = (size_t)nkv * hd;
-
-    if (!quant || m->ring_pos[li][t % W] == t) {
-        memcpy(kb, m->kv_k[li] + (size_t)(t % W) * vec, sizeof(float) * vec);
-        memcpy(vb, m->kv_v[li] + (size_t)(t % W) * vec, sizeof(float) * vec);
-        return;
-    }
-    for (int h = 0; h < nkv; h++) {
-        size_t idx = (size_t)t * nkv + h;
-        kvq_decode(&m->qk[li], m->pk[li] + idx * m->qk[li].bytes, kb + (size_t)h * hd);
-        kvq_decode(&m->qv[li], m->pv[li] + idx * m->qv[li].bytes, vb + (size_t)h * hd);
-    }
-}
+/* There is no kv_read: attn_fwd reads the cache IN PLACE (and decodes a compressed
+ * key only when the residual ring does not hold the position), which is the point of
+ * parallelising over kv heads -- a copy per position per layer was pure overhead. */
 
 /* ------------------------------------------------------------- the two mixers */
 
@@ -766,81 +823,117 @@ static void kv_read(M *m, int li, int t, int nkv, int hd, int cap,
  * previous conv_L-1 of those, OLDEST FIRST, so tap k pairs with state[k] and the
  * LAST tap with the current value. Positions must be fed in order: this is a
  * recurrence, not a cache, and it cannot be rewound. */
-static void conv_fwd(M *m, int li, const float *xn, float *out, Buf *b) {
+static void conv_fwd(M *m, int li, const float *Xn, float *OUT, int S, Buf *b) {
     Cfg *c = &m->c;
     Layer *L = &m->L[li];
     int D = c->hidden, CL = c->conv_L;
     float *st = m->conv_state[li];                  /* [(CL-1) * D] */
 
-    matvec(b->bcx, &L->conv_in, xn, b->xq, b->sx);  /* [3D] = B | C | x */
-    const float *Bg = b->bcx, *Cg = b->bcx + D, *xv = b->bcx + 2 * D;
+    /* Both projections are batched; only the recurrence between them is sequential,
+     * and that part is elementwise and cheap. */
+    matmul(b->bcx, &L->conv_in, Xn, S, b->mxq, b->msx);      /* [S, 3D] = B | C | x */
 
-    /* cy, not tmp: the caller passes b->tmp as `out`, and matvec must not read the
-     * buffer it is writing. */
-    for (int i = 0; i < D; i++) {
-        float cur = Bg[i] * xv[i];
-        const float *w = L->conv_w.f + (size_t)i * CL;
-        float acc = w[CL - 1] * cur;
-        for (int k = 0; k < CL - 1; k++) acc += w[k] * st[(size_t)k * D + i];
-        b->cy[i] = Cg[i] * acc;
-        for (int k = 0; k + 2 < CL; k++) st[(size_t)k * D + i] = st[(size_t)(k + 1) * D + i];
-        if (CL > 1) st[(size_t)(CL - 2) * D + i] = cur;
+    for (int s = 0; s < S; s++) {
+        const float *row = b->bcx + (size_t)s * 3 * D;
+        const float *Bg = row, *Cg = row + D, *xv = row + 2 * D;
+        float *cy = b->cy + (size_t)s * D;
+        for (int i = 0; i < D; i++) {
+            float cur = Bg[i] * xv[i];
+            const float *w = L->conv_w.f + (size_t)i * CL;
+            float acc = w[CL - 1] * cur;
+            for (int k = 0; k < CL - 1; k++) acc += w[k] * st[(size_t)k * D + i];
+            cy[i] = Cg[i] * acc;
+            for (int k = 0; k + 2 < CL; k++)
+                st[(size_t)k * D + i] = st[(size_t)(k + 1) * D + i];
+            if (CL > 1) st[(size_t)(CL - 2) * D + i] = cur;
+        }
     }
-    matvec(out, &L->conv_out, b->cy, b->xq, b->sx);
+    matmul(OUT, &L->conv_out, b->cy, S, b->mxq, b->msx);
 }
 
 /* GQA attention: q/k RMSNorm per head, full-rotation RoPE, causal over the whole
  * context (no sliding window), scaled by 1/sqrt(head_dim). */
-static void attn_fwd(M *m, int li, const float *xn, float *out, int pos, Buf *b) {
+static void attn_fwd(M *m, int li, const float *Xn, float *OUT, int S,
+                     int pos_base, Buf *b) {
     Cfg *c = &m->c;
     Layer *L = &m->L[li];
     int hd = c->head_dim, nkv = c->n_kv_heads, nh = c->n_heads, rep = nh / nkv;
     int cap = c->ctx;
-
-    matvec(b->q, &L->q_proj, xn, b->xq, b->sx);
-    for (int i = 0; i < nh; i++)
-        rmsnorm(b->q + (size_t)i * hd, b->q + (size_t)i * hd, L->q_norm.f, hd, c->eps);
-    rope(b->q, nh, hd, pos, c->rope_theta);
-
-    matvec(b->k, &L->k_proj, xn, b->xq, b->sx);
-    for (int i = 0; i < nkv; i++)
-        rmsnorm(b->k + (size_t)i * hd, b->k + (size_t)i * hd, L->k_norm.f, hd, c->eps);
-    rope(b->k, nkv, hd, pos, c->rope_theta);
-
-    matvec(b->v, &L->v_proj, xn, b->xq, b->sx);     /* V is neither normed nor roped */
-
-    kv_write(m, li, pos, nkv, hd, cap, b->k, b->v);
-
-    /* fold the attention scale into q once rather than into every score */
+    int quant = m->pk[li] != NULL;
+    int Wr = quant ? (m->rwin < cap ? m->rwin : cap) : cap;
+    size_t vec = (size_t)nkv * hd;
     float scale = 1.0f / sqrtf((float)hd);
-    for (int i = 0; i < nh * hd; i++) b->q[i] *= scale;
 
-    /* Online softmax: decode every KV position once and retain no ctx-sized score
-     * or V scratch. mx/z are the per-head running maximum and normaliser. */
-    float mx[256], z[256];
-    if (nh > 256) { fprintf(stderr, "too many attention heads\n"); exit(1); }
-    memset(b->o, 0, sizeof(float) * nh * hd);
-    for (int hh = 0; hh < nh; hh++) { mx[hh] = -INFINITY; z[hh] = 0.0f; }
-    for (int t = 0; t <= pos; t++) {
-        kv_read(m, li, t, nkv, hd, cap, b->kvk, b->kvv);
-        /* Heads are independent given this t; the online-softmax recurrence is
-         * carried per head across t, so parallelise the head loop, not t. */
+    if (hd > 512 || rep > 64) { fprintf(stderr, "attention head geometry too large\n"); exit(1); }
+
+    /* All four projections are batched; only the causal part below is per-position. */
+    matmul(b->q, &L->q_proj, Xn, S, b->mxq, b->msx);
+    matmul(b->k, &L->k_proj, Xn, S, b->mxq, b->msx);
+    matmul(b->v, &L->v_proj, Xn, S, b->mxq, b->msx);   /* V is neither normed nor roped */
+
+    /* Norm + rope + publish KV for the whole batch FIRST. Safe because the loop
+     * below only ever reads t <= pos, so a position never sees a future key. */
+    for (int s = 0; s < S; s++) {
+        int pos = pos_base + s;
+        float *q = b->q + (size_t)s * nh * hd;
+        float *k = b->k + (size_t)s * vec;
+        float *v = b->v + (size_t)s * vec;
+        for (int i = 0; i < nh; i++)
+            rmsnorm(q + (size_t)i * hd, q + (size_t)i * hd, L->q_norm.f, hd, c->eps);
+        rope(q, nh, hd, pos, m->inv_freq);
+        for (int i = 0; i < nkv; i++)
+            rmsnorm(k + (size_t)i * hd, k + (size_t)i * hd, L->k_norm.f, hd, c->eps);
+        rope(k, nkv, hd, pos, m->inv_freq);
+        /* fold the attention scale into q once rather than into every score */
+        for (int i = 0; i < nh * hd; i++) q[i] *= scale;
+        kv_write(m, li, pos, nkv, hd, cap, k, v);
+    }
+
+    /* ONE parallel region per position, over KV heads rather than per KV position
+     * over q heads. Two reasons this is the right axis:
+     *   - the old shape forked a team for every t, i.e. `pos` fork/joins per layer,
+     *     to cover ~4 K flops each;
+     *   - a kv head serves `rep` q heads, so owning the kv head lets a thread decode
+     *     a compressed key ONCE and reuse it, and in the uncompressed case read the
+     *     cache in place with no copy at all. */
+    for (int s = 0; s < S; s++) {
+        int pos = pos_base + s;
+        const float *qrow = b->q + (size_t)s * nh * hd;
+        float *orow = b->o + (size_t)s * nh * hd;
         #pragma omp parallel for schedule(static)
-        for (int hh = 0; hh < nh; hh++) {
-            const float *qq = b->q + (size_t)hh * hd;
-            const float *kk = b->kvk + (size_t)(hh / rep) * hd;
-            const float *vv = b->kvv + (size_t)(hh / rep) * hd;
-            float score = 0.0f;
-            for (int d = 0; d < hd; d++) score += qq[d] * kk[d];
-            float nm = score > mx[hh] ? score : mx[hh];
-            float a = expf(mx[hh] - nm), w = expf(score - nm), nz = a * z[hh] + w;
-            float *ov = b->o + (size_t)hh * hd;
-            float old = z[hh] ? a * z[hh] / nz : 0.0f, add = w / nz;
-            for (int d = 0; d < hd; d++) ov[d] = old * ov[d] + add * vv[d];
-            mx[hh] = nm; z[hh] = nz;
+        for (int kh = 0; kh < nkv; kh++) {
+            float kbuf[512], vbuf[512];
+            float mx[64], z[64];
+            for (int r = 0; r < rep; r++) {
+                mx[r] = -INFINITY; z[r] = 0.0f;
+                memset(orow + (size_t)(kh * rep + r) * hd, 0, sizeof(float) * hd);
+            }
+            for (int t = 0; t <= pos; t++) {
+                const float *kk, *vv;
+                if (!quant || m->ring_pos[li][t % Wr] == t) {
+                    kk = m->kv_k[li] + (size_t)(t % Wr) * vec + (size_t)kh * hd;
+                    vv = m->kv_v[li] + (size_t)(t % Wr) * vec + (size_t)kh * hd;
+                } else {
+                    size_t idx = (size_t)t * nkv + kh;
+                    kvq_decode(&m->qk[li], m->pk[li] + idx * m->qk[li].bytes, kbuf);
+                    kvq_decode(&m->qv[li], m->pv[li] + idx * m->qv[li].bytes, vbuf);
+                    kk = kbuf; vv = vbuf;
+                }
+                for (int r = 0; r < rep; r++) {
+                    const float *qq = qrow + (size_t)(kh * rep + r) * hd;
+                    float *ov = orow + (size_t)(kh * rep + r) * hd;
+                    float score = 0.0f;
+                    for (int d = 0; d < hd; d++) score += qq[d] * kk[d];
+                    float nm = score > mx[r] ? score : mx[r];
+                    float a = expf(mx[r] - nm), w = expf(score - nm), nz = a * z[r] + w;
+                    float old = z[r] ? a * z[r] / nz : 0.0f, add = w / nz;
+                    for (int d = 0; d < hd; d++) ov[d] = old * ov[d] + add * vv[d];
+                    mx[r] = nm; z[r] = nz;
+                }
+            }
         }
     }
-    matvec(out, &L->o_proj, b->o, b->xq, b->sx);
+    matmul(OUT, &L->o_proj, b->o, S, b->mxq, b->msx);
 }
 
 /* ------------------------------------------------------------------ layer
@@ -857,30 +950,26 @@ static void layer_fwd(M *m, int li, float *H, int S, int pos_base, Buf *b) {
     Layer *L = &m->L[li];
     int D = c->hidden;
 
-    /* Positions walk in order: the conv is a recurrence, and attention writes KV
-     * that later positions of the same batch must be able to read. */
-    for (int s = 0; s < S; s++) {
-        float *h = H + (size_t)s * D;
-        rmsnorm(b->xn, h, L->operator_norm.f, D, c->eps);
-        if (c->layer_types[li]) attn_fwd(m, li, b->xn, b->tmp, pos_base + s, b);
-        else                    conv_fwd(m, li, b->xn, b->tmp, b);
-        for (int i = 0; i < D; i++) h[i] += b->tmp[i];
-    }
+    /* The operator sees the whole batch: its projections are batched, and inside,
+     * the conv recurrence and the causal attention still walk positions in order. */
+    float *Xn = b->xn;
+    for (int s = 0; s < S; s++)
+        rmsnorm(Xn + (size_t)s * D, H + (size_t)s * D, L->operator_norm.f, D, c->eps);
+    if (c->layer_types[li]) attn_fwd(m, li, Xn, b->tmp, S, pos_base, b);
+    else                    conv_fwd(m, li, Xn, b->tmp, S, b);
+    for (int i = 0; i < S * D; i++) H[i] += b->tmp[i];
 
     float *X = b->eout;
     for (int s = 0; s < S; s++)
         rmsnorm(X + (size_t)s * D, H + (size_t)s * D, L->ffn_norm.f, D, c->eps);
 
     if (li < c->n_dense_layers) {
-        for (int s = 0; s < S; s++) {
-            const float *x = X + (size_t)s * D;
-            matvec(b->gate, &L->mlp_gate, x, b->xq, b->sx);
-            matvec(b->up, &L->mlp_up, x, b->xq, b->sx);
-            for (int i = 0; i < c->dense_inter; i++) b->mlp[i] = silu(b->gate[i]) * b->up[i];
-            matvec(b->tmp, &L->mlp_down, b->mlp, b->xq, b->sx);
-            float *h = H + (size_t)s * D;
-            for (int i = 0; i < D; i++) h[i] += b->tmp[i];
-        }
+        int DI = c->dense_inter;
+        matmul(b->gate, &L->mlp_gate, X, S, b->mxq, b->msx);
+        matmul(b->up, &L->mlp_up, X, S, b->mxq, b->msx);
+        for (int i = 0; i < S * DI; i++) b->mlp[i] = silu(b->gate[i]) * b->up[i];
+        matmul(b->tmp, &L->mlp_down, b->mlp, S, b->mxq, b->msx);
+        for (int i = 0; i < S * D; i++) H[i] += b->tmp[i];
     } else {
         moe_start(m, li, X, b->h2, S, b);
         moe_finish(m, li, X, b->h2, S, b);
@@ -917,19 +1006,12 @@ static void conv_reset(M *m) {
  * pos_base == 0 means a NEW SEQUENCE and resets the conv recurrence. Any other
  * pos_base must equal conv_pos: the conv state cannot be rewound, so a caller
  * reusing a cached prefix has to be strictly extending it. */
-static void forward(M *m, const int *ids, int S, int pos_base,
-                    float *logits, int last_only, Buf *b) {
+static void forward_chunk(M *m, const int *ids, int S, int pos_base,
+                          float *logits, int last_only, Buf *b) {
     Cfg *c = &m->c;
     int D = c->hidden;
     W *embed = &m->L[MAXL - 1].q_proj;
     W *fnorm = &m->L[MAXL - 1].o_proj;
-
-    if (pos_base == 0) conv_reset(m);
-    else if (pos_base != m->conv_pos) {
-        fprintf(stderr, "internal error: forward at %d but the conv state is at %d\n",
-                pos_base, m->conv_pos);
-        exit(1);
-    }
 
     float *H = b->x;
     for (int s = 0; s < S; s++) embed_row(m, ids[s], H + (size_t)s * D);
@@ -938,10 +1020,47 @@ static void forward(M *m, const int *ids, int S, int pos_base,
 
     if (!logits) return;
     int s0 = last_only ? S - 1 : 0;
+    /* The lm_head is [vocab, hidden] -- by far the widest tensor here -- so batch it
+     * too when every row's logits are wanted (--check). */
+    if (!last_only && S > 1) {
+        for (int s = 0; s < S; s++)
+            rmsnorm(b->cy + (size_t)s * D, H + (size_t)s * D, fnorm->f, D, c->eps);
+        matmul(logits, embed, b->cy, S, b->mxq, b->msx);
+        return;
+    }
     for (int s = s0; s < S; s++) {
-        rmsnorm(b->xn, H + (size_t)s * D, fnorm->f, D, c->eps);
+        rmsnorm(b->cy, H + (size_t)s * D, fnorm->f, D, c->eps);
         float *out = logits + (size_t)(last_only ? 0 : s) * c->vocab;
-        matvec(out, embed, b->xn, b->xq, b->sx);          /* tied lm_head */
+        matvec(out, embed, b->cy, b->xq, b->sx);          /* tied lm_head */
+    }
+}
+
+/* Run S tokens from pos_base. logits may be NULL (prefill), [S,vocab], or -- the
+ * common case -- only the last row via `last_only`.
+ *
+ * pos_base == 0 means a NEW SEQUENCE and resets the conv recurrence. Any other
+ * pos_base must equal conv_pos: the conv state cannot be rewound, so a caller
+ * reusing a cached prefix has to be strictly extending it.
+ *
+ * Long inputs are processed in chunks of b->S. That is exactly equivalent to one
+ * big call -- positions still go through every layer in order, the conv recurrence
+ * carries across the boundary and KV accumulates -- and it bounds the batched
+ * projection scratch, which would otherwise scale with the full context. */
+static void forward(M *m, const int *ids, int S, int pos_base,
+                    float *logits, int last_only, Buf *b) {
+    if (pos_base == 0) conv_reset(m);
+    else if (pos_base != m->conv_pos) {
+        fprintf(stderr, "internal error: forward at %d but the conv state is at %d\n",
+                pos_base, m->conv_pos);
+        exit(1);
+    }
+    for (int c0 = 0; c0 < S; c0 += b->S) {
+        int cn = S - c0 < b->S ? S - c0 : b->S;
+        int last = (c0 + cn == S);
+        float *lg = !logits ? NULL
+                  : last_only ? (last ? logits : NULL)
+                  : logits + (size_t)c0 * m->c.vocab;
+        forward_chunk(m, ids + c0, cn, pos_base + c0, lg, last_only, b);
     }
 }
 
@@ -1029,6 +1148,10 @@ static void init(M *m, const char *dir, int n_io,
     m->ucount = calloc((size_t)c->n_layers * c->n_experts, 8);
     snprintf(m->usage_path, sizeof m->usage_path, "%s/usage.bin", dir);
 
+    m->inv_freq = xmalloc(sizeof(float) * (size_t)(c->head_dim / 2 + 1));
+    for (int i = 0; i < c->head_dim / 2; i++)
+        m->inv_freq[i] = powf(c->rope_theta, -(float)(2 * i) / (float)c->head_dim);
+
     m->kv_k = calloc(c->n_layers, sizeof(float *));
     m->kv_v = calloc(c->n_layers, sizeof(float *));
     m->ring_pos = calloc(c->n_layers, sizeof(int *));
@@ -1094,28 +1217,34 @@ static Buf *bufs(M *m, int Smax) {
     Cfg *c = &m->c;
     int D = c->hidden, K = c->topk;
     int qmax = c->n_heads * c->head_dim;
+    int kvmax = c->n_kv_heads * c->head_dim;
     int imax = c->dense_inter > c->moe_inter ? c->dense_inter : c->moe_inter;
     int wide = qmax > c->vocab ? qmax : c->vocab;
     if (wide < D) wide = D;
     if (wide < imax) wide = imax;
     if (wide < 3 * D) wide = 3 * D;              /* conv in_proj output */
+    /* widest CONTRACTED dimension any matmul sees (lm_head contracts over D, not
+     * vocab), which is what the batched activation scratch is sized by */
+    int cmax = D > imax ? D : imax;
 
     Buf *b = calloc(1, sizeof *b);
     b->S = Smax;
     b->x    = xmalloc(sizeof(float) * (size_t)Smax * D);
     b->eout = xmalloc(sizeof(float) * (size_t)Smax * D);   /* ffn-normed input */
     b->h2   = xmalloc(sizeof(float) * (size_t)Smax * D);   /* MoE output */
-    b->xn   = xmalloc(sizeof(float) * wide);
-    b->q    = xmalloc(sizeof(float) * (qmax + 64));
-    b->k    = xmalloc(sizeof(float) * (qmax + 64));
-    b->v    = xmalloc(sizeof(float) * (qmax + 64));
-    b->o    = xmalloc(sizeof(float) * (qmax + 64));
-    b->tmp  = xmalloc(sizeof(float) * wide);
-    b->mlp  = xmalloc(sizeof(float) * (imax + 64));
-    b->bcx  = xmalloc(sizeof(float) * (3 * D + 64));
-    b->cy   = xmalloc(sizeof(float) * (D + 64));
-    b->gate = xmalloc(sizeof(float) * (imax + 64));
-    b->up   = xmalloc(sizeof(float) * (imax + 64));
+    b->xn   = xmalloc(sizeof(float) * ((size_t)Smax * D + wide));
+    b->q    = xmalloc(sizeof(float) * ((size_t)Smax * qmax + 64));
+    b->k    = xmalloc(sizeof(float) * ((size_t)Smax * kvmax + 64));
+    b->v    = xmalloc(sizeof(float) * ((size_t)Smax * kvmax + 64));
+    b->o    = xmalloc(sizeof(float) * ((size_t)Smax * qmax + 64));
+    b->tmp  = xmalloc(sizeof(float) * ((size_t)Smax * D + wide));
+    b->mlp  = xmalloc(sizeof(float) * ((size_t)Smax * imax + 64));
+    b->bcx  = xmalloc(sizeof(float) * ((size_t)Smax * 3 * D + 64));
+    b->cy   = xmalloc(sizeof(float) * ((size_t)Smax * D + 64));
+    b->gate = xmalloc(sizeof(float) * ((size_t)Smax * imax + 64));
+    b->up   = xmalloc(sizeof(float) * ((size_t)Smax * imax + 64));
+    b->mxq  = xmalloc((size_t)Smax * cmax + 64);
+    b->msx  = xmalloc(sizeof(float) * ((size_t)Smax * (cmax / Q40_BLK) + 64));
     b->rwt  = xmalloc(sizeof(float) * (c->n_experts + 64));
     b->xq   = xmalloc(wide + 64);
     b->hq   = xmalloc(wide + 64);
@@ -1484,6 +1613,7 @@ int main(int argc, char **argv) {
     int think = 0, raw = 0, chat_mode = 0;
     int kvq_on = 0, kb = 6, vb = 4, rwin = 128, kv_protect = 2, kv_pbits = 8;
     int check = 0, n_io = 8, max_tokens = 0, nobatch = 0, npin = 0, nthreads = 2;
+    int batch = 128;
     int serve_mode = 0, serve_port = 8484;
     float temp = 0.2f, topp = 1.0f;      /* LFM2.5 generation defaults */
     int topk = 80;
@@ -1494,6 +1624,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--nobatch")) nobatch = 1;
         else if (!strcmp(argv[i], "--threads") && i + 1 < argc) nthreads = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--io") && i + 1 < argc) n_io = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--batch") && i + 1 < argc) batch = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--max_tokens") && i + 1 < argc) max_tokens = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--temp") && i + 1 < argc) temp = atof(argv[++i]);
         else if (!strcmp(argv[i], "--topp") && i + 1 < argc) topp = atof(argv[++i]);
@@ -1546,7 +1677,13 @@ int main(int argc, char **argv) {
     init(&m, dir, n_io, kb, vb, kv_protect, rwin, kv_pbits);
     Cfg *c = &m.c;
     pin_load(&m, npin);
-    Buf *b = bufs(&m, c->ctx);
+    /* Prefill batch size. Bigger reuses each streamed weight row over more rows --
+     * the whole reason prefill is not per-position any more -- but the projection
+     * scratch grows with it, so past a point it just evicts the weights it is trying
+     * to reuse. 128 is a good default; --batch tunes it. */
+    if (batch < 1) batch = 1;
+    if (batch > c->ctx) batch = c->ctx;
+    Buf *b = bufs(&m, batch);
 
     int nattn = 0;
     for (int l = 0; l < c->n_layers; l++) nattn += c->layer_types[l];
