@@ -502,7 +502,6 @@ typedef struct {
     float *x, *xn, *q, *k, *v, *o, *tmp, *mlp;
     float *gate, *up, *eout, *h2, *bcx, *cy;
     int8_t *mxq; float *msx;         /* batched-activation scratch for matmul */
-    float *kvk, *kvv;
     int moe_nu, moe_chunk_n, moe_prefetch, moe_slots[MAXEXPERTS];
     /* Per-row CPU prefill scratch: avoids OpenMP fork/join for every row. */
     float *egate, *esx, *ehs;
@@ -1035,12 +1034,7 @@ static void forward_chunk(M *m, const int *ids, int S, int pos_base,
     }
 }
 
-/* Run S tokens from pos_base. logits may be NULL (prefill), [S,vocab], or -- the
- * common case -- only the last row via `last_only`.
- *
- * pos_base == 0 means a NEW SEQUENCE and resets the conv recurrence. Any other
- * pos_base must equal conv_pos: the conv state cannot be rewound, so a caller
- * reusing a cached prefix has to be strictly extending it.
+/* As forward_chunk, but for an input of any length.
  *
  * Long inputs are processed in chunks of b->S. That is exactly equivalent to one
  * big call -- positions still go through every layer in order, the conv recurrence
@@ -1334,9 +1328,6 @@ static Buf *bufs(M *m, int Smax) {
     b->rows = xmalloc(sizeof(int) * (size_t)Smax * K);
     b->roww = xmalloc(sizeof(float) * (size_t)Smax * K);
     b->uniq = xmalloc(sizeof(int) * c->n_experts);
-    int mkv = c->n_kv_heads * c->head_dim;
-    b->kvk  = xmalloc(sizeof(float) * (mkv + 64));
-    b->kvv  = xmalloc(sizeof(float) * (mkv + 64));
     b->egate = xmalloc(sizeof(float) * (size_t)Smax * (c->moe_inter + 64));
     b->exq  = xmalloc((size_t)Smax * (D + 64));
     b->ehq  = xmalloc((size_t)Smax * (c->moe_inter + 64));
@@ -1426,7 +1417,6 @@ typedef struct {
     int *cached_ids;
     int cached_len;
     int cached_cap;
-    int port;
     int eos, eot;
     const char *model_id;
 } LfmServerContext;
@@ -1667,7 +1657,7 @@ static int lfm_serve_handler(SamosaHttpServer *server, int fd, const SamosaHttpR
 }
 
 static int run_lfm_server(M *m, Buf *buffers, LfmTok *tokenizer, const char *model_id, int port) {
-    LfmServerContext ctx={.model=m,.buffers=buffers,.tokenizer=tokenizer,.port=port,.model_id=model_id};
+    LfmServerContext ctx={.model=m,.buffers=buffers,.tokenizer=tokenizer,.model_id=model_id};
     ctx.eos = lfmtok_id(tokenizer, "<|im_end|>");
     ctx.eot = lfmtok_id(tokenizer, "<|endoftext|>");
     pthread_mutex_init(&ctx.generation_mu,NULL); atomic_init(&ctx.cancel,0);

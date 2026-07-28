@@ -376,8 +376,7 @@ of experts, 96 MiB KV and 29 of 32 slots/layer. Measured on an Intel Mac at 8 th
 
 Flags mirror `gemma4` where they mean the same thing (`--chat`, `--serve`, `--system`,
 `--raw`, `--temp/--topp/--topk`, `--pin`, `--io`, `--threads`, `--ctx`, `--ram`,
-`--kv`/`--kvq`
-and the individual TurboQuant knobs). Sampling defaults are LFM2.5's own: temp 0.2,
+`--kv`/`--kvq` and the individual TurboQuant knobs). Sampling defaults are LFM2.5's own: temp 0.2,
 top_k 80. `--batch N` (default 128) sets the prefill batch: it is what gives each
 streamed weight row its reuse, so lowering it costs prefill speed and saves scratch.
 `--think` forces a reasoning block by pre-filling `<think>` — the chat template has

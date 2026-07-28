@@ -19,7 +19,7 @@ share a bug tend to share it because they share code; these share none.
     python3 tools/lfm25_oracle.py /tmp/lfmfix
     ./lfm25-exact /tmp/lfmfix --check
 """
-import argparse, json, os, sys
+import argparse, json, os
 import numpy as np
 
 QK = 32

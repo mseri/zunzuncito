@@ -186,7 +186,7 @@ class Dense:
     def add(self, name, w, fmt):
         w = np.ascontiguousarray(w, dtype=np.float32)
         if w.ndim == 1:
-            w = w.reshape(1, -1) if fmt == FMT_F32 else w.reshape(1, -1)
+            w = w.reshape(1, -1)
         assert w.ndim == 2, f"{name}: ndim {w.ndim}"
         b = quant_rows(fmt, w)
         self.f.write(b)
@@ -266,8 +266,7 @@ def make_fixture(dst):
     T = {}
     n = lambda *s: rng.standard_normal(s).astype(np.float32) * 0.05
     T["model.embed_tokens.weight"] = n(cfg["vocab"], cfg["hidden"])
-    T["model.embedding_norm.weight"] = 1.0 + n(cfg["hidden"])[0] * 0
-    T["model.embedding_norm.weight"] = (1.0 + n(cfg["hidden"]) * 2).reshape(-1)
+    T["model.embedding_norm.weight"] = 1.0 + n(cfg["hidden"]) * 2
     D, MI, DI, NE = cfg["hidden"], cfg["moe_inter"], cfg["dense_inter"], cfg["n_experts"]
     for li in range(cfg["n_layers"]):
         p = f"model.layers.{li}."
