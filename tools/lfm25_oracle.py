@@ -3,17 +3,14 @@
 lfm25_oracle.py — an independent numpy forward pass for LFM2.5, written from the
 architecture, run on the DEQUANTISED container weights.
 
-WHY THIS AND NOT HF. Comparing lfm25.c against fp32 HF logits would conflate two
-completely different things: a bug in the engine, and the quantiser's own error
-(which on a random fixture is percent-level and would drown any bug worth finding).
-So the oracle reads the SAME container the engine reads, dequantises it, and runs
-the math in float64. Any disagreement beyond float noise is then unambiguously an
-engine bug -- there is nothing else left for it to be.
+WHY NOT HF. Comparing against fp32 HF logits would conflate a bug in the engine with
+the quantiser's own error, which on a random fixture is percent-level. So the oracle
+reads the SAME container, dequantises it, and runs the math in float64: any
+disagreement beyond float noise is then unambiguously an engine bug.
 
-It is also written to be structurally different from the C: whole-sequence
-matrices, an explicit attention matrix, no streaming, no online softmax, no conv
-state machine (the conv is a plain shifted sum here). Two implementations that
-share a bug tend to share it because they share code; these share none.
+It is also deliberately structured unlike the C -- whole-sequence matrices, an
+explicit attention matrix, no streaming, no online softmax, no conv state machine
+(the conv is a plain shifted sum) -- so the two share no code to share a bug in.
 
     python3 tools/convert_lfm25.py --fixture --ctx 64 /tmp/lfmfix
     python3 tools/lfm25_oracle.py /tmp/lfmfix

@@ -11,11 +11,10 @@ instead of the MoE. So `layer_types` here means conv-vs-attention (not sliding-v
 global), and layers 0..num_dense_layers-1 carry an MLP in dense.bin while the rest
 carry a router + 32 experts in experts.bin.
 
-MIXED PRECISION (the apex-quant idea, ported). apex-quant is a llama.cpp recipe: it
-does not invent a format, it assigns DIFFERENT existing quant types per tensor
-class, exploiting that routed experts are ~97% idle and so tolerate far more error
-than the always-on tensors. We keep the idea and drop the GGUF dependency, mapping
-its Q3_K..Q8_0 gradient onto the two block formats this engine has kernels for:
+MIXED PRECISION (the apex-quant idea, ported). apex-quant assigns different quant
+types per tensor class, exploiting that routed experts are ~97% idle and tolerate
+far more error than the always-on tensors. Its Q3_K..Q8_0 gradient maps onto the two
+block formats this engine has kernels for:
 
     always-on  (attention, conv, dense MLP)  -> q8_0    (apex: Q6_K/Q8_0)
     routed experts, edge layers              -> q8_0    (apex: Q6_K)
