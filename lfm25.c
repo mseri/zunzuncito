@@ -1291,6 +1291,22 @@ static int pi_desc(const void *a, const void *b) {
     float x = ((const PI *)a)->p, y = ((const PI *)b)->p;
     return x < y ? 1 : x > y ? -1 : 0;
 }
+/* HF-style repetition penalty over the whole context: every token already in the
+ * sequence has its logit divided by pen when positive, multiplied when negative,
+ * and only once no matter how often it occurs. Applied to the fresh logits before
+ * temperature, so it also bites in greedy mode. */
+static void repetition_penalty(float *logits, int V, const int *ids, int n,
+                               float pen, unsigned char *seen) {
+    if (pen == 1.0f || n <= 0) return;
+    memset(seen, 0, (size_t)V);
+    for (int i = 0; i < n; i++) {
+        int t = ids[i];
+        if ((unsigned)t >= (unsigned)V || seen[t]) continue;
+        seen[t] = 1;
+        logits[t] = logits[t] > 0 ? logits[t] / pen : logits[t] * pen;
+    }
+}
+
 /* temperature + top-k + nucleus. Greedy when temp <= 0. top_k is applied BEFORE
  * top_p, which is the order HF uses. LFM2.5's own generation defaults are
  * temp 0.2 / top_k 80 (generation_config.json). */
@@ -1469,7 +1485,7 @@ static int lfm_serve_chat(LfmServerContext *ctx, int fd, jval *root) {
     if (!has_user) return samosa_http_json_error(fd,400,"invalid_messages","A text user message is required.");
 
     int stream = 0, max_tokens = 2048, topk = 80, seed = 0;
-    float temperature = 0.2f, topp = 1.0f;      /* LFM2.5 generation defaults */
+    float temperature = 0.2f, topp = 1.0f, penalty = 1.05f;   /* LFM2.5 generation defaults */
     jval *v = json_get(root,"stream"); if (v && v->t == J_BOOL) stream = v->boolean;
     v = json_get(root,"max_tokens"); if (!v) v = json_get(root,"max_completion_tokens");
     if (v) {
@@ -1495,6 +1511,12 @@ static int lfm_serve_chat(LfmServerContext *ctx, int fd, jval *root) {
             return samosa_http_json_error(fd,400,"invalid_top_k","top_k must be an integer in 1..256.");
         topk = (int)v->num;
     }
+    v = json_get(root,"repetition_penalty");
+    if (v) {
+        if (v->t != J_NUM || v->num < 0.5 || v->num > 2)
+            return samosa_http_json_error(fd,400,"invalid_repetition_penalty","repetition_penalty must be in 0.5..2.");
+        penalty = (float)v->num;
+    }
     v = json_get(root,"seed");
     if (v) {
         if (v->t != J_NUM || v->num < 0 || floor(v->num) != v->num || v->num > UINT32_MAX)
@@ -1511,18 +1533,19 @@ static int lfm_serve_chat(LfmServerContext *ctx, int fd, jval *root) {
     int *ids = malloc((size_t)c->ctx * sizeof *ids);
     float *logits = malloc((size_t)c->vocab * sizeof *logits);
     PI *pbuf = malloc((size_t)c->vocab * sizeof *pbuf);
-    if (!ids || !logits || !pbuf) { free(prompt.data); free(ids); free(logits); free(pbuf); return samosa_http_json_error(fd,500,"out_of_memory","Unable to allocate generation buffers."); }
+    unsigned char *seen = malloc((size_t)c->vocab);
+    if (!ids || !logits || !pbuf || !seen) { free(prompt.data); free(ids); free(logits); free(pbuf); free(seen); return samosa_http_json_error(fd,500,"out_of_memory","Unable to allocate generation buffers."); }
     LfmTok *tok = ctx->tokenizer;
     int np = lfmtok_encode(tok, prompt.data, ids, c->ctx);
     free(prompt.data);
-    if (np <= 0) { free(ids); free(logits); free(pbuf); return samosa_http_json_error(fd,400,"invalid_prompt","The prompt produced no tokens."); }
+    if (np <= 0) { free(ids); free(logits); free(pbuf); free(seen); return samosa_http_json_error(fd,400,"invalid_prompt","The prompt produced no tokens."); }
     /* The window is whatever --ctx sized the KV for at startup (advertised as
      * context_length on /v1/models); report both figures, not just "context limit". */
     if (np >= c->ctx) {
         char msg[256];
         snprintf(msg, sizeof msg, "The prompt is %d tokens and the context window is "
                  "%d; it leaves no room for a completion.", np, c->ctx);
-        free(ids); free(logits); free(pbuf);
+        free(ids); free(logits); free(pbuf); free(seen);
         return samosa_http_json_error(fd, 400, "context_limit", msg);
     }
     if (max_tokens > c->ctx - np) max_tokens = c->ctx - np;   /* clamp, do not fail */
@@ -1541,10 +1564,11 @@ static int lfm_serve_chat(LfmServerContext *ctx, int fd, jval *root) {
         forward(m, ids, np, 0, logits, 1, ctx->buffers);
 
     char id[64]; snprintf(id,sizeof id,"lfm25-%llu",(unsigned long long)time(NULL));
-    if (stream && !samosa_http_stream_headers(fd)) { pthread_mutex_unlock(&ctx->generation_mu); free(ids); free(logits); free(pbuf); return 1; }
+    if (stream && !samosa_http_stream_headers(fd)) { pthread_mutex_unlock(&ctx->generation_mu); free(ids); free(logits); free(pbuf); free(seen); return 1; }
     LfmString answer = {0}; uint64_t rng = seed ? (uint64_t)seed : 0x853c49e6748fea9bULL;
     int generated = 0; const char *reason = "length";
     while (generated < max_tokens && !atomic_load(&ctx->cancel)) {
+        repetition_penalty(logits, c->vocab, ids, np + generated, penalty, seen);
         int token = sample(logits, c->vocab, temperature, topp, topk, pbuf, &rng);
         if (token == ctx->eos || token == ctx->eot) { reason = "stop"; break; }
         char piece[4096]; int n = lfmtok_decode(tok, &token, 1, piece, sizeof piece - 1);
@@ -1575,7 +1599,7 @@ static int lfm_serve_chat(LfmServerContext *ctx, int fd, jval *root) {
         memcpy(ctx->cached_ids, ids, (size_t)final_len * sizeof *ids);
         ctx->cached_len = final_len;
     }
-    free(answer.data); pthread_mutex_unlock(&ctx->generation_mu); free(ids); free(logits); free(pbuf); return 0;
+    free(answer.data); pthread_mutex_unlock(&ctx->generation_mu); free(ids); free(logits); free(pbuf); free(seen); return 0;
 }
 
 static int lfm_serve_handler(SamosaHttpServer *server, int fd, const SamosaHttpRequest *request, void *opaque) {
@@ -1621,6 +1645,7 @@ static void usage(const char *prog, FILE *out) {
         "usage: %s <dir> [flags...] [prompt]\n"
         "         [--chat] [--system S] [--think] [--raw] [--max_tokens N]\n"
         "         [--temp F] [--topp F] [--topk N]   (default 0.2 / 1.0 / 80)\n"
+        "         [--penalty F]           repetition penalty (default 1.05, 1 = off)\n"
         "         [--ctx N]               override the container's context length\n"
         "         [--ram F]               re-plan the expert cache for an F GB budget\n"
         "         [--pin N] [--io N] [--threads N] [--batch N] [--nobatch]\n"
@@ -1646,7 +1671,7 @@ int main(int argc, char **argv) {
     int batch = 128, ctx_override = 0;
     double ram_gb = 0;                   /* 0 = keep the container's own plan */
     int serve_mode = 0, serve_port = 8484;
-    float temp = 0.2f, topp = 1.0f;      /* LFM2.5 generation defaults */
+    float temp = 0.2f, topp = 1.0f, penalty = 1.05f;   /* LFM2.5 generation defaults */
     int topk = 80;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--serve")) serve_mode = 1;
@@ -1662,6 +1687,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--temp") && i + 1 < argc) temp = atof(argv[++i]);
         else if (!strcmp(argv[i], "--topp") && i + 1 < argc) topp = atof(argv[++i]);
         else if (!strcmp(argv[i], "--topk") && i + 1 < argc) topk = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--penalty") && i + 1 < argc) penalty = atof(argv[++i]);
         else if (!strcmp(argv[i], "--pin") && i + 1 < argc) npin = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--system") && i + 1 < argc) sys = argv[++i];
         else if (!strcmp(argv[i], "--chat")) chat_mode = 1;
@@ -1696,6 +1722,7 @@ int main(int argc, char **argv) {
         else if (!prompt) prompt = argv[i];   /* first non-flag positional is the prompt */
     }
     if (!kvq_on) kb = vb = 0;
+    if (penalty < 0.5f || penalty > 2.0f) { fprintf(stderr, "--penalty must be in 0.5..2\n\n"); usage(argv[0], stderr); return 1; }
     if (chat_mode && check) { fprintf(stderr, "--chat cannot be used with --check\n\n"); usage(argv[0], stderr); return 1; }
     if (chat_mode && serve_mode) { fprintf(stderr, "--chat cannot be used with --serve\n\n"); usage(argv[0], stderr); return 1; }
     if (!serve_mode && !check && max_tokens == 0) max_tokens = 2048;
@@ -1807,6 +1834,7 @@ int main(int argc, char **argv) {
     if (max_tokens > 0) {
         float *logits = xmalloc(sizeof(float) * c->vocab);
         PI *pbuf = xmalloc(sizeof(PI) * c->vocab);
+        unsigned char *seen = xmalloc((size_t)c->vocab);
         uint64_t rng = 0x853c49e6748fea9bULL;
 
         char tp[4096];
@@ -1911,6 +1939,7 @@ int main(int argc, char **argv) {
             double t = now();
 
             while (n < max_tokens) {
+                repetition_penalty(logits, c->vocab, ids, np + n, penalty, seen);
                 int tok = sample(logits, c->vocab, temp, topp, topk, pbuf, &rng);
                 if (tok == eos || tok == eot) break;
                 if (T) { lfmtok_decode(T, &tok, 1, piece, sizeof piece); fputs(piece, stdout); }
