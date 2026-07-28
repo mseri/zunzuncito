@@ -28,14 +28,14 @@ from disk with an expert-granular cache instead of leaving it to the OS page cac
 
 The main tricks used to speed that up:
 
-1. **Exact prefetch.** Gemma-4's router reads the raw post-attention residual, so the
-   8 expert IDs for a layer are known before the dense MLP runs. We route first, fire
-   the reads, then compute the MLP while they are in flight — no prediction needed.
-2. **Batch-union MoE.** The S tokens of a prefill batch collectively route to at most
-   `min(128, 8·S)` distinct experts per layer. We read each once, so a 512-token
-   prompt drops from 122,880 expert reads to ≤3,840.
-3. **A learned pin set.** Expert usage is heavily skewed and stable across prompts.
-   Routing counts persist to `usage.bin` and the next run pins the hot set into slots
+1. Prefetch is exact, not predicted. Gemma-4's router reads the raw post-attention
+   residual, so the 8 expert IDs for a layer are known before the dense MLP runs. We
+   route first, fire the reads, then compute the MLP while they are in flight.
+2. The MoE runs over the batch union. The S tokens of a prefill batch collectively
+   route to at most `min(128, 8·S)` distinct experts per layer. We read each once, so a
+   512-token prompt drops from 122,880 expert reads to ≤3,840.
+3. The pin set is learned. Expert usage is heavily skewed and stable across prompts, so
+   routing counts persist to `usage.bin` and the next run pins the hot set into slots
    the LRU may never evict. On a constrained cache this easily reaches 80% hits.
 
 MTP speculative decoding is implemented, but on my system the IO slowdown makes it
@@ -217,9 +217,9 @@ At a small RAM budget this engine is IO bound anyway — roughly 800 MB of exper
 per token against 7.6 GFLOP of compute — so a faster matmul does not help you wait on
 NVMe. Metal could still help for:
 
-- **prefill**, which is batched and genuinely compute-bound;
-- **16 GB**, where the whole container is resident in memory, so there is no
-  disk in the loop, and unified memory bandwidth may beat the CPU bandwidth.
+- prefill, which is batched and genuinely compute-bound;
+- a 16 GB budget, where the whole container is resident and there is no disk in the
+  loop, so unified memory bandwidth may beat the CPU bandwidth.
 
 ## KV-cache compression (TurboQuant V3)
 
@@ -325,12 +325,12 @@ see `--pin` under Tuning. Without `--ram` the container's own plan is used.
 
 You can improve generation speed quite a lot by playing with these:
 
-- **`--io`**: we do 240 expert reads per token at 3.19 MiB each. The default is 8 I/O
-  threads, but on a good SSD you can go considerably higher.
-- **`--pin`**: how much of the cache to freeze rather than leave to the LRU. At 4 GB
+- `--io` sets the I/O threads, default 8. We do 240 expert reads per token at 3.19 MiB
+  each, so on a good SSD you can go considerably higher.
+- `--pin` decides how much of the cache to freeze rather than leave to the LRU. At 4 GB
   there are only 21 slots/layer, and the right split depends on the routing
   distribution of your own requests.
-- **`--threads`**: compute threads, default 2. Raise it according to your core count.
+- `--threads` sets the compute threads, default 2. Raise it according to your core count.
 
 The engine prints hit rate, expert reads and speculation acceptance after every run,
 so you can see what the flags did.
