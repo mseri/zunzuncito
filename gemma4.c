@@ -1720,7 +1720,7 @@ static int mtp_load(M *m, const char *dir) {
 }
 
 /* ------------------------------------------------------------------ setup */
-static void init(M *m, const char *dir, int n_io, int ctx_override,
+static void init(M *m, const char *dir, int n_io, int ctx_override, double ram_gb,
                  int kb, int vb, int kv_protect, int rwin, int kv_pbits) {
     m->rwin = rwin > 0 ? rwin : 128;
     manifest(m, dir);
@@ -1737,24 +1737,6 @@ static void init(M *m, const char *dir, int n_io, int ctx_override,
      * once the real figure is known. */
     int ctx_planned = c->ctx;
     if (ctx_override > 0) c->ctx = ctx_override;
-    if (c->slots_per_layer < c->topk) {
-        fprintf(stderr, "slots_per_layer=%d < topk=%d: raise --ram\n",
-                c->slots_per_layer, c->topk);
-        exit(1);
-    }
-    size_t ns = (size_t)c->n_layers * c->slots_per_layer;
-    m->slots = calloc(ns, sizeof(Slot));
-    for (size_t i = 0; i < ns; i++) {
-        m->slots[i].eid = -1;
-        m->slots[i].buf = xmalloc(m->esz);
-        /* Map each slot once, up front. Slots are reused for different experts, so
-         * the mapping stays valid for the whole run -- the streaming layer only ever
-         * overwrites the bytes, never the address. */
-        if (g_use_gpu && !gpu_map(m->slots[i].buf, m->esz)) {
-            fprintf(stderr, "metal: could not map expert slots; using CPU\n");
-            g_use_gpu = 0;
-        }
-    }
     m->ucount = calloc((size_t)c->n_layers * c->n_experts, 8);
     snprintf(m->usage_path, sizeof m->usage_path, "%s/usage.bin", dir);
 
@@ -1819,12 +1801,65 @@ static void init(M *m, const char *dir, int n_io, int ctx_override,
             int cap = glob ? ctx_planned : c->sliding_window + MAXDRAFT + 2;
             planned += 2 * sizeof(float) * (size_t)cap * nkv * hd;
         }
-        if (kvb > planned)
+        /* With an explicit --ram the cache is about to be re-planned against this
+         * very figure, so the overshoot is already accounted for: warning would be
+         * telling the user about a problem we are in the middle of solving. */
+        if (kvb > planned && ram_gb <= 0)
             fprintf(stderr, "warning: that is %.0f MiB more KV than the container's "
                     "plan budgeted (%.0f MiB for ctx %d, f32), so total RAM will "
                     "exceed the conversion's --ram%s\n",
                     (kvb - planned) / 1048576.0, planned / 1048576.0, ctx_planned,
                     kb > 0 ? "" : "; --kvq would cut it a lot");
+    }
+
+    /* ------------------------------------------------- expert-cache plan
+     * slots_per_layer is the ONLY thing the conversion's --ram fixed, and nothing in
+     * the container depends on it: experts are read from experts.bin one at a time by
+     * offset and the cache is pure LRU. So --ram re-runs the planner of
+     * tools/convert_gemma4.py against the numbers we now know EXACTLY -- the resident
+     * dense blob and the KV just allocated -- instead of the ones the conversion had
+     * to assume (f32 KV at the container's own ctx). */
+    if (ram_gb > 0) {
+        int64_t scratch = 192 << 20;
+        int64_t avail = (int64_t)(ram_gb * (double)(1LL << 30))
+                      - (int64_t)m->dense_len - (int64_t)kvb - scratch;
+        int64_t per = avail > 0 ? (avail / (int64_t)m->esz) / c->n_layers : 0;
+        if (per > c->n_experts) per = c->n_experts;
+        if (per < c->topk) {
+            double min_gb = ((double)m->dense_len + (double)kvb + (double)scratch
+                             + (double)c->topk * c->n_layers * (double)m->esz)
+                            / (double)(1LL << 30);
+            fprintf(stderr, "--ram %g GB leaves room for %lld experts per layer, below "
+                    "topk=%d: this model needs %.2f GB at this context%s\n",
+                    ram_gb, (long long)per, c->topk, min_gb,
+                    kb > 0 ? "" : " (--kvq would lower it)");
+            exit(1);
+        }
+        c->slots_per_layer = (int)per;
+        fprintf(stderr, "ram: %g GB budget -> %d slots/layer "
+                "(dense %.0f MiB + kv %.0f MiB + cache %.0f MiB)\n",
+                ram_gb, c->slots_per_layer, m->dense_len / 1048576.0, kvb / 1048576.0,
+                (double)c->slots_per_layer * c->n_layers * (double)m->esz / 1048576.0);
+    }
+    if (c->slots_per_layer < c->topk) {
+        fprintf(stderr, "slots_per_layer=%d < topk=%d: raise --ram\n",
+                c->slots_per_layer, c->topk);
+        exit(1);
+    }
+    {
+        size_t ns = (size_t)c->n_layers * c->slots_per_layer;
+        m->slots = calloc(ns, sizeof(Slot));
+        for (size_t i = 0; i < ns; i++) {
+            m->slots[i].eid = -1;
+            m->slots[i].buf = xmalloc(m->esz);
+            /* Map each slot once, up front. Slots are reused for different experts, so
+             * the mapping stays valid for the whole run -- the streaming layer only ever
+             * overwrites the bytes, never the address. */
+            if (g_use_gpu && !gpu_map(m->slots[i].buf, m->esz)) {
+                fprintf(stderr, "metal: could not map expert slots; using CPU\n");
+                g_use_gpu = 0;
+            }
+        }
     }
 
     m->kv_conf = INT_MAX;                   /* nothing speculative yet */
@@ -2684,6 +2719,7 @@ static void usage(const char *prog, FILE *out) {
         "                                DFlash extra denoising passes (default 0) and\n"
         "                                per-token freeze confidence (default 0.9)\n"
         "         [--ctx N]              override the container's context length\n"
+        "         [--ram F]              re-plan the expert cache for an F GB budget\n"
         "         [--io N] [--nobatch] [--threads N]\n"
         "         [--metal] Metal is OFF by default (it is slower if gemma is not fully in RAM)\n"
         "         [--serve] [--port N]    OpenAI-compatible local server (default 8484)\n"
@@ -2712,6 +2748,7 @@ int main(int argc, char **argv) {
     int no_metal = 0, chk_gpu = 0, use_mtp = 0, use_dflash = 0, use_metal = 0;
     int check = 0, n_io = 8, max_tokens = 0, nobatch = 0, npin = 0, draft = 0, nthreads = 2;
     int serve_mode = 0, serve_port = 8484, ctx_override = 0;
+    double ram_gb = 0;                   /* 0 = keep the container's own plan */
     const char *dpath = NULL;
     float temp = 1.0f, topp = 0.95f;   /* Gemma-4 generation defaults */
     int topk = 64;
@@ -2723,6 +2760,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--threads") && i + 1 < argc) nthreads = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--io") && i + 1 < argc) n_io = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--ctx") && i + 1 < argc) ctx_override = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--ram") && i + 1 < argc) ram_gb = atof(argv[++i]);
         else if (!strcmp(argv[i], "--max_tokens") && i + 1 < argc) max_tokens = atoi(argv[++i]);
 
         else if (!strcmp(argv[i], "--temp") && i + 1 < argc) temp = atof(argv[++i]);
@@ -2811,7 +2849,7 @@ int main(int argc, char **argv) {
 
     M m; memset(&m, 0, sizeof m);
     double t0 = now();
-    init(&m, dir, n_io, ctx_override, kb, vb, kv_protect, rwin, kv_pbits);
+    init(&m, dir, n_io, ctx_override, ram_gb, kb, vb, kv_protect, rwin, kv_pbits);
     if (g_use_gpu)
         fprintf(stderr, "metal: %s (q4_0 matmul offloaded; --no-metal to disable)\n",
                 gpu_name());
@@ -2865,7 +2903,9 @@ int main(int argc, char **argv) {
     if (dpath) {
         /* same ctx as the target: the drafter has to span the same positions.
          * Its KV stays f32 -- it is tiny. */
-        init(&dm, dpath, n_io, c->ctx, 0, 0, 0, rwin, 8);
+        /* ram_gb 0: --ram budgets the TARGET's expert cache. The drafter is a dense
+         * model whose whole footprint is fixed by its own container. */
+        init(&dm, dpath, n_io, c->ctx, 0, 0, 0, 0, rwin, 8);
         db = bufs(&dm, dm.c.ctx);
         if (dm.c.vocab != c->vocab) {
             fprintf(stderr, "drafter vocab %d != target %d\n", dm.c.vocab, c->vocab);

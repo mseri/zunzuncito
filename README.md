@@ -265,6 +265,40 @@ room for a completion is rejected with both figures in the error. There is no
 per-request context parameter — changing the window means restarting with a
 different `--ctx`, because the KV cache is allocated once.
 
+## RAM budget
+
+Both engines also take `--ram F` (GB) to re-plan the expert cache at startup, without
+reconverting. `slots_per_layer` is the only thing the conversion's `--ram` fixed, and
+nothing in the container depends on it: experts are read from `experts.bin` one at a
+time by offset and the cache is a plain LRU. So the same container runs on a smaller
+or a larger machine than it was converted for.
+
+The runtime re-runs the converter's planner (`plan()` in `tools/convert_*.py`) with
+numbers it knows *exactly* rather than had to assume — the resident dense blob and the
+KV it just allocated:
+
+```
+$ ./lfm25 ./lfm-ct --ram 4 --kvq
+kv: 20 MiB for ctx 4096 (K6/V4, rwin 128, 2 protected layers at 8 bits)
+ram: 4 GB budget -> 13 slots/layer (dense 606 MiB + kv 20 MiB + cache 3191 MiB)
+```
+
+It composes with `--ctx` and `--kvq`, in that order: the KV is sized first and the
+cache gets what is left, so a longer context costs slots. Below `topk` slots per layer
+the cache would thrash inside a single forward, so that exits with the minimum budget
+for the current context instead of running unusably slow:
+
+```
+$ ./gemma4 ./g4 --ram 2 --kvq
+--ram 2 GB leaves room for 3 experts per layer, below topk=8: this model needs 2.38 GB
+```
+
+Fewer slots is a hit-rate cost, not a correctness one: with `--ram` low the engine
+streams more experts per token from disk. Check the `expert cache: NN% hit` line at
+exit, and see `--pin` under Tuning — the learned hot-expert pin set is what makes a
+small cache bearable. Without `--ram` the container's own plan is used and nothing
+changes.
+
 ## Tuning
 
 You can improve the generation speed quite a lot by playing around with these flags
@@ -341,7 +375,8 @@ of experts, 96 MiB KV and 29 of 32 slots/layer. Measured on an Intel Mac at 8 th
 ~24 tok/s prefill, ~16 tok/s decode, ~90% expert-cache hit.
 
 Flags mirror `gemma4` where they mean the same thing (`--chat`, `--serve`, `--system`,
-`--raw`, `--temp/--topp/--topk`, `--pin`, `--io`, `--threads`, `--ctx`, `--kv`/`--kvq`
+`--raw`, `--temp/--topp/--topk`, `--pin`, `--io`, `--threads`, `--ctx`, `--ram`,
+`--kv`/`--kvq`
 and the individual TurboQuant knobs). Sampling defaults are LFM2.5's own: temp 0.2,
 top_k 80. `--batch N` (default 128) sets the prefill batch: it is what gives each
 streamed weight row its reuse, so lowering it costs prefill speed and saves scratch.

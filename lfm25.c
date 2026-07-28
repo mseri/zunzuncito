@@ -1125,7 +1125,7 @@ static void pin_save(M *m) {
 }
 
 /* ------------------------------------------------------------------ init */
-static void init(M *m, const char *dir, int n_io, int ctx_override,
+static void init(M *m, const char *dir, int n_io, int ctx_override, double ram_gb,
                  int kb, int vb, int kv_protect, int rwin, int kv_pbits) {
     m->rwin = rwin > 0 ? rwin : 128;
     manifest(m, dir);
@@ -1142,21 +1142,6 @@ static void init(M *m, const char *dir, int n_io, int ctx_override,
      * one the plan assumed, below, once both are known. */
     int ctx_planned = c->ctx;
     if (ctx_override > 0) c->ctx = ctx_override;
-    if (c->slots_per_layer < c->topk) {
-        fprintf(stderr, "slots_per_layer=%d < topk=%d: raise --ram\n",
-                c->slots_per_layer, c->topk);
-        exit(1);
-    }
-    size_t ns = (size_t)c->n_layers * c->slots_per_layer;
-    m->slots = calloc(ns, sizeof(Slot));
-    for (int l = 0; l < c->n_layers; l++)
-        for (int i = 0; i < c->slots_per_layer; i++) {
-            Slot *s = &m->slots[(size_t)l * c->slots_per_layer + i];
-            s->eid = -1;
-            /* sized for THIS layer's expert format: the apex gradient makes the
-             * edge layers' experts bigger than the middle ones' */
-            s->buf = m->esz[l] ? xmalloc(m->esz[l]) : NULL;
-        }
     m->ucount = calloc((size_t)c->n_layers * c->n_experts, 8);
     snprintf(m->usage_path, sizeof m->usage_path, "%s/usage.bin", dir);
 
@@ -1224,12 +1209,75 @@ static void init(M *m, const char *dir, int n_io, int ctx_override,
             if (c->layer_types[l])
                 planned += 2 * sizeof(float) * (size_t)ctx_planned
                          * c->n_kv_heads * c->head_dim;
-        if (kvb > planned)
+        /* With an explicit --ram the cache is about to be re-planned against this
+         * very figure, so the overshoot is already accounted for: warning would be
+         * telling the user about a problem we are in the middle of solving. */
+        if (kvb > planned && ram_gb <= 0)
             fprintf(stderr, "warning: that is %.0f MiB more KV than the container's "
                     "plan budgeted (%.0f MiB for ctx %d, f32), so total RAM will "
                     "exceed the conversion's --ram%s\n",
                     (kvb - planned) / 1048576.0, planned / 1048576.0, ctx_planned,
                     quant ? "" : "; --kvq would cut it a lot");
+    }
+
+    /* ------------------------------------------------- expert-cache plan
+     * slots_per_layer is the ONLY thing the conversion's --ram fixed, and nothing
+     * in the container depends on it: the experts are read from experts.bin one at
+     * a time and the cache is pure LRU. So a runtime --ram simply re-runs the
+     * planner of tools/convert_lfm25.py against the numbers we now know exactly --
+     * the resident dense blob and the KV just allocated -- instead of the ones the
+     * conversion had to assume. Budget the slots against the LARGEST expert so the
+     * plan is safe on every layer (mixed precision makes the edge layers bigger). */
+    if (ram_gb > 0) {
+        int64_t esz_max = 0, esz_sum = 0, nmoe = 0;
+        for (int l = 0; l < c->n_layers; l++)
+            if (m->esz[l]) {
+                nmoe++; esz_sum += m->esz[l];
+                if (m->esz[l] > esz_max) esz_max = m->esz[l];
+            }
+        if (esz_max && nmoe) {
+            int64_t scratch = 192 << 20;
+            int64_t avail = (int64_t)(ram_gb * (double)(1LL << 30))
+                          - (int64_t)m->dense_len - (int64_t)kvb - (int64_t)cvb
+                          - scratch;
+            int64_t per = avail > 0 ? (avail / esz_max) / nmoe : 0;
+            if (per > c->n_experts) per = c->n_experts;
+            if (per < c->topk) {
+                double min_gb = ((double)m->dense_len + (double)kvb + (double)cvb
+                                 + (double)scratch
+                                 + (double)c->topk * nmoe * esz_max) / (double)(1LL << 30);
+                fprintf(stderr, "--ram %g GB leaves room for %lld experts per layer, "
+                        "below topk=%d: this model needs %.2f GB at this context%s\n",
+                        ram_gb, (long long)per, c->topk, min_gb,
+                        quant ? "" : " (--kvq would lower it)");
+                exit(1);
+            }
+            c->slots_per_layer = (int)per;
+        }
+        /* Budgeted against the largest expert so the plan is safe on every layer, but
+         * REPORTED at the true per-layer sizes -- same distinction the converter's
+         * planner makes, and the reason the printed cache is under the budget. */
+        fprintf(stderr, "ram: %g GB budget -> %d slots/layer "
+                "(dense %.0f MiB + kv %.0f MiB + cache %.0f MiB)\n",
+                ram_gb, c->slots_per_layer, m->dense_len / 1048576.0,
+                kvb / 1048576.0, (double)c->slots_per_layer * esz_sum / 1048576.0);
+    }
+    if (c->slots_per_layer < c->topk) {
+        fprintf(stderr, "slots_per_layer=%d < topk=%d: raise --ram\n",
+                c->slots_per_layer, c->topk);
+        exit(1);
+    }
+    {
+        size_t ns = (size_t)c->n_layers * c->slots_per_layer;
+        m->slots = calloc(ns, sizeof(Slot));
+        for (int l = 0; l < c->n_layers; l++)
+            for (int i = 0; i < c->slots_per_layer; i++) {
+                Slot *s = &m->slots[(size_t)l * c->slots_per_layer + i];
+                s->eid = -1;
+                /* sized for THIS layer's expert format: the apex gradient makes the
+                 * edge layers' experts bigger than the middle ones' */
+                s->buf = m->esz[l] ? xmalloc(m->esz[l]) : NULL;
+            }
     }
 
     m->qcap = 2 * c->slots_per_layer;
@@ -1637,6 +1685,7 @@ static void usage(const char *prog, FILE *out) {
         "         [--chat] [--system S] [--think] [--raw] [--max_tokens N]\n"
         "         [--temp F] [--topp F] [--topk N]   (default 0.2 / 1.0 / 80)\n"
         "         [--ctx N]               override the container's context length\n"
+        "         [--ram F]               re-plan the expert cache for an F GB budget\n"
         "         [--pin N] [--io N] [--threads N] [--batch N] [--nobatch]\n"
         "         [--serve] [--port N]    OpenAI-compatible local server (default 8484)\n"
         "         [--kv off|k6v4|k4v2]    KV-cache compression preset\n"
@@ -1658,6 +1707,7 @@ int main(int argc, char **argv) {
     int kvq_on = 0, kb = 6, vb = 4, rwin = 128, kv_protect = 2, kv_pbits = 8;
     int check = 0, n_io = 8, max_tokens = 0, nobatch = 0, npin = 0, nthreads = 2;
     int batch = 128, ctx_override = 0;
+    double ram_gb = 0;                   /* 0 = keep the container's own plan */
     int serve_mode = 0, serve_port = 8484;
     float temp = 0.2f, topp = 1.0f;      /* LFM2.5 generation defaults */
     int topk = 80;
@@ -1670,6 +1720,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--io") && i + 1 < argc) n_io = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--batch") && i + 1 < argc) batch = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--ctx") && i + 1 < argc) ctx_override = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--ram") && i + 1 < argc) ram_gb = atof(argv[++i]);
         else if (!strcmp(argv[i], "--max_tokens") && i + 1 < argc) max_tokens = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--temp") && i + 1 < argc) temp = atof(argv[++i]);
         else if (!strcmp(argv[i], "--topp") && i + 1 < argc) topp = atof(argv[++i]);
@@ -1719,7 +1770,7 @@ int main(int argc, char **argv) {
 
     M m; memset(&m, 0, sizeof m);
     double t0 = now();
-    init(&m, dir, n_io, ctx_override, kb, vb, kv_protect, rwin, kv_pbits);
+    init(&m, dir, n_io, ctx_override, ram_gb, kb, vb, kv_protect, rwin, kv_pbits);
     Cfg *c = &m.c;
     pin_load(&m, npin);
     /* Prefill batch size. Bigger reuses each streamed weight row over more rows --
