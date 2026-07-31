@@ -707,14 +707,15 @@ static void moe_start(M *m, int li, const float *X, float *out, int S, Buf *b) {
      * no room for the second chunk, so the overlap is dropped rather than evicting a
      * slot still in use -- slower, but --pin near the slot count is the user's call.
      *
-     * free_slots/2 is only the UPPER bound on a chunk. Sizing the chunk at that
-     * bound is wrong whenever the union is small: at decode S is 1, so moe_nu is at
-     * most topk (4) against ~14 free slots, the whole union goes out as one chunk,
+     * free_slots/2 is the UPPER bound on a chunk, not the target. Take it whenever
+     * the union is small and the overlap disappears: at decode S is 1, so moe_nu is
+     * at most topk (4) against ~14 free slots, the whole union goes out as one chunk,
      * moe_finish finds nothing left to submit, and the layer stalls on the read with
-     * no compute overlapping it. That is the worst case for this model, which -- no
-     * early routing signal, no dense branch beside the MoE -- has chunk pipelining
-     * as its ONLY latency hiding. So aim for two chunks and take the bound only when
-     * it binds. */
+     * nothing computing over it. This model can least afford that. Its router reads
+     * the same normed hidden the experts consume, so there is no early routing signal
+     * to prefetch from, and no dense branch sits beside the MoE either: chunk
+     * pipelining is the ONLY latency hiding it has. So aim for two chunks, and fall
+     * back to the bound only where the bound actually binds. */
     int free_slots = c->slots_per_layer - m->npin;
     b->moe_prefetch = free_slots >= 2;
     if (b->moe_prefetch) {

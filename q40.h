@@ -148,13 +148,17 @@ static inline int q40_hsum_i32(__m256i v){
     s=_mm_add_epi32(s,_mm_shuffle_epi32(s,0xb1));
     return _mm_cvtsi128_si32(s);
 }
-/* one block's contribution, folded into `acc`. Split out so the dot below can
- * feed FOUR independent accumulators: there is exactly one fmadd per block, so a
- * single accumulator makes the loop a serial chain of 4-cycle FMA latencies
- * (~6.4 measured cycles/block, most of it the chain). Four chains in flight
- * covers the latency and measured 1.33x single-thread / 1.18x at 4 threads on a
- * Xeon; the arithmetic is unchanged and the split sum is, if anything, a
- * slightly better summation order. */
+/* One block's contribution, folded into `acc`. Split out so the dot below can feed
+ * FOUR independent accumulators. There is exactly one fmadd per block, so a single
+ * accumulator makes the loop a serial chain of 4-cycle FMA latencies -- ~6.4
+ * measured cycles/block, most of it the chain. Four chains in flight cover that
+ * latency: 1.13x / 1.21x / 1.12x at 1 / 2 / 4 threads, best-of-7 on a 2.1 GHz Xeon.
+ * q8_0 gains much less (1.03-1.07x): at 34 bytes/block it is already near bandwidth,
+ * where q4_0 at 18 has arithmetic to spare.
+ *
+ * It is the chain and not the op count. Hoisting the redundant per-row sum(x) out of
+ * the loop, ~15% of the inner-loop uops, is worth 1.01x. The arithmetic here is
+ * unchanged and the split sum is, if anything, slightly better conditioned. */
 static inline __m256 q40_blk_acc(__m256 acc, const uint8_t *w, const int8_t *xq,
                                  const float *sx, int b,
                                  __m256i lomask, __m256i ones16){
@@ -208,14 +212,16 @@ static inline float q40_dot(const uint8_t *w, const int8_t *xq, const float *sx,
  * fallback below uses widening multiply-accumulate for older cores.
  * Unlike AVX2 we can subtract the 8 offset directly (NEON multiplies signed x
  * signed), so no sum(x) correction term is needed. */
-/* One block's contribution, folded into a VECTOR accumulator. Two changes from the
- * obvious loop, both about the dependency chain rather than the arithmetic:
- * the cross-lane vaddvq_s32 is hoisted out of the loop (accumulate lane-wise, reduce
- * once at the end), and the caller keeps FOUR accumulators so the per-block FMA
- * latency is covered instead of forming one serial chain. Measured 1.33x on AVX2,
- * where the chain was the binding cost; NEON has the same structure plus the
- * cross-lane reduction, but the gain here is UNMEASURED -- no arm64 hardware was
- * available. Verify with ./test_q40 before trusting the numbers. */
+/* One block's contribution, folded into a VECTOR accumulator. Two departures from the
+ * obvious loop, both about the dependency chain rather than the arithmetic: the
+ * cross-lane vaddvq_s32 lives outside the loop (accumulate lane-wise, reduce once at
+ * the end), and the caller keeps FOUR accumulators so the per-block FMA latency is
+ * covered instead of forming one serial chain.
+ *
+ * NEON carries both problems -- the serial chain AVX2 has, plus a cross-lane
+ * reduction per block -- so it should gain at least what AVX2's 1.13-1.21x did. But
+ * that is UNMEASURED: no arm64 hardware was available, only a cross-compile that
+ * checks it builds and emits sdot. test_q40 covers correctness, not speed. */
 static inline float32x4_t q40_blk_acc(float32x4_t acc, const uint8_t *w,
                                       const int8_t *xq, const float *sx, int b,
                                       uint8x16_t lomask, int8x16_t eight){
