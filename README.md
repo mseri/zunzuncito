@@ -432,6 +432,14 @@ expert pinning        ──►  unpinned           bit-identical
 HF tokenizer          ──►  lfmtok.h           475/475 exact (incl. 400 fuzzed)
 ```
 
+## Not implemented yet
+
+See [TODO.md](TODO.md). The main open item is 3-bit experts for the middle MoE layers
+plus the kernel that needs — the one idea worth taking from
+[WASTE](https://github.com/sqliteai/waste), and a low-RAM feature specifically: it
+buys ~16–22% fewer bytes per token at `--ram 4`, and nothing at all where the cache
+already holds the model.
+
 ## GenAI use warning
 
 Part of the code comes from [colibrì](https://github.com/JustVugg/colibri) and
