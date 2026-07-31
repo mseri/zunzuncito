@@ -2,11 +2,10 @@
  *
  * THE BET. Gemma-4 26B-A4B is 25 GB of weights of which ~3.8 B params activate per
  * token. At q4_0 that is 1.31 GB of dense weights (resident) + 12.9 GB of routed
- * experts (3840 of them, 3.19 MiB each). On a 4-8 GB machine the expert set does
- * not fit, so llama.cpp mmaps it and lets the kernel's global 4 KB-page LRU decide
- * what to evict -- a policy that knows nothing about expert granularity, expert
- * hotness, or what the next layer will need. We keep an explicit expert-granular
- * per-layer LRU instead, and we prefetch.
+ * experts (3840 of them, 3.19 MiB each). On a 4-8 GB machine the expert set does not
+ * fit, and mmap leaves eviction to the kernel's global 4 KB-page LRU, which knows
+ * nothing about expert granularity, expert hotness, or what the next layer needs. We
+ * keep an explicit expert-granular per-layer LRU instead, and we prefetch.
  *
  * THE STRUCTURAL EDGE. In Gemma-4 the router reads the RAW post-attention residual:
  *
@@ -17,10 +16,10 @@
  *     h  = residual + post_ffn_ln(h1 + h2);  h *= layer_scalar
  *
  * So the 8 expert ids are known BEFORE the dense MLP runs. We route first, fire the
- * expert reads at the I/O threads, then compute the MLP -- which hides real NVMe
- * latency behind real arithmetic, exactly, with no prediction. (colibri's GLM path
- * needs PILOT to *guess* next-layer routing at 71.6%; here it is free and exact.)
- * A synchronous mmap fault, which is what llama.cpp does, cannot overlap at all.
+ * expert reads at the I/O threads, then compute the MLP, hiding NVMe latency behind
+ * arithmetic with no prediction involved -- colibri's GLM path needs PILOT to guess
+ * next-layer routing at 71.6%, whereas here it is free and exact. A synchronous mmap
+ * fault cannot overlap at all.
  *
  * Everything is q4_0 (see q40.h): weights carry their fp16 scales inline, so one
  * expert is ONE contiguous 4096-aligned byte range -> one pread, no scale seek.
@@ -199,7 +198,7 @@ static int g_dflash_refine = 0;
 static float g_dflash_conf = 0.9f;
 
 /* Ring capacity of a layer's KV. Sliding layers need MORE than `sliding_window`
- * slots, for two independent reasons -- and neither is slack:
+ * slots, for two independent reasons; neither is slack:
  *
  *  +1  The MTP head's BIDIRECTIONAL sliding mask attends t >= pos - W (W+1
  *      positions), one further back than the backbone's causal SWA
@@ -208,9 +207,9 @@ static float g_dflash_conf = 0.9f;
  *  +MAXDRAFT  Speculation writes AHEAD and then REWINDS. A verify forward writes
  *      positions P..P+d, but on rejection the next step restarts at P+1 and its
  *      attention reaches back to (P+1) - W. The span that must be simultaneously
- *      live is therefore W + d + 1, not W + 1. With a W+1 ring the lookahead
- *      silently evicts the oldest positions of the very window the next step needs:
- *      output degrades and draft acceptance collapses, with nothing to indicate why.
+ *      live is therefore W + d + 1, not W + 1. With a W+1 ring the lookahead evicts
+ *      the oldest positions of the very window the next step needs, and output
+ *      degrades and draft acceptance collapses with nothing to indicate why.
  *
  * At W = 1024 this costs 18 extra positions. */
 static inline int kv_cap(const Cfg *c, int li) {
@@ -473,11 +472,10 @@ if (--m->inflight == 0) pthread_cond_broadcast(&m->done);
 pthread_mutex_unlock(&m->mu);
 }
 }
-/* Find or evict a slot for (layer,eid). Returns the slot index; sets *need_io if
- * the caller must fetch it. LRU is per layer: an expert only ever competes with
- * the other experts of its own layer, which is the whole point -- a global page
- * LRU (what mmap gives llama.cpp) lets a hot layer-3 expert be evicted by a
- * cold layer-27 one. */
+/* Find or evict a slot for (layer,eid). Returns the slot index; sets *need_io if the
+ * caller must fetch it. The LRU is per layer, so an expert only competes with the
+ * other experts of its own layer -- under a global page LRU a hot layer-3 expert can
+ * be evicted by a cold layer-27 one. */
 static int slot_for(M *m, int layer, int eid, int *need_io) {
     int S = m->c.slots_per_layer;
     Slot *base = &m->slots[(size_t)layer * S];
@@ -491,8 +489,8 @@ static int slot_for(M *m, int layer, int eid, int *need_io) {
     for (int i = 0; i < S; i++)
         if (!base[i].pinned && (lru < 0 || base[i].used < base[lru].used)) lru = i;
     if (lru < 0) lru = 0;
-    /* Do NOT publish the eid yet: the buffer still holds the evicted expert until
-     * the I/O completes. The worker sets s->eid when the bytes are actually there. */
+    /* Do NOT publish the eid yet: the buffer holds the evicted expert until the I/O
+     * completes, and the worker sets s->eid when the bytes are actually there. */
     base[lru].eid = -1;
     base[lru].used = ++m->tick;
     *need_io = 1;
@@ -503,21 +501,19 @@ static int slot_for(M *m, int layer, int eid, int *need_io) {
 /* ------------------------------------------------------------------ forward */
 /* ------------------------------------------------------------------ forward
  *
- * ONE code path for prefill and decode: decode is simply S = 1. The reason to
+ * One code path for prefill and decode -- decode is simply S = 1 -- and the reason to
  * unify is the MoE.
  *
- * BATCH-UNION MoE. Token-at-a-time prefill reads 8 experts per layer per token --
- * a 1000-token prompt is 240,000 expert reads of 3.19 MiB. But the S tokens of a
- * batch collectively route to at most min(128, 8*S) DISTINCT experts per layer, so
- * we invert the loop: gather expert -> {rows that chose it}, read each distinct
- * expert ONCE, and apply it to every row that wants it. Prefill I/O collapses from
- * O(S * topk) to O(unique experts) -- bounded by 128 per layer no matter how long
- * the prompt is. Up to a 60x cut.
+ * BATCH-UNION MoE. Token-at-a-time prefill reads 8 experts per layer per token, so a
+ * 1000-token prompt is 240,000 reads of 3.19 MiB. But the S rows of a batch
+ * collectively route to at most min(128, 8*S) DISTINCT experts per layer, so the loop
+ * is inverted: gather expert -> {rows that chose it}, read each once, apply it to all
+ * of them. Prefill I/O drops from O(S * topk) to O(unique experts), bounded by 128 per
+ * layer however long the prompt is -- up to a 60x cut.
  *
- * The chunking below exists because the cache has only `slots_per_layer` slots: we
- * process the distinct experts in chunks of that size, and since acquiring a slot
- * bumps it to most-recently-used, nothing acquired within a chunk can be evicted
- * by a later acquisition in the same chunk.
+ * Chunking bounds that against slots_per_layer. Acquiring a slot bumps it to
+ * most-recently-used, so nothing acquired within a chunk can be evicted by a later
+ * acquisition in the same chunk.
  */
 typedef struct {
     float *x, *xn, *q, *k, *v, *o, *mlp, *h1, *h2, *tmp;
@@ -769,9 +765,8 @@ rmsnorm(out + (size_t)s * D, out + (size_t)s * D, L->post_ffn_ln2.f, D, c->eps);
 }
 /* Write K/V for `pos`. The f32 residual ring holds the most recent `rwin` positions;
  * the occupant about to be overwritten (position pos - rwin) is TurboQuant-encoded
- * into the packed store on its way out. Recent tokens therefore always attend at full
- * precision -- which is the single thing the upstream results say you cannot skip
- * ("3-4 bit compression without a residual window produces garbage"). */
+ * into the packed store on its way out, so recent tokens always attend at full
+ * precision -- 3-4 bit compression without a residual window produces garbage. */
 static void kv_write(M *m, int li, int pos, int nkv, int hd, int cap,
                      const float *k, const float *v) {
     int quant = m->pk[li] != NULL;
@@ -781,13 +776,12 @@ static void kv_write(M *m, int li, int pos, int nkv, int hd, int cap,
 
     /* Evict whatever the slot ACTUALLY holds -- do not assume it is position pos-W.
      *
-     * Speculative decoding breaks the "each position is written exactly once, in
-     * order" invariant: the verify forward writes positions np..np+d-1, and on a
-     * partial acceptance the next forward RE-WRITES np+acc (which held a rejected
-     * draft). On that second write the slot still holds position np+acc itself, not
-     * np+acc-W, so evicting blindly encodes the wrong vector into the TurboQuant
-     * store and silently poisons the quantised history. Symptom: output that is
-     * perfect until the residual window first spills (rwin tokens in) and then
+     * Speculation breaks the "each position is written exactly once, in order"
+     * invariant: the verify forward writes np..np+d-1, and on a partial acceptance
+     * the next forward RE-WRITES np+acc, which held a rejected draft. On that second
+     * write the slot still holds np+acc itself, not np+acc-W, so evicting blindly
+     * encodes the wrong vector into the TurboQuant store and poisons the quantised
+     * history -- output stays perfect until the residual window first spills, then
      * degrades into noise. Tracking the true occupant makes re-writes harmless. */
     if (quant) {
         int old = m->ring_pos[li][slot];
@@ -1150,12 +1144,11 @@ static void pin_save(M *m) {
  * for the full source is the whole context. That is exactly what the engine caches.
  *
  * THE DRAFT LOOP, taken from transformers' SinglePositionMultiTokenCandidateGenerator
- * (generation/candidate_generator.py) -- NOT guessed. Three things live there rather
- * than in the model, and all three are counter-intuitive:
+ * (generation/candidate_generator.py). Four things live there rather than in the
+ * model, and each is easy to get backwards:
  *
  *   1. inputs_embeds = cat([last_token_embedding, last_hidden_state], dim=-1)
- *      The EMBEDDING COMES FIRST, then the hidden state. (The natural guess is the
- *      other way round, and it is wrong.)
+ *      The EMBEDDING COMES FIRST, then the hidden state.
  *
  *   2. last_token_embedding = target_model_input_embeddings(tok), which is
  *      get_input_embeddings() -- the target's ScaledWordEmbedding, so the embedding
@@ -1165,9 +1158,8 @@ static void pin_save(M *m) {
  *
  *   3. position_ids = [[input_ids.shape[1] - 1]] is computed ONCE, BEFORE the draft
  *      loop, and never advanced. Every drafted token is produced from the position
- *      of the last REAL token -- the head does not walk forward. Hence the class
- *      name: SinglePosition. Incrementing the position per draft step (the obvious
- *      thing to do) silently degrades every draft after the first.
+ *      of the last REAL token -- hence the class name, SinglePosition. Incrementing
+ *      the position per draft step silently degrades every draft after the first.
  *
  *   4. The drafter is GREEDY: last_token_id = outputs.logits.argmax(-1), regardless
  *      of the target's sampling temperature. */
@@ -1720,29 +1712,23 @@ static int mtp_load(M *m, const char *dir) {
 }
 
 /* ------------------------------------------------------------------ setup */
-static void init(M *m, const char *dir, int n_io,
+static void init(M *m, const char *dir, int n_io, int ctx_override, double ram_gb,
                  int kb, int vb, int kv_protect, int rwin, int kv_pbits) {
     m->rwin = rwin > 0 ? rwin : 128;
     manifest(m, dir);
     Cfg *c = &m->c;
-    if (c->slots_per_layer < c->topk) {
-        fprintf(stderr, "slots_per_layer=%d < topk=%d: raise --ram\n",
-                c->slots_per_layer, c->topk);
-        exit(1);
-    }
-    size_t ns = (size_t)c->n_layers * c->slots_per_layer;
-    m->slots = calloc(ns, sizeof(Slot));
-    for (size_t i = 0; i < ns; i++) {
-        m->slots[i].eid = -1;
-        m->slots[i].buf = xmalloc(m->esz);
-        /* Map each slot once, up front. Slots are reused for different experts, so
-         * the mapping stays valid for the whole run -- the streaming layer only ever
-         * overwrites the bytes, never the address. */
-        if (g_use_gpu && !gpu_map(m->slots[i].buf, m->esz)) {
-            fprintf(stderr, "metal: could not map expert slots; using CPU\n");
-            g_use_gpu = 0;
-        }
-    }
+
+    /* --ctx overrides what the container was converted with. It is allowed to go
+     * UP: the container's ctx only fixed slots_per_layer (the expert-cache plan),
+     * and the weights do not care. Only the GLOBAL layers grow anyway -- the
+     * sliding ones are capped by sliding_window at any context.
+     *
+     * Whether that is a problem is a question about BYTES, not about the context
+     * number: with --kvq a much longer context can fit in less than the plan
+     * assumed, and warning there would be nonsense. The comparison is made below,
+     * once the real figure is known. */
+    int ctx_planned = c->ctx;
+    if (ctx_override > 0) c->ctx = ctx_override;
     m->ucount = calloc((size_t)c->n_layers * c->n_experts, 8);
     snprintf(m->usage_path, sizeof m->usage_path, "%s/usage.bin", dir);
 
@@ -1788,10 +1774,85 @@ static void init(M *m, const char *dir, int n_io,
             kvb += (m->qk[l].bytes + m->qv[l].bytes) * (size_t)cap * nkv;
         }
     }
-    fprintf(stderr, "kv: %.0f MiB", kvb / 1048576.0);
+    fprintf(stderr, "kv: %.0f MiB for ctx %d", kvb / 1048576.0, c->ctx);
     if (kb > 0) fprintf(stderr, " (K%d/V%d, rwin %d, %d protected layers at %d bits)",
                         kb, vb, m->rwin, kv_protect, kv_pbits);
+    else        fprintf(stderr, " (f32; --kvq would cut this a lot)");
     fprintf(stderr, "\n");
+
+    /* Compare against what the conversion budgeted -- an f32 KV at the container's
+     * own ctx. Only an ACTUAL overshoot is worth a warning: --kvq routinely buys a
+     * longer context for fewer bytes than the plan assumed, and that deserves
+     * silence, not a scare. */
+    {
+        size_t planned = 0;
+        for (int l = 0; l < c->n_layers; l++) {
+            int glob = c->layer_types[l];
+            int hd  = glob ? c->global_head_dim : c->head_dim;
+            int nkv = glob ? c->n_global_kv_heads : c->n_kv_heads;
+            int cap = glob ? ctx_planned : c->sliding_window + MAXDRAFT + 2;
+            planned += 2 * sizeof(float) * (size_t)cap * nkv * hd;
+        }
+        /* With an explicit --ram the cache is about to be re-planned against this
+         * very figure, so the overshoot is already accounted for: warning would be
+         * telling the user about a problem we are in the middle of solving. */
+        if (kvb > planned && ram_gb <= 0)
+            fprintf(stderr, "warning: that is %.0f MiB more KV than the container's "
+                    "plan budgeted (%.0f MiB for ctx %d, f32), so total RAM will "
+                    "exceed the conversion's --ram%s\n",
+                    (kvb - planned) / 1048576.0, planned / 1048576.0, ctx_planned,
+                    kb > 0 ? "" : "; --kvq would cut it a lot");
+    }
+
+    /* ------------------------------------------------- expert-cache plan
+     * slots_per_layer is the ONLY thing the conversion's --ram fixed, and nothing in
+     * the container depends on it: experts are read from experts.bin one at a time by
+     * offset and the cache is pure LRU. So --ram re-runs the planner of
+     * tools/convert_gemma4.py against the numbers we now know EXACTLY -- the resident
+     * dense blob and the KV just allocated -- instead of the ones the conversion had
+     * to assume (f32 KV at the container's own ctx). */
+    if (ram_gb > 0) {
+        int64_t scratch = 192 << 20;
+        int64_t avail = (int64_t)(ram_gb * (double)(1LL << 30))
+                      - (int64_t)m->dense_len - (int64_t)kvb - scratch;
+        int64_t per = avail > 0 ? (avail / (int64_t)m->esz) / c->n_layers : 0;
+        if (per > c->n_experts) per = c->n_experts;
+        if (per < c->topk) {
+            double min_gb = ((double)m->dense_len + (double)kvb + (double)scratch
+                             + (double)c->topk * c->n_layers * (double)m->esz)
+                            / (double)(1LL << 30);
+            fprintf(stderr, "--ram %g GB leaves room for %lld experts per layer, below "
+                    "topk=%d: this model needs %.2f GB at this context%s\n",
+                    ram_gb, (long long)per, c->topk, min_gb,
+                    kb > 0 ? "" : " (--kvq would lower it)");
+            exit(1);
+        }
+        c->slots_per_layer = (int)per;
+        fprintf(stderr, "ram: %g GB budget -> %d slots/layer "
+                "(dense %.0f MiB + kv %.0f MiB + cache %.0f MiB)\n",
+                ram_gb, c->slots_per_layer, m->dense_len / 1048576.0, kvb / 1048576.0,
+                (double)c->slots_per_layer * c->n_layers * (double)m->esz / 1048576.0);
+    }
+    if (c->slots_per_layer < c->topk) {
+        fprintf(stderr, "slots_per_layer=%d < topk=%d: raise --ram\n",
+                c->slots_per_layer, c->topk);
+        exit(1);
+    }
+    {
+        size_t ns = (size_t)c->n_layers * c->slots_per_layer;
+        m->slots = calloc(ns, sizeof(Slot));
+        for (size_t i = 0; i < ns; i++) {
+            m->slots[i].eid = -1;
+            m->slots[i].buf = xmalloc(m->esz);
+            /* Map each slot once, up front. Slots are reused for different experts, so
+             * the mapping stays valid for the whole run -- the streaming layer only ever
+             * overwrites the bytes, never the address. */
+            if (g_use_gpu && !gpu_map(m->slots[i].buf, m->esz)) {
+                fprintf(stderr, "metal: could not map expert slots; using CPU\n");
+                g_use_gpu = 0;
+            }
+        }
+    }
 
     m->kv_conf = INT_MAX;                   /* nothing speculative yet */
 
@@ -1916,10 +1977,10 @@ static int sample(const float *logits, int V, float temp, float topp, int topk,
  *   [<|channel>thought\n<channel|>]      <-- ONLY when thinking is OFF
  *
  * That last line is the non-obvious part: with thinking disabled the template
- * pre-fills an EMPTY thought channel, which is what suppresses reasoning. Omit it
- * and the model will happily start thinking. Conversely `<|think|>` at the top of
- * the system turn is what ENABLES it. The system turn is emitted if there is a
- * system message OR thinking is on (or tools -- not supported here).
+ * pre-fills an EMPTY thought channel, and that is what suppresses reasoning -- omit
+ * it and the model starts thinking. `<|think|>` at the top of the system turn
+ * enables it. The system turn is emitted if there is a system message OR thinking is
+ * on (or tools, not supported here).
  *
  * Generation stops on <turn|> (eot) or <eos>, which are the config's eos ids. */
 static void chat_prompt(char *out, size_t cap, const char *sys,
@@ -1947,13 +2008,12 @@ static void chat_prompt(char *out, size_t cap, const char *sys,
  *
  * The verification forward is where this pays off for a streaming engine. Those d
  * positions collectively route to at most min(128, 8*d) distinct experts per layer,
- * and batch-union reads each ONCE -- so verifying d tokens costs barely more expert
- * I/O than decoding one. Speculation converts "d tokens of disk latency" into "1
- * token of disk latency", which on a disk-bound engine is the entire game.
+ * and batch-union reads each ONCE, so verifying d tokens costs barely more expert I/O
+ * than decoding one: d tokens of disk latency become 1.
  *
  * LOSSLESS. At temp=0 acceptance is exact: keep a draft token iff it is the target's
  * argmax. At temp>0 we use rejection sampling against the draft's own distribution,
- * so the output distribution is IDENTICAL to non-speculative sampling -- speculation
+ * so the output distribution is identical to non-speculative sampling. Speculation
  * changes the speed, never the text.
  *
  * REJECTED KV. If we reject at position j, the KV written for positions >= pos+j is
@@ -1961,11 +2021,10 @@ static void chat_prompt(char *out, size_t cap, const char *sys,
  * position (`pos % cap`), so the next forward simply overwrites it. */
 
 /* `dpos` = how many tokens of `ids` the DRAFTER has actually consumed into its KV.
- * Tracking it is not bookkeeping pedantry: the drafter emits draft[d-1] but never
- * feeds it back, so on full acceptance that position joins the accepted prefix with
- * STALE KV behind it, and the drafter then disagrees with itself. (Observed: an
- * identical drafter/target pair accepting only 75%.) We catch the drafter up on
- * exactly the accepted prefix and no further. */
+ * It has to be tracked: the drafter emits draft[d-1] but never feeds it back, so on
+ * full acceptance that position joins the accepted prefix with STALE KV behind it and
+ * the drafter starts disagreeing with itself (observed: an identical drafter/target
+ * pair accepting only 75%). We catch it up on exactly the accepted prefix, no more. */
 static int spec_step(M *tgt, M *drf, Buf *bt, Buf *bd,
                      int *ids, int np, int *dpos, float *tlog, float *dlog,
                      int d, float temp, float topp, int topk, PI *pbuf, PI *dbuf,
@@ -2126,15 +2185,15 @@ static void lm_head_row(M *m, const float *hn, float *logits, Buf *b) {
  *     last_hidden_state = hidden[n_last_matches]   -> position t
  *     last_token_id     = input_ids[-1]            -> position t+1
  * i.e. the hidden comes from ONE POSITION EARLIER than the token -- the EAGLE
- * convention, concat(e(x_{t+1}), h_t). Pairing h_{t+1} with x_{t+1} (the intuitive
- * thing, and what I did first) collapses acceptance to a few percent.
+ * convention, concat(e(x_{t+1}), h_t). Pairing h_{t+1} with x_{t+1} instead collapses
+ * acceptance to a few percent.
  *
  * ONE target forward per step, not two: the batch is [x_P, draft_0 .. draft_{d-1}]
  * at positions P..P+d. Row 0 both (a) puts x_P's KV into the cache and (b) yields the
  * distribution that verifies draft_0; row i yields the one that verifies draft_{i+1}.
- * And hidden row `acc` is exactly h_{P+acc}, which is the hprev the NEXT step needs.
- * An extra "resync" forward for the newly sampled token is pure waste -- it was also
- * what forced the wrong pairing above.
+ * And hidden row `acc` is exactly h_{P+acc}, the hprev the NEXT step needs. An extra
+ * "resync" forward for the newly sampled token is waste, and is also what forces the
+ * wrong pairing above.
  *
  * Batch-union makes the verify nearly free in I/O terms: the d+1 positions read each
  * distinct expert once. */
@@ -2393,7 +2452,6 @@ typedef struct {
     int *cached_ids;
     int cached_len;
     int cached_cap;
-    int port;
     const char *model_id;
 } G4ServerContext;
 
@@ -2545,7 +2603,13 @@ static int g4_serve_chat(G4ServerContext *ctx, int fd, jval *root) {
     int np = g4tok_encode(tok, prompt.data, ids, c->ctx);
     free(prompt.data);
     if (np <= 0) { free(ids); free(logits); free(pbuf); return samosa_http_json_error(fd,400,"invalid_prompt","The prompt produced no tokens."); }
-    if (np >= c->ctx) { free(ids); free(logits); free(pbuf); return samosa_http_json_error(fd,400,"context_limit","The prompt leaves no room for completion."); }
+    if (np >= c->ctx) {
+        char msg[256];
+        snprintf(msg, sizeof msg, "The prompt is %d tokens and the context window is "
+                 "%d; it leaves no room for a completion.", np, c->ctx);
+        free(ids); free(logits); free(pbuf);
+        return samosa_http_json_error(fd, 400, "context_limit", msg);
+    }
     if (max_tokens > c->ctx - np) max_tokens = c->ctx - np;
 
     pthread_mutex_lock(&ctx->generation_mu);
@@ -2603,7 +2667,10 @@ static int g4_serve_handler(SamosaHttpServer *server, int fd, const SamosaHttpRe
     if (!strcmp(request->method,"GET") && !strcmp(request->path,"/healthz"))
         return samosa_http_response(fd,200,"application/json","{\"status\":\"ok\"}",NULL);
     if (!strcmp(request->method,"GET") && !strcmp(request->path,"/v1/models")) {
-        char body[512]; snprintf(body,sizeof body,"{\"object\":\"list\",\"data\":[{\"id\":\"%s\",\"object\":\"model\",\"owned_by\":\"local\"}]}",ctx->model_id);
+        char body[512]; snprintf(body,sizeof body,
+            "{\"object\":\"list\",\"data\":[{\"id\":\"%s\",\"object\":\"model\","
+            "\"owned_by\":\"local\",\"context_length\":%d,\"max_model_len\":%d}]}",
+            ctx->model_id, ctx->model->c.ctx, ctx->model->c.ctx);
         return samosa_http_response(fd,200,"application/json",body,NULL);
     }
     if (!strcmp(request->method,"POST") && !strcmp(request->path,"/v1/cancel")) {
@@ -2621,7 +2688,7 @@ static int g4_serve_handler(SamosaHttpServer *server, int fd, const SamosaHttpRe
 }
 
 static int run_g4_server(M *m, Buf *buffers, G4Tok *tokenizer, const char *model_id, int port) {
-    G4ServerContext ctx={.model=m,.buffers=buffers,.tokenizer=tokenizer,.port=port,.model_id=model_id};
+    G4ServerContext ctx={.model=m,.buffers=buffers,.tokenizer=tokenizer,.model_id=model_id};
     pthread_mutex_init(&ctx.generation_mu,NULL); atomic_init(&ctx.cancel,0);
     SamosaHttpServer server;
     if (!samosa_http_server_init(&server,port,g4_serve_handler,&ctx)) { fprintf(stderr,"server: cannot bind port %d: %s\n",port,strerror(errno)); pthread_mutex_destroy(&ctx.generation_mu); return 1; }
@@ -2640,6 +2707,8 @@ static void usage(const char *prog, FILE *out) {
         "         [--mtp] [--dflash] [--drefine N] [--dconf F]\n"
         "                                DFlash extra denoising passes (default 0) and\n"
         "                                per-token freeze confidence (default 0.9)\n"
+        "         [--ctx N]              override the container's context length\n"
+        "         [--ram F]              re-plan the expert cache for an F GB budget\n"
         "         [--io N] [--nobatch] [--threads N]\n"
         "         [--metal] Metal is OFF by default (it is slower if gemma is not fully in RAM)\n"
         "         [--serve] [--port N]    OpenAI-compatible local server (default 8484)\n"
@@ -2667,7 +2736,8 @@ int main(int argc, char **argv) {
     int kvq_on = 0, kb = 6, vb = 4, rwin = 128, kv_protect = 2, kv_pbits = 8;
     int no_metal = 0, chk_gpu = 0, use_mtp = 0, use_dflash = 0, use_metal = 0;
     int check = 0, n_io = 8, max_tokens = 0, nobatch = 0, npin = 0, draft = 0, nthreads = 2;
-    int serve_mode = 0, serve_port = 8484;
+    int serve_mode = 0, serve_port = 8484, ctx_override = 0;
+    double ram_gb = 0;                   /* 0 = keep the container's own plan */
     const char *dpath = NULL;
     float temp = 1.0f, topp = 0.95f;   /* Gemma-4 generation defaults */
     int topk = 64;
@@ -2678,6 +2748,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--nobatch")) nobatch = 1;
         else if (!strcmp(argv[i], "--threads") && i + 1 < argc) nthreads = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--io") && i + 1 < argc) n_io = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--ctx") && i + 1 < argc) ctx_override = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--ram") && i + 1 < argc) ram_gb = atof(argv[++i]);
         else if (!strcmp(argv[i], "--max_tokens") && i + 1 < argc) max_tokens = atoi(argv[++i]);
 
         else if (!strcmp(argv[i], "--temp") && i + 1 < argc) temp = atof(argv[++i]);
@@ -2766,7 +2838,7 @@ int main(int argc, char **argv) {
 
     M m; memset(&m, 0, sizeof m);
     double t0 = now();
-    init(&m, dir, n_io, kb, vb, kv_protect, rwin, kv_pbits);
+    init(&m, dir, n_io, ctx_override, ram_gb, kb, vb, kv_protect, rwin, kv_pbits);
     if (g_use_gpu)
         fprintf(stderr, "metal: %s (q4_0 matmul offloaded; --no-metal to disable)\n",
                 gpu_name());
@@ -2818,7 +2890,11 @@ int main(int argc, char **argv) {
     M dm; memset(&dm, 0, sizeof dm);
     Buf *db = NULL;
     if (dpath) {
-        init(&dm, dpath, n_io, 0, 0, 0, rwin, 8);  /* drafter KV stays f32: it is tiny */
+        /* same ctx as the target: the drafter has to span the same positions.
+         * Its KV stays f32 -- it is tiny. */
+        /* ram_gb 0: --ram budgets the TARGET's expert cache. The drafter is a dense
+         * model whose whole footprint is fixed by its own container. */
+        init(&dm, dpath, n_io, c->ctx, 0, 0, 0, 0, rwin, 8);
         db = bufs(&dm, dm.c.ctx);
         if (dm.c.vocab != c->vocab) {
             fprintf(stderr, "drafter vocab %d != target %d\n", dm.c.vocab, c->vocab);

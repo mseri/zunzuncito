@@ -268,4 +268,131 @@ static inline void q40_matvec(float *y, const uint8_t *W, const int8_t *xq,
 static inline int64_t q40_row_bytes(int I){ return (int64_t)(I/Q40_BLK)*Q40_BLK_BYTES; }
 static inline int64_t q40_tensor_bytes(int O,int I){ return (int64_t)O*q40_row_bytes(I); }
 
+/* ============================================================================
+ * Q8_0 WEIGHTS (fmt=8) — the higher-precision tier for the apex-quant gradient.
+ *
+ * Bit-identical to llama.cpp's block_q8_0: 32 weights per block, one fp16 scale,
+ * 32 signed int8 codes. w_j = d * q_j, q in [-127, 127].
+ *
+ *   block = 32 weights = 34 bytes
+ *     [0..1]   fp16 d          (scale)
+ *     [2..33]  32 int8 qs      w_j = d * q_j
+ *
+ * Same streaming property as q4_0: the scale rides inline, one contiguous read.
+ * Activations are the SAME Q8_0-style block quantisation (q40_quant_act), so the
+ * dot decomposes as sum_blocks d_w[b] * d_x[b] * <q_w[b], q_x[b]> (int8 x int8).
+ * ========================================================================== */
+#define Q80_BLK_BYTES 34   /* 2 (fp16 d) + 32 (int8) */
+
+static inline void q80_quant_row(const float *w, uint8_t *dst, int I){
+    for(int b=0;b<I/Q40_BLK;b++){
+        const float *x=w+b*Q40_BLK;
+        uint8_t *blk=dst+(size_t)b*Q80_BLK_BYTES;
+        float amax=0.f;
+        for(int j=0;j<Q40_BLK;j++){ float a=fabsf(x[j]); if(a>amax) amax=a; }
+        uint16_t hd=q40_f32_to_fp16(amax/127.0f); memcpy(blk,&hd,2);
+        float d=q40_fp16_to_f32(hd), id=d?1.0f/d:0.0f;
+        int8_t *o=(int8_t*)(blk+2);
+        for(int j=0;j<Q40_BLK;j++){
+            int q=(int)lrintf(x[j]*id);
+            if(q<-127) q=-127;
+            if(q>127) q=127;
+            o[j]=(int8_t)q;
+        }
+    }
+}
+static inline void q80_dequant_row(const uint8_t *src, float *w, int I){
+    for(int b=0;b<I/Q40_BLK;b++){
+        const uint8_t *blk=src+(size_t)b*Q80_BLK_BYTES;
+        uint16_t hd; memcpy(&hd,blk,2); float d=q40_fp16_to_f32(hd);
+        const int8_t *q=(const int8_t*)(blk+2); float *o=w+b*Q40_BLK;
+        for(int j=0;j<Q40_BLK;j++) o[j]=d*(float)q[j];
+    }
+}
+
+#if defined(__AVX2__)
+static inline float q80_dot(const uint8_t *w, const int8_t *xq, const float *sx, int I){
+    __m256 acc=_mm256_setzero_ps();
+    const __m256i ones16=_mm256_set1_epi16(1);
+    for(int b=0;b<I/Q40_BLK;b++){
+        const uint8_t *blk=w+(size_t)b*Q80_BLK_BYTES;
+        uint16_t hd; memcpy(&hd,blk,2);
+        float d=q40_fp16_to_f32(hd)*sx[b];
+        __m256i a=_mm256_loadu_si256((const __m256i*)(blk+2));
+        __m256i x=_mm256_loadu_si256((const __m256i*)(xq+b*Q40_BLK));
+        /* signed x signed via the sign trick: maddubs needs an unsigned operand */
+        __m256i ax=_mm256_sign_epi8(a,a);          /* |a| (unsigned magnitudes) */
+        __m256i sx8=_mm256_sign_epi8(x,a);         /* x carrying sign of a */
+        __m256i p=_mm256_maddubs_epi16(ax,sx8);    /* i16 pairs */
+        __m256i s=_mm256_madd_epi16(p,ones16);     /* i32 */
+        acc=_mm256_fmadd_ps(_mm256_set1_ps(d),_mm256_cvtepi32_ps(s),acc);
+    }
+    __m128 lo=_mm256_castps256_ps128(acc), hi=_mm256_extractf128_ps(acc,1);
+    __m128 s=_mm_add_ps(lo,hi);
+    s=_mm_add_ps(s,_mm_movehl_ps(s,s));
+    s=_mm_add_ss(s,_mm_shuffle_ps(s,s,1));
+    return _mm_cvtss_f32(s);
+}
+#elif defined(__ARM_NEON)
+static inline float q80_dot(const uint8_t *w, const int8_t *xq, const float *sx, int I){
+    float acc=0.0f;
+    for(int b=0;b<I/Q40_BLK;b++){
+        const uint8_t *blk=w+(size_t)b*Q80_BLK_BYTES;
+        uint16_t hd; memcpy(&hd,blk,2);
+        float d=q40_fp16_to_f32(hd)*sx[b];
+        int8x16_t a0=vld1q_s8((const int8_t*)(blk+2));
+        int8x16_t a1=vld1q_s8((const int8_t*)(blk+2+16));
+        int8x16_t x0=vld1q_s8(xq+b*Q40_BLK);
+        int8x16_t x1=vld1q_s8(xq+b*Q40_BLK+16);
+#if defined(__ARM_FEATURE_DOTPROD)
+        int32x4_t s=vdotq_s32(vdupq_n_s32(0),a0,x0);
+        s=vdotq_s32(s,a1,x1);
+#else
+        int16x8_t p0=vmull_s8(vget_low_s8(a0),vget_low_s8(x0));
+        p0=vmlal_s8(p0,vget_high_s8(a0),vget_high_s8(x0));
+        int16x8_t p1=vmull_s8(vget_low_s8(a1),vget_low_s8(x1));
+        p1=vmlal_s8(p1,vget_high_s8(a1),vget_high_s8(x1));
+        int32x4_t s=vaddq_s32(vpaddlq_s16(p0),vpaddlq_s16(p1));
+#endif
+        acc+=d*(float)vaddvq_s32(s);
+    }
+    return acc;
+}
+#else
+static inline float q80_dot(const uint8_t *w, const int8_t *xq, const float *sx, int I){
+    float acc=0.f;
+    for(int b=0;b<I/Q40_BLK;b++){
+        const uint8_t *blk=w+(size_t)b*Q80_BLK_BYTES;
+        uint16_t hd; memcpy(&hd,blk,2);
+        const int8_t *a=(const int8_t*)(blk+2);
+        const int8_t *x=xq+b*Q40_BLK;
+        int32_t s=0;
+        for(int j=0;j<Q40_BLK;j++) s+=(int)a[j]*(int)x[j];
+        acc+=q40_fp16_to_f32(hd)*sx[b]*(float)s;
+    }
+    return acc;
+}
+#endif
+
+static inline float q80_dot_f32(const uint8_t *w, const float *x, int I){
+    double acc=0;
+    for(int b=0;b<I/Q40_BLK;b++){
+        const uint8_t *blk=w+(size_t)b*Q80_BLK_BYTES;
+        uint16_t hd; memcpy(&hd,blk,2); float d=q40_fp16_to_f32(hd);
+        const int8_t *a=(const int8_t*)(blk+2);
+        const float *v=x+b*Q40_BLK;
+        double s=0;
+        for(int j=0;j<Q40_BLK;j++) s+=(double)a[j]*v[j];
+        acc+=(double)d*s;
+    }
+    return (float)acc;
+}
+static inline void q80_matvec(float *y, const uint8_t *W, const int8_t *xq,
+                              const float *sx, int O, int I){
+    size_t rb=(size_t)(I/Q40_BLK)*Q80_BLK_BYTES;
+    for(int o=0;o<O;o++) y[o]=q80_dot(W+(size_t)o*rb, xq, sx, I);
+}
+static inline int64_t q80_row_bytes(int I){ return (int64_t)(I/Q40_BLK)*Q80_BLK_BYTES; }
+static inline int64_t q80_tensor_bytes(int O,int I){ return (int64_t)O*q80_row_bytes(I); }
+
 #endif /* COLI_Q40_H */

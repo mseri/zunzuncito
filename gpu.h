@@ -4,17 +4,16 @@
  *   The q4_0 matvec/matmul, which is ~95% of the arithmetic: the attention
  *   projections, the dense MLP, and the expert GEMMs. Nothing else.
  *
- *   Attention, routing, KV codec and the expert cache stay on the CPU on purpose.
- *   They are small, branchy, or I/O-bound, and at a 4-8 GB budget this engine is
- *   DISK-bound anyway (~800 MB of expert reads per token against 7.6 GFLOP of
- *   compute) -- moving arithmetic to the GPU does not help you wait on NVMe faster.
+ *   Attention, routing, KV codec and the expert cache stay on the CPU on purpose:
+ *   they are small, branchy, or I/O-bound, and at a 4-8 GB budget this engine is
+ *   disk-bound anyway (~800 MB of expert reads per token against 7.6 GFLOP of
+ *   compute), so moving arithmetic to the GPU does not help you wait on NVMe.
  *
- *   Metal pays for itself in exactly two places:
+ *   Metal pays for itself in two places:
  *     * prefill, which is batched and genuinely compute-bound;
  *     * a 16 GB machine, where the whole container is resident, there is no disk in
  *       the loop, and the ~400 GB/s of unified memory bandwidth beats the CPU's ~100.
- *   Expect little from it during 4 GB decode. That is not a defect; it is the
- *   workload.
+ *   Expect little from it during 4 GB decode; that is the workload, not a defect.
  *
  * UNIFIED MEMORY
  *   Expert slots and the dense blob are page-aligned (posix_memalign, 4096) and
@@ -23,11 +22,11 @@
  *   a copy would cost more than the matmul saves.
  *
  * NUMERICS
- *   The Metal kernel consumes f32 activations and decodes q4_0 weights on the fly,
- *   so it is numerically equivalent to the CPU's q40_dot_f32 -- i.e. it matches the
- *   COLI_F32ACT reference path, and is strictly MORE accurate than the default int8
- *   activation path. `--check-gpu` diffs the two and prints the max relative error;
- *   run it once on your machine before trusting any output.
+ *   The Metal kernel consumes f32 activations and decodes q4_0 weights on the fly, so
+ *   it is numerically equivalent to the CPU's q40_dot_f32: it matches the COLI_F32ACT
+ *   reference path and is strictly more accurate than the default int8 activation
+ *   path. `--check-gpu` diffs the two and prints the max relative error; run it once
+ *   on your machine before trusting any output.
  *
  * FAILURE POLICY
  *   Every entry point is fallible. No Metal device, shader compile failure, buffer

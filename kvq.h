@@ -3,38 +3,36 @@
  * From tonbistudio/turboquant-pytorch (Google's TurboQuant, ICLR 2026), V3 variant:
  * MSE-only (no QJL), asymmetric K/V bit-widths, bit-packed, layer-adaptive.
  *
- * WHY IT IS WORTH ANYTHING HERE. Gemma-4's sliding layers cap their KV at 1024
- * positions, so 25 of 30 layers cost a fixed 400 MiB no matter the context. ALL KV
- * growth is in the 5 global layers. At 4 GB and 4K ctx, quantising KV buys about one
- * extra expert slot -- nothing. At 32K it takes the cache from 9 slots/layer to 21,
- * and at 128K it is the difference between running and not running at all. This is a
- * CONTEXT-LENGTH feature, not a general RAM feature.
+ * WHAT IT BUYS. Gemma-4's sliding layers cap their KV at 1024 positions, so 25 of 30
+ * layers cost a fixed 400 MiB whatever the context, and all KV growth is in the 5
+ * global layers. At 4 GB and 4K ctx, quantising KV buys about one extra expert slot.
+ * At 32K it takes the cache from 9 slots/layer to 21, and at 128K it is the
+ * difference between running and not running. This is a CONTEXT-LENGTH feature, not
+ * a general RAM feature.
  *
  * THE ALGORITHM
  *   quantise:  x -> n = |x|, u = x/n -> RHT -> scale by sqrt(d) -> Lloyd-Max round
  *              each coordinate independently -> pack b bits/coord + store n
  *   restore:   unpack -> centroids -> /sqrt(d) -> inverse RHT -> * n
  *
- * The rotation is the whole trick: it makes every coordinate of a unit vector
- * approximately N(0, 1/d) regardless of what the original vector looked like, so ONE
- * precomputed scalar quantiser (Lloyd-Max for a standard normal) is optimal for every
- * coordinate. No per-tensor calibration, no outlier problem.
+ * The rotation is the trick: it makes every coordinate of a unit vector approximately
+ * N(0, 1/d) whatever the original vector looked like, so ONE precomputed scalar
+ * quantiser (Lloyd-Max for a standard normal) is optimal for every coordinate. No
+ * per-tensor calibration, no outlier problem.
  *
  * We use a randomised Hadamard transform (sign flips + fast Walsh-Hadamard) rather
- * than the reference's dense random orthogonal matrix: same distributional effect,
- * but O(d log d) instead of O(d^2). At d=512 and 240 KV writes/token that difference
- * is not optional. Requires d to be a power of two -- Gemma-4's head dims are 256 and
- * 512, so this is exact, not a compromise.
+ * than the reference's dense random orthogonal matrix: same distributional effect at
+ * O(d log d) instead of O(d^2), which at d=512 and 240 KV writes/token matters. It
+ * requires d to be a power of two, and Gemma-4's head dims are 256 and 512, so this
+ * is exact rather than a compromise.
  *
- * K4/V2 -- READ THIS.
- * The upstream README's own corrected generation table says K4/V2 with no residual
- * window MISSES the needle at both 2K and 4K, i.e. generation is broken; and that
- * "high attention score similarity (99.5%+) does not guarantee working generation".
- * The 99% top-1 figure people quote for "K4/V2 + protected layers" is from their
- * ATTENTION-SCORE table, which is the very table they warn is not predictive. Their
- * only config measured EXACT is K6/V4 with a 128-token fp32 residual window (~2x).
- * So: bits are configurable, K4/V2 is reachable, and the default is K6/V4 rw=128.
- * Measure before trusting either.
+ * ON K4/V2. Upstream's corrected generation table has K4/V2 with no residual window
+ * missing the needle at both 2K and 4K, and warns that "high attention score
+ * similarity (99.5%+) does not guarantee working generation". The 99% top-1 figure
+ * usually quoted for "K4/V2 + protected layers" comes from their attention-score
+ * table, which is the one they say is not predictive. Their only config measured
+ * exact is K6/V4 with a 128-token fp32 residual window (~2x), which is the default
+ * here. K4/V2 is reachable, but measure before trusting it.
  */
 #ifndef KVQ_H
 #define KVQ_H
