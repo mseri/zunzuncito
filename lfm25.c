@@ -1730,7 +1730,12 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--rwin") && i + 1 < argc) rwin = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--protect") && i + 1 < argc) kv_protect = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--pbits") && i + 1 < argc) kv_pbits = atoi(argv[++i]);
-        else if (argv[i][0] == '-' && argv[i][1] == '-') {
+        /* end of flags: whatever follows is the prompt, even if it starts with '-' */
+        else if (!strcmp(argv[i], "--")) { if (i + 1 < argc && !prompt) prompt = argv[++i]; }
+        /* ANY leading dash, not just a double one. A single-dash typo (-kvq for
+         * --kvq) must not fall through to the positional branch: it would silently
+         * become the PROMPT and quietly change what the model generates. */
+        else if (argv[i][0] == '-') {
             fprintf(stderr, "unknown flag: %s\n\n", argv[i]);
             usage(argv[0], stderr);
             return 1;
