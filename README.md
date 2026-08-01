@@ -1,9 +1,9 @@
 # zunzuncito — colibrì-style MoE engines for a small-RAM machine
 
 Two engines share this repo, along with the q4_0/q8_0 kernels (`q40.h`), the
-TurboQuant KV cache (`kvq.h`), the OpenAI server, and the central idea: stream the
-routed experts from disk under an expert-granular cache instead of leaving it to the
-OS page cache.
+TurboQuant KV cache (`kvq.h`), the OpenAI server, and one idea: stream the routed
+experts from disk under an expert-granular cache instead of leaving it to the OS page
+cache.
 
 | binary | model | notes |
 |--------|-------|-------|
@@ -26,11 +26,11 @@ splits into 1.3 GB of dense weights (resident) and 12.9 GB of routed experts (38
 them, 3.19 MiB each). On a 4–8 GB machine the experts don't fit, so we stream them
 from disk with an expert-granular cache instead of leaving it to the OS page cache.
 
-The main tricks used to speed that up:
+Three things make that fast enough to use:
 
-1. Prefetch is exact, not predicted. Gemma-4's router reads the raw post-attention
-   residual, so the 8 expert IDs for a layer are known before the dense MLP runs. We
-   route first, fire the reads, then compute the MLP while they are in flight.
+1. The prefetch is exact rather than predicted. Gemma-4's router reads the raw
+   post-attention residual, so the 8 expert IDs for a layer are known before the dense
+   MLP runs. We route first, fire the reads, then compute the MLP while they fly.
 2. The MoE runs over the batch union. The S tokens of a prefill batch collectively
    route to at most `min(128, 8·S)` distinct experts per layer. We read each once, so a
    512-token prompt drops from 122,880 expert reads to ≤3,840.
@@ -68,10 +68,10 @@ make OMP=0           # single-threaded
 On macOS the Makefile looks for MacPorts' or Homebrew's libomp and applies Apple
 clang's `-Xpreprocessor -fopenmp`.
 
-**Check you got the right kernel.** `q40.h` has AVX2, NEON (with an ARMv8.2 dotprod
-fast path, M1 and later) and a portable fallback. If `ARCHFLAGS` is wrong you land
-silently on the scalar path and lose several times the speed. `./test_q40` prints
-which one you got.
+Check you got the right kernel. `q40.h` has AVX2, NEON (with an ARMv8.2 dotprod fast
+path, M1 and later) and a portable fallback. If `ARCHFLAGS` is wrong you land silently
+on the scalar path and lose several times the speed. `./test_q40` prints which one you
+got.
 
 ## Convert the model
 
@@ -196,7 +196,7 @@ Then run it with `--mtp`:
 There is also `--draft DIR`, if you want the drafter in a separate directory with its
 own KV.
 
-MTP does not pay off on this engine. It would if verification used the same experts,
+MTP doesn't pay off on this engine. It would if verification used the same experts,
 but here it usually has to load and unload others, which costs at least a factor of 2
 in my measurements. It may help if everything fits in RAM, but I have no system with
 enough RAM to check.
@@ -207,14 +207,14 @@ Metal support is off by default, because it makes everything slower on both Inte
 M1. The kernel issues one dispatch and one `waitUntilCompleted` per matvec, and a
 token needs thousands of them: at batch size 1 you pay ~0.5 ms of dispatch latency
 against ~40 ms of real arithmetic. A GPU only wins here with far more work per
-dispatch — whole layers fused into one command buffer, or large prefill batches — and
+dispatch (whole layers fused into one command buffer, or large prefill batches), and
 even then the engine is disk-bound at a 4–8 GB budget. Fixing it properly would take
 time, so it is opt-in with `--metal`, and `make METAL=0` builds a pure-CPU binary.
 Any Metal failure falls back to the CPU silently, so there may be issues I never
 noticed.
 
-At a small RAM budget this engine is IO bound anyway — roughly 800 MB of expert reads
-per token against 7.6 GFLOP of compute — so a faster matmul does not help you wait on
+At a small RAM budget this engine is IO bound anyway, roughly 800 MB of expert reads
+per token against 7.6 GFLOP of compute, so a faster matmul does not help you wait on
 NVMe. Metal could still help for:
 
 - prefill, which is batched and genuinely compute-bound;
@@ -223,7 +223,7 @@ NVMe. Metal could still help for:
 
 ## KV-cache compression (TurboQuant V3)
 
-Optional, off by default, and it is what buys you context length. Gemma-4's 25 sliding
+Optional, off by default, and it's what buys you context length. Gemma-4's 25 sliding
 layers cap their KV at 1024 positions, so they cost a fixed 400 MiB whatever the
 context; all the growth is in the 5 global layers, and on a constrained system you
 feel it.
@@ -252,14 +252,14 @@ At 128K+ it makes the difference between running and not running.
 ```
 
 Pick k6v4 unless you need more than 128K context, in which case k4v2 costs you some
-quality. K6's fidelity is very high — 0.9997 cos / 94% top-1, against K4's 0.995 / 81%
-— and you can check both with `./test_kvq`.
+quality. K6's fidelity is very high (0.9997 cos / 94% top-1, against K4's 0.995 / 81%)
+and you can check both with `./test_kvq`.
 
 To explore further, set `--kbits`, `--vbits`, `--pbits`, `--protect` and `--rwin` by
 hand. `--protect N` protects the first and last N layers at `--pbits` (default 8)
 rather than f32: Gemma-4's last layer is global, so protecting it with f32 would cost
-1.07 GiB at 128K and undo most of the saving. The residual window `--rwin` is not
-optional at low bit-widths — 3-4 bit compression without one just gives you garbage.
+1.07 GiB at 128K and undo most of the saving. The residual window `--rwin` isn't
+optional at low bit-widths; 3-4 bit compression without one just gives you garbage.
 
 ## Context length
 
@@ -278,10 +278,10 @@ kv: 1047 MiB for ctx 16384 (f32; --kvq would cut this a lot)   # gemma4 --ctx 16
 kv:  238 MiB for ctx 16384 (K6/V4, rwin 128, 2 protected layers at 8 bits)
 ```
 
-The warning is about bytes, not about the context number: it fires only when the KV
+The warning is about bytes rather than the context number: it fires only when the KV
 you are actually allocating exceeds what the conversion budgeted (an f32 KV at the
 container's own `ctx`). With `--kvq` a 4x longer context often costs less than the
-plan assumed — 4x the context for a third of the RAM, above — and stays quiet.
+plan assumed, as in the 4x-context-for-a-third-of-the-RAM row above, and stays quiet.
 
 Under `--serve` this is the server's context window, advertised as `context_length`
 and `max_model_len` on `GET /v1/models`; a prompt that leaves no room for a
@@ -317,9 +317,9 @@ $ ./gemma4 ./g4 --ram 2 --kvq
 --ram 2 GB leaves room for 3 experts per layer, below topk=8: this model needs 2.38 GB
 ```
 
-Fewer slots costs hit rate, not correctness: with `--ram` low the engine just streams
-more experts per token from disk. Check the `expert cache: NN% hit` line at exit, and
-see `--pin` under Tuning. Without `--ram` the container's own plan is used.
+Fewer slots costs hit rate but never correctness: with `--ram` low the engine just
+streams more experts per token from disk. Check the `expert cache: NN% hit` line at
+exit, and see `--pin` under Tuning. Without `--ram` the container's own plan is used.
 
 ## Tuning
 
@@ -352,30 +352,24 @@ chat_template.jinja      ──►  chat_prompt()      5/5 exact
 
 `lfm25` runs [LiquidAI/LFM2.5-8B-A1B](https://huggingface.co/LiquidAI/LFM2.5-8B-A1B)
 (8.3 B total, 1.5 B active). The bet is different from Gemma-4's: the experts are tiny
-— 32 per layer at `moe_intermediate_size` 1792, ~5.9 MiB each at q4_0, of which only 4
-fire per token — so a miss is cheap and a layer's whole expert set is only 32 of them.
+(32 per layer at `moe_intermediate_size` 1792, ~5.9 MiB each at q4_0, of which only 4
+fire per token), so a miss is cheap and a layer's whole expert set is only 32 of them.
 At an 8 GB budget essentially the entire model is cacheable.
 
-It is also a hybrid architecture, and that shapes the engine:
-
-- 24 layers, of which only 6 are attention; the other 18 mix along the sequence with
-  a short causal depthwise convolution (`y = C * conv(B * x)`, kernel 3). Conv layers
-  hold no KV at all, so the KV cache costs a quarter of what the layer count
-  suggests (96 MiB at ctx 4096).
-- The conv carries a recurrent state, which unlike a KV cache cannot be rewound. So
-  prompt-prefix reuse (chat, server) is only taken when the new prompt strictly
-  extends what was already absorbed; anything else is reprocessed from scratch.
-- The router is sigmoid, not softmax, and `expert_bias` affects selection only: the
-  weight applied to an expert is the unbiased sigmoid, renormalised.
-- The first 2 layers use a dense SwiGLU MLP rather than the MoE.
+Being a hybrid changes the engine in two ways. Only 6 of the 24 layers are attention,
+and the other 18 hold no KV at all, so the KV cache costs a quarter of what the layer
+count suggests (96 MiB at ctx 4096). And those 18 carry a recurrent conv state, which
+unlike a KV cache cannot be rewound: prompt-prefix reuse (chat, server) is only taken
+when the new prompt strictly extends what was already absorbed, and anything else is
+reprocessed from scratch.
 
 No MTP, no DFlash (this model ships neither). No Metal.
 
 ### Mixed precision (apex-quant, ported)
 
-[apex-quant](https://github.com/localai-org/apex-quant) is a llama.cpp recipe. It does
-not invent a format, it assigns different quant types per tensor class, exploiting
-that routed experts are ~97% idle and so tolerate far more error than the always-on
+[apex-quant](https://github.com/localai-org/apex-quant) is a llama.cpp recipe. It
+invents no format; it assigns different quant types per tensor class, exploiting that
+routed experts are ~97% idle and so tolerate far more error than the always-on
 tensors. We keep the idea and drop the GGUF dependency, mapping its Q3_K..Q8_0
 gradient onto the two block formats this engine has kernels for:
 
@@ -409,9 +403,8 @@ what gives each streamed weight row its reuse, so lowering it saves scratch and 
 prefill speed. `--think` forces a reasoning block by pre-filling `<think>`; the chat
 template has no thinking toggle, the model decides for itself.
 
-The tokenizer is a different family from Gemma's: GPT-2-style ByteLevel BPE with the
-Qwen2/Llama-3 pre-tokenizer split regex and `ignore_merges`, so it has its own
-container (`lfmtok.h`, magic `LFTK`) rather than reusing `g4tok.h`.
+The tokenizer has its own container (`lfmtok.h`, magic `LFTK`) rather than reusing
+`g4tok.h`.
 
 ### Checking it
 
@@ -435,8 +428,8 @@ HF tokenizer          ──►  lfmtok.h           475/475 exact (incl. 400 fuz
 ## Not implemented yet
 
 See [TODO.md](TODO.md). The main open item is 3-bit experts for the middle MoE layers,
-plus the kernel that needs. It is the one idea worth taking from
-[WASTE](https://github.com/sqliteai/waste), and it is a low-RAM feature specifically:
+plus the kernel that needs. It's the one idea worth taking from
+[WASTE](https://github.com/sqliteai/waste), and it's specifically a low-RAM feature:
 worth 16–22% fewer bytes per token at `--ram 4`, and nothing at all where the cache
 already holds the model.
 
