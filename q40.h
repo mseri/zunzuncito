@@ -147,35 +147,58 @@ static inline int q40_hsum_i32(__m256i v){
     s=_mm_add_epi32(s,_mm_shuffle_epi32(s,0x4e));
     s=_mm_add_epi32(s,_mm_shuffle_epi32(s,0xb1));
     return _mm_cvtsi128_si32(s);
-}static inline float q40_dot(const uint8_t *w, const int8_t *xq, const float *sx, int I){
-    __m256 acc=_mm256_setzero_ps();
+}
+/* One block's contribution, folded into `acc`. Split out so the dot below can feed
+ * FOUR independent accumulators. There is exactly one fmadd per block, so a single
+ * accumulator makes the loop a serial chain of 4-cycle FMA latencies -- ~6.4
+ * measured cycles/block, most of it the chain. Four chains in flight cover that
+ * latency: 1.13x / 1.21x / 1.12x at 1 / 2 / 4 threads, best-of-7 on a 2.1 GHz Xeon.
+ * q8_0 gains much less (1.03-1.07x): at 34 bytes/block it is already near bandwidth,
+ * where q4_0 at 18 has arithmetic to spare.
+ *
+ * It is the chain and not the op count. Hoisting the redundant per-row sum(x) out of
+ * the loop, ~15% of the inner-loop uops, is worth 1.01x. The arithmetic here is
+ * unchanged and the split sum is, if anything, slightly better conditioned. */
+static inline __m256 q40_blk_acc(__m256 acc, const uint8_t *w, const int8_t *xq,
+                                 const float *sx, int b,
+                                 __m256i lomask, __m256i ones16){
+    const uint8_t *blk=w+(size_t)b*Q40_BLK_BYTES;
+    uint16_t hd; memcpy(&hd,blk,2);
+    float d=q40_fp16_to_f32(hd)*sx[b];
+
+    /* 16 packed bytes -> 32 nibbles. Low nibbles are weights 0..15, high
+     * nibbles are weights 16..31: broadcast the 16 bytes into both lanes and
+     * mask, which puts w[0..15] in lane 0 and w[16..31] in lane 1 — exactly
+     * the order the activation bytes already sit in. */
+    __m128i raw=_mm_loadu_si128((const __m128i*)(blk+2));
+    __m256i both=_mm256_set_m128i(_mm_srli_epi16(raw,4), raw);
+    __m256i q=_mm256_and_si256(both,lomask);           /* u8, 0..15 */
+
+    __m256i x=_mm256_loadu_si256((const __m256i*)(xq+(size_t)b*Q40_BLK));
+
+    /* <q,x> with u8 x i8; and sum(x) to apply the -8 offset without
+     * materialising q-8 (maddubs needs the u8 operand first). */
+    __m256i p =_mm256_maddubs_epi16(q,x);              /* i16, may saturate? no:
+                                                         15*127*2 = 3810 < 32767 */
+    __m256i sx8=_mm256_maddubs_epi16(_mm256_set1_epi8(1),x);   /* sum pairs of x */
+    __m256i acc_i=_mm256_sub_epi32(_mm256_madd_epi16(p,ones16),
+                   _mm256_slli_epi32(_mm256_madd_epi16(sx8,ones16),3)); /* -8*sum(x) */
+    return _mm256_fmadd_ps(_mm256_set1_ps(d),_mm256_cvtepi32_ps(acc_i),acc);
+}
+static inline float q40_dot(const uint8_t *w, const int8_t *xq, const float *sx, int I){
+    __m256 a0=_mm256_setzero_ps(), a1=a0, a2=a0, a3=a0;
     const __m256i lomask=_mm256_set1_epi8(0x0f);
     const __m256i ones16=_mm256_set1_epi16(1);
-    for(int b=0;b<I/Q40_BLK;b++){
-        const uint8_t *blk=w+(size_t)b*Q40_BLK_BYTES;
-        uint16_t hd; memcpy(&hd,blk,2);
-        float d=q40_fp16_to_f32(hd)*sx[b];
-
-        /* 16 packed bytes -> 32 nibbles. Low nibbles are weights 0..15, high
-         * nibbles are weights 16..31: broadcast the 16 bytes into both lanes and
-         * mask, which puts w[0..15] in lane 0 and w[16..31] in lane 1 — exactly
-         * the order the activation bytes already sit in. */
-        __m128i raw=_mm_loadu_si128((const __m128i*)(blk+2));
-        __m256i both=_mm256_set_m128i(_mm_srli_epi16(raw,4), raw);
-        __m256i q=_mm256_and_si256(both,lomask);           /* u8, 0..15 */
-
-        __m256i x=_mm256_loadu_si256((const __m256i*)(xq+b*Q40_BLK));
-
-        /* <q,x> with u8 x i8; and sum(x) to apply the -8 offset without
-         * materialising q-8 (maddubs needs the u8 operand first). */
-        __m256i p =_mm256_maddubs_epi16(q,x);              /* i16, may saturate? no:
-                                                             15*127*2 = 3810 < 32767 */
-        __m256i sx8=_mm256_maddubs_epi16(_mm256_set1_epi8(1),x);   /* sum pairs of x */
-        __m256i acc_i=_mm256_sub_epi32(_mm256_madd_epi16(p,ones16),
-                       _mm256_slli_epi32(_mm256_madd_epi16(sx8,ones16),3)); /* -8*sum(x) */
-        acc=_mm256_fmadd_ps(_mm256_set1_ps(d),_mm256_cvtepi32_ps(acc_i),acc);
+    int nb=I/Q40_BLK, b=0;
+    for(; b+3<nb; b+=4){
+        a0=q40_blk_acc(a0,w,xq,sx,b+0,lomask,ones16);
+        a1=q40_blk_acc(a1,w,xq,sx,b+1,lomask,ones16);
+        a2=q40_blk_acc(a2,w,xq,sx,b+2,lomask,ones16);
+        a3=q40_blk_acc(a3,w,xq,sx,b+3,lomask,ones16);
     }
-    /* horizontal sum of the f32 accumulator */
+    for(; b<nb; b++) a0=q40_blk_acc(a0,w,xq,sx,b,lomask,ones16);
+    /* horizontal sum of the f32 accumulators */
+    __m256 acc=_mm256_add_ps(_mm256_add_ps(a0,a1),_mm256_add_ps(a2,a3));
     __m128 lo=_mm256_castps256_ps128(acc), hi=_mm256_extractf128_ps(acc,1);
     __m128 s=_mm_add_ps(lo,hi);
     s=_mm_add_ps(s,_mm_movehl_ps(s,s));
@@ -189,53 +212,75 @@ static inline int q40_hsum_i32(__m256i v){
  * fallback below uses widening multiply-accumulate for older cores.
  * Unlike AVX2 we can subtract the 8 offset directly (NEON multiplies signed x
  * signed), so no sum(x) correction term is needed. */
-static inline float q40_dot(const uint8_t *w, const int8_t *xq, const float *sx, int I){
-    float acc = 0.0f;
-    const uint8x16_t lomask = vdupq_n_u8(0x0f);
-    const int8x16_t eight = vdupq_n_s8(8);
-    for(int b=0;b<I/Q40_BLK;b++){
-        const uint8_t *blk=w+(size_t)b*Q40_BLK_BYTES;
-        uint16_t hd; memcpy(&hd,blk,2);
-        float d=q40_fp16_to_f32(hd)*sx[b];
+/* One block's contribution, folded into a VECTOR accumulator. Two departures from the
+ * obvious loop, both about the dependency chain rather than the arithmetic: the
+ * cross-lane vaddvq_s32 lives outside the loop (accumulate lane-wise, reduce once at
+ * the end), and the caller keeps FOUR accumulators so the per-block FMA latency is
+ * covered instead of forming one serial chain.
+ *
+ * NEON carries both problems -- the serial chain AVX2 has, plus a cross-lane
+ * reduction per block -- so it should gain at least what AVX2's 1.13-1.21x did. But
+ * that is UNMEASURED: no arm64 hardware was available, only a cross-compile that
+ * checks it builds and emits sdot. test_q40 covers correctness, not speed. */
+static inline float32x4_t q40_blk_acc(float32x4_t acc, const uint8_t *w,
+                                      const int8_t *xq, const float *sx, int b,
+                                      uint8x16_t lomask, int8x16_t eight){
+    const uint8_t *blk=w+(size_t)b*Q40_BLK_BYTES;
+    uint16_t hd; memcpy(&hd,blk,2);
+    float d=q40_fp16_to_f32(hd)*sx[b];
 
-        uint8x16_t raw = vld1q_u8(blk+2);                  /* 16 bytes = 32 nibbles */
-        /* low nibbles are weights 0..15, high nibbles are weights 16..31 --
-         * matching the order the activation bytes already sit in. */
-        int8x16_t q0 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(raw, lomask)), eight);
-        int8x16_t q1 = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(raw, 4)), eight);
+    uint8x16_t raw = vld1q_u8(blk+2);                  /* 16 bytes = 32 nibbles */
+    /* low nibbles are weights 0..15, high nibbles are weights 16..31 --
+     * matching the order the activation bytes already sit in. */
+    int8x16_t q0 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(raw, lomask)), eight);
+    int8x16_t q1 = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(raw, 4)), eight);
 
-        int8x16_t x0 = vld1q_s8(xq + b*Q40_BLK);
-        int8x16_t x1 = vld1q_s8(xq + b*Q40_BLK + 16);
+    int8x16_t x0 = vld1q_s8(xq + (size_t)b*Q40_BLK);
+    int8x16_t x1 = vld1q_s8(xq + (size_t)b*Q40_BLK + 16);
 
 #if defined(__ARM_FEATURE_DOTPROD)
-        int32x4_t s = vdotq_s32(vdupq_n_s32(0), q0, x0);
-        s = vdotq_s32(s, q1, x1);
+    int32x4_t s = vdotq_s32(vdupq_n_s32(0), q0, x0);
+    s = vdotq_s32(s, q1, x1);
 #else
-        int16x8_t p0 = vmull_s8(vget_low_s8(q0),  vget_low_s8(x0));
-        p0 = vmlal_s8(p0, vget_high_s8(q0), vget_high_s8(x0));
-        int16x8_t p1 = vmull_s8(vget_low_s8(q1),  vget_low_s8(x1));
-        p1 = vmlal_s8(p1, vget_high_s8(q1), vget_high_s8(x1));
-        int32x4_t s = vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1));
+    int16x8_t p0 = vmull_s8(vget_low_s8(q0),  vget_low_s8(x0));
+    p0 = vmlal_s8(p0, vget_high_s8(q0), vget_high_s8(x0));
+    int16x8_t p1 = vmull_s8(vget_low_s8(q1),  vget_low_s8(x1));
+    p1 = vmlal_s8(p1, vget_high_s8(q1), vget_high_s8(x1));
+    int32x4_t s = vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1));
 #endif
-        acc += d * (float)vaddvq_s32(s);
+    return vmlaq_n_f32(acc, vcvtq_f32_s32(s), d);
+}
+static inline float q40_dot(const uint8_t *w, const int8_t *xq, const float *sx, int I){
+    float32x4_t a0=vdupq_n_f32(0.0f), a1=a0, a2=a0, a3=a0;
+    const uint8x16_t lomask = vdupq_n_u8(0x0f);
+    const int8x16_t eight = vdupq_n_s8(8);
+    int nb=I/Q40_BLK, b=0;
+    for(; b+3<nb; b+=4){
+        a0=q40_blk_acc(a0,w,xq,sx,b+0,lomask,eight);
+        a1=q40_blk_acc(a1,w,xq,sx,b+1,lomask,eight);
+        a2=q40_blk_acc(a2,w,xq,sx,b+2,lomask,eight);
+        a3=q40_blk_acc(a3,w,xq,sx,b+3,lomask,eight);
     }
-    return acc;
+    for(; b<nb; b++) a0=q40_blk_acc(a0,w,xq,sx,b,lomask,eight);
+    return vaddvq_f32(vaddq_f32(vaddq_f32(a0,a1), vaddq_f32(a2,a3)));
 }
 #else
+/* Four accumulators here too: the scalar path has the same serial-FP-add chain as
+ * the SIMD ones, and this costs nothing to spell out. */
 static inline float q40_dot(const uint8_t *w, const int8_t *xq, const float *sx, int I){
-    float acc=0.f;
+    float a[4]={0.f,0.f,0.f,0.f};
     for(int b=0;b<I/Q40_BLK;b++){
         const uint8_t *blk=w+(size_t)b*Q40_BLK_BYTES;
         uint16_t hd; memcpy(&hd,blk,2);
-        const int8_t *x=xq+b*Q40_BLK;
+        const int8_t *x=xq+(size_t)b*Q40_BLK;
         int32_t s=0;
         for(int j=0;j<16;j++){
             s += ((int)(blk[2+j]&0x0f)-8)*(int)x[j];
             s += ((int)(blk[2+j]>>4)  -8)*(int)x[j+16];
         }
-        acc += q40_fp16_to_f32(hd)*sx[b]*(float)s;
+        a[b&3] += q40_fp16_to_f32(hd)*sx[b]*(float)s;
     }
-    return acc;
+    return (a[0]+a[1])+(a[2]+a[3]);
 }
 #endif
 
@@ -311,22 +356,33 @@ static inline void q80_dequant_row(const uint8_t *src, float *w, int I){
 }
 
 #if defined(__AVX2__)
+static inline __m256 q80_blk_acc(__m256 acc, const uint8_t *w, const int8_t *xq,
+                                 const float *sx, int b, __m256i ones16){
+    const uint8_t *blk=w+(size_t)b*Q80_BLK_BYTES;
+    uint16_t hd; memcpy(&hd,blk,2);
+    float d=q40_fp16_to_f32(hd)*sx[b];
+    __m256i a=_mm256_loadu_si256((const __m256i*)(blk+2));
+    __m256i x=_mm256_loadu_si256((const __m256i*)(xq+(size_t)b*Q40_BLK));
+    /* signed x signed via the sign trick: maddubs needs an unsigned operand */
+    __m256i ax=_mm256_sign_epi8(a,a);          /* |a| (unsigned magnitudes) */
+    __m256i sx8=_mm256_sign_epi8(x,a);         /* x carrying sign of a */
+    __m256i p=_mm256_maddubs_epi16(ax,sx8);    /* i16 pairs */
+    __m256i s=_mm256_madd_epi16(p,ones16);     /* i32 */
+    return _mm256_fmadd_ps(_mm256_set1_ps(d),_mm256_cvtepi32_ps(s),acc);
+}
+/* four accumulators, same reasoning as q40_dot above */
 static inline float q80_dot(const uint8_t *w, const int8_t *xq, const float *sx, int I){
-    __m256 acc=_mm256_setzero_ps();
+    __m256 a0=_mm256_setzero_ps(), a1=a0, a2=a0, a3=a0;
     const __m256i ones16=_mm256_set1_epi16(1);
-    for(int b=0;b<I/Q40_BLK;b++){
-        const uint8_t *blk=w+(size_t)b*Q80_BLK_BYTES;
-        uint16_t hd; memcpy(&hd,blk,2);
-        float d=q40_fp16_to_f32(hd)*sx[b];
-        __m256i a=_mm256_loadu_si256((const __m256i*)(blk+2));
-        __m256i x=_mm256_loadu_si256((const __m256i*)(xq+b*Q40_BLK));
-        /* signed x signed via the sign trick: maddubs needs an unsigned operand */
-        __m256i ax=_mm256_sign_epi8(a,a);          /* |a| (unsigned magnitudes) */
-        __m256i sx8=_mm256_sign_epi8(x,a);         /* x carrying sign of a */
-        __m256i p=_mm256_maddubs_epi16(ax,sx8);    /* i16 pairs */
-        __m256i s=_mm256_madd_epi16(p,ones16);     /* i32 */
-        acc=_mm256_fmadd_ps(_mm256_set1_ps(d),_mm256_cvtepi32_ps(s),acc);
+    int nb=I/Q40_BLK, b=0;
+    for(; b+3<nb; b+=4){
+        a0=q80_blk_acc(a0,w,xq,sx,b+0,ones16);
+        a1=q80_blk_acc(a1,w,xq,sx,b+1,ones16);
+        a2=q80_blk_acc(a2,w,xq,sx,b+2,ones16);
+        a3=q80_blk_acc(a3,w,xq,sx,b+3,ones16);
     }
+    for(; b<nb; b++) a0=q80_blk_acc(a0,w,xq,sx,b,ones16);
+    __m256 acc=_mm256_add_ps(_mm256_add_ps(a0,a1),_mm256_add_ps(a2,a3));
     __m128 lo=_mm256_castps256_ps128(acc), hi=_mm256_extractf128_ps(acc,1);
     __m128 s=_mm_add_ps(lo,hi);
     s=_mm_add_ps(s,_mm_movehl_ps(s,s));
@@ -334,43 +390,53 @@ static inline float q80_dot(const uint8_t *w, const int8_t *xq, const float *sx,
     return _mm_cvtss_f32(s);
 }
 #elif defined(__ARM_NEON)
-static inline float q80_dot(const uint8_t *w, const int8_t *xq, const float *sx, int I){
-    float acc=0.0f;
-    for(int b=0;b<I/Q40_BLK;b++){
-        const uint8_t *blk=w+(size_t)b*Q80_BLK_BYTES;
-        uint16_t hd; memcpy(&hd,blk,2);
-        float d=q40_fp16_to_f32(hd)*sx[b];
-        int8x16_t a0=vld1q_s8((const int8_t*)(blk+2));
-        int8x16_t a1=vld1q_s8((const int8_t*)(blk+2+16));
-        int8x16_t x0=vld1q_s8(xq+b*Q40_BLK);
-        int8x16_t x1=vld1q_s8(xq+b*Q40_BLK+16);
+static inline float32x4_t q80_blk_acc(float32x4_t acc, const uint8_t *w,
+                                      const int8_t *xq, const float *sx, int b){
+    const uint8_t *blk=w+(size_t)b*Q80_BLK_BYTES;
+    uint16_t hd; memcpy(&hd,blk,2);
+    float d=q40_fp16_to_f32(hd)*sx[b];
+    int8x16_t a0=vld1q_s8((const int8_t*)(blk+2));
+    int8x16_t a1=vld1q_s8((const int8_t*)(blk+2+16));
+    int8x16_t x0=vld1q_s8(xq+(size_t)b*Q40_BLK);
+    int8x16_t x1=vld1q_s8(xq+(size_t)b*Q40_BLK+16);
 #if defined(__ARM_FEATURE_DOTPROD)
-        int32x4_t s=vdotq_s32(vdupq_n_s32(0),a0,x0);
-        s=vdotq_s32(s,a1,x1);
+    int32x4_t s=vdotq_s32(vdupq_n_s32(0),a0,x0);
+    s=vdotq_s32(s,a1,x1);
 #else
-        int16x8_t p0=vmull_s8(vget_low_s8(a0),vget_low_s8(x0));
-        p0=vmlal_s8(p0,vget_high_s8(a0),vget_high_s8(x0));
-        int16x8_t p1=vmull_s8(vget_low_s8(a1),vget_low_s8(x1));
-        p1=vmlal_s8(p1,vget_high_s8(a1),vget_high_s8(x1));
-        int32x4_t s=vaddq_s32(vpaddlq_s16(p0),vpaddlq_s16(p1));
+    int16x8_t p0=vmull_s8(vget_low_s8(a0),vget_low_s8(x0));
+    p0=vmlal_s8(p0,vget_high_s8(a0),vget_high_s8(x0));
+    int16x8_t p1=vmull_s8(vget_low_s8(a1),vget_low_s8(x1));
+    p1=vmlal_s8(p1,vget_high_s8(a1),vget_high_s8(x1));
+    int32x4_t s=vaddq_s32(vpaddlq_s16(p0),vpaddlq_s16(p1));
 #endif
-        acc+=d*(float)vaddvq_s32(s);
+    return vmlaq_n_f32(acc, vcvtq_f32_s32(s), d);
+}
+/* four accumulators, vaddvq hoisted out -- same reasoning as q40_dot above */
+static inline float q80_dot(const uint8_t *w, const int8_t *xq, const float *sx, int I){
+    float32x4_t a0=vdupq_n_f32(0.0f), a1=a0, a2=a0, a3=a0;
+    int nb=I/Q40_BLK, b=0;
+    for(; b+3<nb; b+=4){
+        a0=q80_blk_acc(a0,w,xq,sx,b+0);
+        a1=q80_blk_acc(a1,w,xq,sx,b+1);
+        a2=q80_blk_acc(a2,w,xq,sx,b+2);
+        a3=q80_blk_acc(a3,w,xq,sx,b+3);
     }
-    return acc;
+    for(; b<nb; b++) a0=q80_blk_acc(a0,w,xq,sx,b);
+    return vaddvq_f32(vaddq_f32(vaddq_f32(a0,a1), vaddq_f32(a2,a3)));
 }
 #else
 static inline float q80_dot(const uint8_t *w, const int8_t *xq, const float *sx, int I){
-    float acc=0.f;
+    float acc[4]={0.f,0.f,0.f,0.f};
     for(int b=0;b<I/Q40_BLK;b++){
         const uint8_t *blk=w+(size_t)b*Q80_BLK_BYTES;
         uint16_t hd; memcpy(&hd,blk,2);
         const int8_t *a=(const int8_t*)(blk+2);
-        const int8_t *x=xq+b*Q40_BLK;
+        const int8_t *x=xq+(size_t)b*Q40_BLK;
         int32_t s=0;
         for(int j=0;j<Q40_BLK;j++) s+=(int)a[j]*(int)x[j];
-        acc+=q40_fp16_to_f32(hd)*sx[b]*(float)s;
+        acc[b&3]+=q40_fp16_to_f32(hd)*sx[b]*(float)s;
     }
-    return acc;
+    return (acc[0]+acc[1])+(acc[2]+acc[3]);
 }
 #endif
 

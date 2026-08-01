@@ -705,10 +705,26 @@ static void moe_start(M *m, int li, const float *X, float *out, int S, Buf *b) {
     /* moe_finish submits chunk n+1 before applying chunk n, so two chunks are
      * resident at once and need disjoint unpinned slots. Below 2 free slots there is
      * no room for the second chunk, so the overlap is dropped rather than evicting a
-     * slot still in use -- slower, but --pin near the slot count is the user's call. */
+     * slot still in use -- slower, but --pin near the slot count is the user's call.
+     *
+     * free_slots/2 is the UPPER bound on a chunk, not the target. Take it whenever
+     * the union is small and the overlap disappears: at decode S is 1, so moe_nu is
+     * at most topk (4) against ~14 free slots, the whole union goes out as one chunk,
+     * moe_finish finds nothing left to submit, and the layer stalls on the read with
+     * nothing computing over it. This model can least afford that. Its router reads
+     * the same normed hidden the experts consume, so there is no early routing signal
+     * to prefetch from, and no dense branch sits beside the MoE either: chunk
+     * pipelining is the ONLY latency hiding it has. So aim for two chunks, and fall
+     * back to the bound only where the bound actually binds. */
     int free_slots = c->slots_per_layer - m->npin;
     b->moe_prefetch = free_slots >= 2;
-    b->moe_chunk_n = b->moe_prefetch ? free_slots / 2 : 1;
+    if (b->moe_prefetch) {
+        int cap = free_slots / 2, half = (b->moe_nu + 1) / 2;
+        b->moe_chunk_n = half < cap ? half : cap;
+        if (b->moe_chunk_n < 1) b->moe_chunk_n = 1;
+    } else {
+        b->moe_chunk_n = 1;
+    }
     if (b->moe_chunk_n > b->moe_nu) b->moe_chunk_n = b->moe_nu;
     if (b->moe_chunk_n) moe_submit_chunk(m, li, b, 0, b->moe_chunk_n);
 }
