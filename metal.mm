@@ -97,12 +97,66 @@ kernel void q40_matmul(
     }
     if (lane == 0u) Y[(ulong)s * O + row] = part[0];
 }
+
+// q8_0: 32 weights per 34-byte block -> fp16 scale d, then 32 signed int8 codes.
+//   w = d * q
+//
+// Same threadgroup shape and reduction as q40_matmul above; only the block decode
+// differs. It is a separate kernel rather than a branch inside one because the
+// per-block byte stride is a compile-time constant in both, and the inner loop is
+// where every cycle of this thing goes.
+kernel void q80_matmul(
+    device const uchar  *W   [[buffer(0)]],   // [O, (I/32)*34]
+    device const float  *X   [[buffer(1)]],   // [S, I]
+    device       float  *Y   [[buffer(2)]],   // [S, O]
+    constant     uint   &O   [[buffer(3)]],
+    constant     uint   &I   [[buffer(4)]],
+    constant     uint   &S   [[buffer(5)]],
+    uint3 gid  [[threadgroup_position_in_grid]],
+    uint3 tid  [[thread_position_in_threadgroup]])
+{
+    const uint row  = gid.x;
+    const uint s    = gid.y;
+    const uint lane = tid.x;
+    if (row >= O || s >= S) return;
+
+    const uint nb = I / 32u;
+    const ulong rb = (ulong)nb * 34u;
+    device const uchar *w = W + (ulong)row * rb;
+    device const float *x = X + (ulong)s * I;
+
+    float acc = 0.0f;
+    for (uint b = lane; b < nb; b += TG) {
+        device const uchar *blk = w + (ulong)b * 34u;
+
+        // 34 is even, but the tensor base need not be 2-byte aligned relative to the
+        // buffer origin, so assemble the fp16 from bytes here too
+        ushort bits = (ushort)blk[0] | ((ushort)blk[1] << 8);
+        float  d    = (float)as_type<half>(bits);
+
+        device const float *xv = x + (ulong)b * 32u;
+        float s0 = 0.0f;
+        for (uint j = 0; j < 32u; ++j)
+            s0 += (float)(int)(char)blk[2u + j] * xv[j];
+        acc += d * s0;
+    }
+
+    threadgroup float part[TG];
+    part[lane] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint off = TG / 2u; off > 0u; off >>= 1u) {
+        if (lane < off) part[lane] += part[lane + off];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane == 0u) Y[(ulong)s * O + row] = part[0];
+}
 )METAL";
 
 /* ------------------------------------------------------------------ state */
 static id<MTLDevice>               g_dev  = nil;
 static id<MTLCommandQueue>         g_q    = nil;
-static id<MTLComputePipelineState> g_pipe = nil;
+static id<MTLComputePipelineState> g_pipe = nil;   /* q4_0 */
+static id<MTLComputePipelineState> g_pipe8 = nil;  /* q8_0 */
 static char g_name[128] = "none";
 static int  g_ok = 0;
 
@@ -144,8 +198,15 @@ int gpu_init(void) {
             g_dev = nil;
             return 0;
         }
+        /* q8_0 is optional: gemma4 never asks for it, so a failure here only costs
+         * lfm25 its GPU path, and gpu_matmul declines for fmt 2. */
+        id<MTLFunction> fn8 = [lib newFunctionWithName:@"q80_matmul"];
+        if (fn8) {
+            g_pipe8 = [g_dev newComputePipelineStateWithFunction:fn8 error:&err];
+            [fn8 release];
+        }
         g_q = [g_dev newCommandQueue];
-        if (!g_q) { g_dev = nil; g_pipe = nil; return 0; }
+        if (!g_q) { g_dev = nil; g_pipe = nil; g_pipe8 = nil; return 0; }
         g_ok = 1;
         return 1;
     }
@@ -154,7 +215,7 @@ int gpu_init(void) {
 void gpu_shutdown(void) {
     g_ok = 0;
     g_nmap = 0;
-    g_pipe = nil; g_q = nil; g_dev = nil; g_x = nil; g_y = nil;
+    g_pipe = nil; g_pipe8 = nil; g_q = nil; g_dev = nil; g_x = nil; g_y = nil;
 }
 
 int gpu_ready(void)        { return g_ok; }
@@ -204,10 +265,15 @@ static int ensure(id<MTLBuffer> *buf, size_t *cap, size_t need) {
     return 1;
 }
 
-int gpu_q40_matmul(float *y, const uint8_t *W, const float *x, int O, int I, int S) {
+int gpu_matmul(int fmt, float *y, const uint8_t *W, const float *x,
+               int O, int I, int S) {
     if (!g_ok || (I & 31) || O <= 0 || S <= 0) return 0;
+    if (fmt != GPU_FMT_Q40 && fmt != GPU_FMT_Q80) return 0;
 
-    size_t rb = (size_t)(I / 32) * 18;
+    id<MTLComputePipelineState> pipe = (fmt == GPU_FMT_Q40) ? g_pipe : g_pipe8;
+    if (!pipe) return 0;
+
+    size_t rb = (size_t)(I / 32) * (fmt == GPU_FMT_Q40 ? 18 : 34);
     size_t off = 0;
     id<MTLBuffer> wb = find_map(W, rb * (size_t)O, &off);
     if (!wb) return 0;                     /* weights not GPU-mapped -> CPU path */
@@ -223,7 +289,7 @@ int gpu_q40_matmul(float *y, const uint8_t *W, const float *x, int O, int I, int
 
         id<MTLCommandBuffer> cb = [g_q commandBuffer];
         id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
-        [e setComputePipelineState:g_pipe];
+        [e setComputePipelineState:pipe];
         [e setBuffer:wb  offset:off atIndex:0];
         [e setBuffer:g_x offset:0   atIndex:1];
         [e setBuffer:g_y offset:0   atIndex:2];
@@ -241,4 +307,8 @@ int gpu_q40_matmul(float *y, const uint8_t *W, const float *x, int O, int I, int
         memcpy(y, [g_y contents], yn);
         return 1;
     }
+}
+
+int gpu_q40_matmul(float *y, const uint8_t *W, const float *x, int O, int I, int S) {
+    return gpu_matmul(GPU_FMT_Q40, y, W, x, O, I, S);
 }

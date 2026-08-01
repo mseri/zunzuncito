@@ -1,8 +1,10 @@
 /* gpu.h — Metal backend interface (Apple silicon / Intel Mac with a Metal GPU).
  *
  * WHAT IS OFFLOADED, AND WHY ONLY THIS
- *   The q4_0 matvec/matmul, which is ~95% of the arithmetic: the attention
- *   projections, the dense MLP, and the expert GEMMs. Nothing else.
+ *   The quantised matvec/matmul -- q4_0 and q8_0, one kernel each -- which is ~95%
+ *   of the arithmetic: the attention projections, the dense MLP, and the expert
+ *   GEMMs. Nothing else. (gemma4 is q4_0 throughout; lfm25's apex gradient makes its
+ *   always-on tensors q8_0, hence the second kernel.)
  *
  *   Attention, routing, KV codec and the expert cache stay on the CPU on purpose:
  *   they are small, branchy, or I/O-bound, and at a 4-8 GB budget this engine is
@@ -39,6 +41,11 @@
 #include <stdint.h>
 #include <stddef.h>
 
+/* Weight formats the kernels speak. The values match lfm25.c's FMT_* on purpose so
+ * that engine can pass its tensor format straight through. */
+#define GPU_FMT_Q40 1
+#define GPU_FMT_Q80 2
+
 #ifdef COLI_METAL
 
 #ifdef __cplusplus
@@ -61,6 +68,11 @@ int  gpu_map(const void *p, size_t n);
  * and the caller falls back to the CPU. */
 int  gpu_q40_matmul(float *y, const uint8_t *W, const float *x, int O, int I, int S);
 
+/* Same, for either GPU_FMT_Q40 or GPU_FMT_Q80 weights. Returns 0 (caller falls back
+ * to the CPU) for any other format, or if that kernel failed to compile. */
+int  gpu_matmul(int fmt, float *y, const uint8_t *W, const float *x,
+                int O, int I, int S);
+
 #ifdef __cplusplus
 }
 #endif
@@ -77,6 +89,10 @@ static inline int  gpu_map(const void *p, size_t n) { (void)p; (void)n; return 0
 static inline int  gpu_q40_matmul(float *y, const uint8_t *W, const float *x,
                                   int O, int I, int S) {
     (void)y; (void)W; (void)x; (void)O; (void)I; (void)S; return 0;
+}
+static inline int  gpu_matmul(int fmt, float *y, const uint8_t *W, const float *x,
+                              int O, int I, int S) {
+    (void)fmt; (void)y; (void)W; (void)x; (void)O; (void)I; (void)S; return 0;
 }
 #endif /* COLI_METAL */
 

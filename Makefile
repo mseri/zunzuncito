@@ -85,19 +85,21 @@ gemma4: gemma4.c q40.h g4tok.h kvq.h gpu.h openai_http.h openai_json.h $(METAL_O
 gemma4-exact: gemma4.c q40.h g4tok.h kvq.h gpu.h $(METAL_OBJ)
 	$(CC) $(CFLAGS) -DCOLI_F32ACT gemma4.c $(METAL_OBJ) -o $@ $(LDFLAGS)
 
-# LFM2.5-8B-A1B. No Metal: the gpu.h kernel only speaks q4_0, and lfm25's dense
-# tensors are mostly q8_0 (the apex gradient), so there is nothing for it to do.
-LFM_DEPS = lfm25.c q40.h lfmtok.h kvq.h openai_http.h openai_json.h
-LFM_CFLAGS = $(OPT) $(WARN) $(ARCHFLAGS) $(OMPFLAGS) -I.
-LFM_LDFLAGS = -lm -lpthread $(OMPLIBS)
+# LFM2.5-8B-A1B. Metal is compiled in (the backend has a q8_0 kernel alongside the
+# q4_0 one, which lfm25's apex gradient needs) but stays OFF unless you pass --metal:
+# at 1.5 B active params over ~5.9 MiB experts, dispatch latency usually beats the
+# arithmetic saved. See the comment on g_use_gpu in lfm25.c.
+LFM_DEPS = lfm25.c q40.h lfmtok.h kvq.h gpu.h openai_http.h openai_json.h
+LFM_CFLAGS = $(OPT) $(WARN) $(ARCHFLAGS) $(OMPFLAGS) $(METAL_CFLAGS) -I.
+LFM_LDFLAGS = -lm -lpthread $(OMPLIBS) $(METAL_LDFLAGS)
 
-lfm25: $(LFM_DEPS)
-	$(CC) $(LFM_CFLAGS) lfm25.c -o $@ $(LFM_LDFLAGS)
+lfm25: $(LFM_DEPS) $(METAL_OBJ)
+	$(CC) $(LFM_CFLAGS) lfm25.c $(METAL_OBJ) -o $@ $(LFM_LDFLAGS)
 
 # COLI_F32ACT keeps activations in f32 (weights stay quantised). Slower; used only
 # to separate the int8-activation approximation from an actual bug when validating.
-lfm25-exact: $(LFM_DEPS)
-	$(CC) $(LFM_CFLAGS) -DCOLI_F32ACT lfm25.c -o $@ $(LFM_LDFLAGS)
+lfm25-exact: $(LFM_DEPS) $(METAL_OBJ)
+	$(CC) $(LFM_CFLAGS) -DCOLI_F32ACT lfm25.c $(METAL_OBJ) -o $@ $(LFM_LDFLAGS)
 
 test_lfmtok: tests/test_lfmtok.c lfmtok.h
 	$(CC) $(OPT) $(ARCHFLAGS) -I. tests/test_lfmtok.c -o $@ -lm
@@ -145,6 +147,8 @@ check-lfm25: lfm25 lfm25-exact test_lfmtok
 	./lfm25-exact $(LFMFIX) --check --nobatch  # batched == sequential
 	./lfm25       $(LFMFIX) --check            # int8-activation build
 	./lfm25-exact $(LFMFIX) --check --pin 3    # pinning must not change the logits
+	./lfm25       $(LFMFIX) --check-gpu        # Metal vs CPU (no-op without Metal)
+	./lfm25       $(LFMFIX) --check --metal    # engine with the GPU path enabled
 
 clean:
 	rm -f gemma4 gemma4-exact lfm25 lfm25-exact \

@@ -54,6 +54,7 @@
 #include "q40.h"
 #include "lfmtok.h"
 #include "kvq.h"
+#include "gpu.h"
 #include "openai_json.h"
 #include "openai_http.h"
 
@@ -141,6 +142,14 @@ typedef struct {
     struct { int layer, eid, slot; } *q;
     int qcap, qhead, qtail, qcount, inflight, stop;
 } M;
+
+/* METAL. Off by default here, unlike gemma4: this model is 1.5 B active params over
+ * ~5.9 MiB experts, so a decode step is a stream of small matvecs, and per-dispatch
+ * latency plus the activation copy usually costs more than the arithmetic saved.
+ * --metal turns it on -- worth trying on prefill, where the batch is large enough to
+ * amortise a dispatch, and on a machine whose whole container is resident. Every GPU
+ * call can decline (returning 0) and the CPU path runs instead. */
+static int g_use_gpu = 0;
 
 static double now(void) {
     struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
@@ -284,6 +293,10 @@ static void manifest(M *m, const char *dir) {
     }
     close(fd);
     m->dense = blob; m->dense_len = sz;
+    if (g_use_gpu && !gpu_map(blob, (size_t)sz)) {
+        fprintf(stderr, "metal: could not map the dense blob; using CPU\n");
+        g_use_gpu = 0;
+    }
 
     /* embed doubles as the lm_head (tie_word_embeddings) -- stashed in a spare slot */
     m->L[MAXL - 1].q_proj = dense_bind(dd, ndense, blob, "embed_tokens");
@@ -342,6 +355,10 @@ static inline float silu(float x) {
  * can separate the int8-activation approximation from an actual bug. */
 static void matvec(float *y, const W *w, const float *x, int8_t *xq, float *sx) {
     int64_t rb = fmt_row_bytes(w->fmt, w->I);
+    /* The Metal kernels consume f32 activations, so they reproduce the wdot_f32 path
+     * -- i.e. MORE accurate than the int8 default, not less. They decline for f32
+     * tensors and for weights that are not GPU-mapped. */
+    if (g_use_gpu && gpu_matmul(w->fmt, y, w->q, x, w->O, w->I, 1)) return;
     if (w->fmt == FMT_F32) {
         #pragma omp parallel for schedule(static)
         for (int o = 0; o < w->O; o++)
@@ -387,6 +404,9 @@ static void rope(float *x, int H, int D, int pos, const float *invf) {
 static void matmul(float *Y, const W *w, const float *X, int S,
                    int8_t *xq, float *sx) {
     if (S == 1) { matvec(Y, w, X, xq, sx); return; }
+    /* One dispatch fills the whole O*S grid, which is where Metal has a chance:
+     * prefill is batched and genuinely compute-bound. */
+    if (g_use_gpu && gpu_matmul(w->fmt, Y, w->q, X, w->O, w->I, S)) return;
     int I = w->I, O = w->O, nb = I / Q40_BLK;
     int64_t rb = fmt_row_bytes(w->fmt, I);
 #ifdef COLI_F32ACT
@@ -495,6 +515,9 @@ typedef struct {
     int *rows;        /* scratch: rows routed to one expert */
     float *roww;      /* scratch: their weights */
     int *uniq;        /* distinct experts in the batch */
+    /* GPU expert scratch: the rows routed to one expert are scattered through X, and
+     * the kernel wants them contiguous, so they are gathered here and scattered back. */
+    float *gx, *gg, *gu, *gd;
     int S;
 } Buf;
 
@@ -612,6 +635,27 @@ static void expert_apply(M *m, int li, const uint8_t *blob, const float *X, floa
     int D = c->hidden, MI = c->moe_inter, fmt = m->expert_fmt[li];
     const uint8_t *G = blob, *U = blob + m->gate_b[li], *Dn = blob + 2 * m->gate_b[li];
     size_t grb = fmt_row_bytes(fmt, D), drb = fmt_row_bytes(fmt, MI);
+    /* GPU path. The expert slot was gpu_map'd at allocation, so the weights are read
+     * in place; only the participating activation rows move, and they are scattered
+     * through X, hence the gather into b->gx and the scatter back out of b->gd. */
+    if (g_use_gpu) {
+        for (int r = 0; r < nrows; r++)
+            memcpy(b->gx + (size_t)r * D, X + (size_t)rows[r] * D, sizeof(float) * D);
+        if (gpu_matmul(fmt, b->gg, G, b->gx, MI, D, nrows) &&
+            gpu_matmul(fmt, b->gu, U, b->gx, MI, D, nrows)) {
+            for (size_t i = 0; i < (size_t)nrows * MI; i++)
+                b->gg[i] = silu(b->gg[i]) * b->gu[i];
+            if (gpu_matmul(fmt, b->gd, Dn, b->gg, D, MI, nrows)) {
+                for (int r = 0; r < nrows; r++) {
+                    float *out = OUT + (size_t)rows[r] * D;
+                    const float *dr = b->gd + (size_t)r * D;
+                    for (int o = 0; o < D; o++) out[o] += w[r] * dr[o];
+                }
+                return;
+            }
+        }
+        /* any decline above and we simply fall through to the CPU */
+    }
     if (nrows > 1) {
         expert_apply_batch_cpu(m, fmt, G, U, Dn, grb, drb, X, OUT, rows, nrows, w, b);
         return;
@@ -1236,6 +1280,12 @@ static void init(M *m, const char *dir, int n_io, int ctx_override, double ram_g
                 s->eid = -1;
                 /* sized for THIS layer's format: edge-layer experts are bigger */
                 s->buf = m->esz[l] ? xmalloc(m->esz[l]) : NULL;
+                /* Map each slot once, up front: the streaming layer overwrites the
+                 * bytes but never the address, so the mapping stays valid all run. */
+                if (g_use_gpu && s->buf && !gpu_map(s->buf, (size_t)m->esz[l])) {
+                    fprintf(stderr, "metal: could not map expert slots; using CPU\n");
+                    g_use_gpu = 0;
+                }
             }
     }
 
@@ -1293,6 +1343,12 @@ static Buf *bufs(M *m, int Smax) {
     b->rows = xmalloc(sizeof(int) * (size_t)Smax * K);
     b->roww = xmalloc(sizeof(float) * (size_t)Smax * K);
     b->uniq = xmalloc(sizeof(int) * c->n_experts);
+    if (g_use_gpu) {
+        b->gx = xmalloc(sizeof(float) * ((size_t)Smax * D + 64));
+        b->gg = xmalloc(sizeof(float) * ((size_t)Smax * c->moe_inter + 64));
+        b->gu = xmalloc(sizeof(float) * ((size_t)Smax * c->moe_inter + 64));
+        b->gd = xmalloc(sizeof(float) * ((size_t)Smax * D + 64));
+    }
     b->egate = xmalloc(sizeof(float) * (size_t)Smax * (c->moe_inter + 64));
     b->exq  = xmalloc((size_t)Smax * (D + 64));
     b->ehq  = xmalloc((size_t)Smax * (c->moe_inter + 64));
@@ -1656,6 +1712,65 @@ static int run_lfm_server(M *m, Buf *buffers, LfmTok *tokenizer, const char *mod
 }
 
 /* ------------------------------------------------------------------ main */
+/* Numerically diff the Metal kernels against the CPU reference on random data, in
+ * both formats. The Metal path cannot be tested where it was written -- it is the
+ * user's machine that decides whether it is right. Shapes cover the real ones. */
+static int check_gpu(void) {
+    if (!gpu_ready()) {
+        printf("no Metal device (or built without COLI_METAL) -- nothing to check\n");
+        return 0;
+    }
+    printf("metal device: %s\n\n", gpu_name());
+    struct { int fmt, O, I; const char *what; } shp[] = {
+        {FMT_Q80, 2048, 2048, "q_proj (q8_0)"},
+        {FMT_Q80,  512, 2048, "k/v_proj (q8_0)"},
+        {FMT_Q80, 6144, 2048, "conv in_proj (q8_0)"},
+        {FMT_Q80, 8192, 2048, "dense mlp gate/up (q8_0)"},
+        {FMT_Q80, 2048, 8192, "dense mlp down (q8_0)"},
+        {FMT_Q40, 1792, 2048, "expert gate/up (q4_0)"},
+        {FMT_Q40, 2048, 1792, "expert down (q4_0)"},
+        {FMT_Q80, 1792, 2048, "edge expert gate/up (q8_0)"},
+    };
+    int fail = 0;
+    for (unsigned t = 0; t < sizeof shp / sizeof *shp; t++) {
+        int fmt = shp[t].fmt, O = shp[t].O, I = shp[t].I;
+        size_t rb = (size_t)fmt_row_bytes(fmt, I), wb = (size_t)O * rb;
+        uint8_t *W = xmalloc((wb + 4095) & ~(size_t)4095);
+        float *x = xmalloc(sizeof(float) * I);
+        float *yg = xmalloc(sizeof(float) * O), *yc = xmalloc(sizeof(float) * O);
+
+        uint64_t r = 0x243f6a8885a308d3ULL ^ t;
+        for (size_t i = 0; i < wb; i++) {
+            r = r * 6364136223846793005ULL + 1442695040888963407ULL;
+            W[i] = (uint8_t)(r >> 40);
+        }
+        for (int i = 0; i < I; i++) {
+            r = r * 6364136223846793005ULL + 1442695040888963407ULL;
+            x[i] = (float)((int64_t)(r >> 40) - 8388608) / 8388608.0f;
+        }
+        if (!gpu_map(W, wb)) { printf("  %-22s gpu_map FAILED\n", shp[t].what); fail = 1; goto next; }
+        if (!gpu_matmul(fmt, yg, W, x, O, I, 1)) {
+            printf("  %-22s gpu_matmul DECLINED\n", shp[t].what); fail = 1; goto next;
+        }
+        for (int o = 0; o < O; o++) yc[o] = wdot_f32(fmt, W + (size_t)o * rb, x, I);
+
+        double worst = 0, mag = 0;
+        for (int o = 0; o < O; o++) {
+            double d = fabs(yg[o] - yc[o]);
+            if (d > worst) worst = d;
+            if (fabs(yc[o]) > mag) mag = fabs(yc[o]);
+        }
+        double rel = worst / (mag + 1e-9);
+        printf("  %-22s [%5d x %5d]  max rel err %.3e  %s\n",
+               shp[t].what, O, I, rel, rel < 1e-4 ? "ok" : "MISMATCH");
+        if (rel >= 1e-4) fail = 1;
+    next:
+        free(W); free(x); free(yg); free(yc);
+    }
+    printf("\n%s\n", fail ? "GPU CHECK FAILED -- do not pass --metal" : "GPU CHECK PASSED");
+    return fail;
+}
+
 static void usage(const char *prog, FILE *out) {
     fprintf(out,
         "usage: %s <dir> [flags...] [prompt]\n"
@@ -1669,7 +1784,10 @@ static void usage(const char *prog, FILE *out) {
         "         [--kv off|k6v4|k4v2]    KV-cache compression preset\n"
         "         [--kvq] [--kbits N] [--vbits N] [--rwin N] [--protect N] [--pbits N]\n"
         "                                 override individual TurboQuant settings\n"
+        "         [--metal]               offload the matmuls to the GPU (off by\n"
+        "                                 default: usually slower here, see matvec)\n"
         "         [--check]               diff against the numpy oracle's logits\n"
+        "         [--check-gpu]           diff the Metal kernels against the CPU\n"
         "         [--help]\n",
         prog);
 }
@@ -1687,12 +1805,15 @@ int main(int argc, char **argv) {
     int batch = 128, ctx_override = 0;
     double ram_gb = 0;                   /* 0 = keep the container's own plan */
     int serve_mode = 0, serve_port = 8484;
+    int want_metal = 0, chk_gpu = 0;
     float temp = 0.2f, topp = 1.0f, penalty = 1.05f;   /* LFM2.5 generation defaults */
     int topk = 80;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--serve")) serve_mode = 1;
         else if (!strcmp(argv[i], "--port") && i + 1 < argc) serve_port = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--check")) check = 1;
+        else if (!strcmp(argv[i], "--metal")) want_metal = 1;
+        else if (!strcmp(argv[i], "--check-gpu")) chk_gpu = 1;
         else if (!strcmp(argv[i], "--nobatch")) nobatch = 1;
         else if (!strcmp(argv[i], "--threads") && i + 1 < argc) nthreads = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--io") && i + 1 < argc) n_io = atoi(argv[++i]);
@@ -1753,6 +1874,11 @@ int main(int argc, char **argv) {
     (void)nthreads;
 #endif
 
+    if (want_metal || chk_gpu) g_use_gpu = gpu_init();
+    if (chk_gpu) return check_gpu();
+    if (want_metal && !g_use_gpu)
+        fprintf(stderr, "metal: no device available; using CPU\n");
+
     M m; memset(&m, 0, sizeof m);
     double t0 = now();
     init(&m, dir, n_io, ctx_override, ram_gb, kb, vb, kv_protect, rwin, kv_pbits);
@@ -1771,6 +1897,8 @@ int main(int argc, char **argv) {
             "%d slots/layer, dense %.1f MiB, ready in %.2fs\n",
             c->n_layers, nattn, c->n_layers - nattn, c->n_experts, c->topk,
             c->slots_per_layer, m.dense_len / 1048576.0, now() - t0);
+    if (g_use_gpu)
+        fprintf(stderr, "metal: %s (q4_0/q8_0 matmul offloaded)\n", gpu_name());
 
     if (serve_mode) {
         char tp[4096]; snprintf(tp, sizeof tp, "%s/tok.bin", dir);
