@@ -10,9 +10,9 @@ What this pins down (each is a way to be silently wrong):
   * pre_projection consumes 2 * backbone_hidden, post_projection returns backbone_hidden;
   * the tied lm_head, and no final logit softcap.
 
-It does NOT pin down the ORDER of the two halves of the concat, whether the embedding
-is scaled, or whether the backbone hidden is pre/post final norm -- those live in the
-generation glue, not the model.
+It does not pin down the order of the two halves of the concat, whether the embedding
+is scaled, or whether the backbone hidden is pre- or post-final-norm: those live in
+the generation glue rather than the model.
 """
 import json, os, sys
 import numpy as np

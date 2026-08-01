@@ -62,8 +62,8 @@ def mtp_forward(cfg, W, bh, emb_row, pos, K_slide, V_slide, K_full, V_full,
         cos, sin = rope_tables(hd, theta, np.array([pos]), partial)
         q = apply_rope(q[None], cos, sin)[0]          # [nh, hd]
 
-        # The head's mask is BIDIRECTIONAL. Full layers: attend everything. Sliding
-        # layers: t >= pos - W, i.e. W+1 positions -- one MORE than the backbone's
+        # The head's mask is bidirectional. Full layers: attend everything. Sliding
+        # layers: t >= pos - W, i.e. W+1 positions, one more than the backbone's
         # causal SWA (t >= pos - W + 1). Verified against HF; assuming "q_len==1 means
         # full attention" is wrong and costs ~30% on the attention output.
         KK = np.repeat(Ksrc, rep, axis=1)             # [T, nh, hd]
@@ -135,7 +135,7 @@ def main(dst, mtpsrc):
 
     SW = bcfg["sliding_window"]
 
-    # (a) EXACT fp32 weights: any error here is an ARCHITECTURE bug, so the bar is
+    # (a) exact fp32 weights: any error here is an architecture bug, so the bar is
     #     float precision. This is the check that matters.
     sd = {k: v.detach().numpy().astype(np.float32) for k, v in ref.state_dict().items()}
     Wx = {"embed_tokens": sd["model.embed_tokens.weight"], "norm": sd["model.norm.weight"],
@@ -154,7 +154,7 @@ def main(dst, mtpsrc):
         Wx[o + "mlp_up"] = sd[q + "mlp.up_proj.weight"]
         Wx[o + "mlp_down"] = sd[q + "mlp.down_proj.weight"]
 
-    # inputs_embeds = cat([last_token_embedding, last_hidden_state]): the FIRST half is
+    # inputs_embeds = cat([last_token_embedding, last_hidden_state]): the first half is
     # the embedding and the second is the hidden state, so split it that way.
     xl, xb = mtp_forward(cfg, Wx, emb[BB:], emb[:BB], pos, Ks, Vs, Kf, Vf, SW)
     el = np.abs(hf_logits - xl).max() / (np.abs(hf_logits).max() + 1e-9)
@@ -163,7 +163,7 @@ def main(dst, mtpsrc):
     print(f"  logits            max rel err {el:.3e}")
     print(f"  post_projection   max rel err {eb:.3e}   <- architecture check")
 
-    # (b) the q4_0 container: adds quantisation error on top (large on a RANDOM
+    # (b) the q4_0 container: adds quantisation error on top (large on a random
     #     fixture model, which is the worst case for q4_0 -- not representative).
     ql, qb = mtp_forward(cfg, W, emb[BB:], emb[:BB], pos, Ks, Vs, Kf, Vf, SW)
     dl = np.abs(hf_logits - ql).max() / (np.abs(hf_logits).max() + 1e-9)

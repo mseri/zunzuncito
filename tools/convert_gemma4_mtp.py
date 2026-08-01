@@ -2,7 +2,7 @@
 """
 convert_gemma4_mtp.py — Gemma-4 MTP drafter (Gemma4AssistantForCausalLM) -> container.
 
-WHAT THIS THING IS
+What this is
   Not a model. An EAGLE/MTP-style draft HEAD that runs inside the backbone's forward:
 
     * its layers have NO k_proj / v_proj / k_norm. num_kv_shared_layers == num_layers,
@@ -27,7 +27,7 @@ WHAT THIS THING IS
   Everything is small: 4 layers, hidden 1024, ~0.4 B params. It is resident, never
   streamed.
 
-OUTPUT: mtp.bin / mtp.idx / mtp.cfg.json, same conventions as the main container
+It writes mtp.bin / mtp.idx / mtp.cfg.json, same conventions as the main container
 (q4_0 matrices, f32 norms).
 """
 import argparse, json, os, sys

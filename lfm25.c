@@ -4,32 +4,21 @@
  * per-layer LRU instead of the OS page cache, batch-union prefill, a learned pin
  * set in usage.bin, and I/O threads. What differs is the model.
  *
- * THE BET. 8.3 B params, 1.5 B active, and the experts are TINY -- 32 per layer at
- * moe_intermediate_size 1792, ~5.9 MiB each at q4_0, 4 firing per token. A miss is
- * cheap and a layer's whole expert set is only 32 of them, so a modest cache holds
- * a large fraction of the model. (Gemma-4: 25 GB, 3.19 MiB experts, 128 per layer.)
+ * The bet is different from gemma4's. 8.3 B params, 1.5 B active, and the experts
+ * are tiny: 32 per layer at moe_intermediate_size 1792, ~5.9 MiB each at q4_0, 4
+ * firing per token. A miss is cheap and a layer's whole expert set is only 32 of
+ * them, so a modest cache holds a large fraction of the model. (Gemma-4, for
+ * contrast: 25 GB, 3.19 MiB experts, 128 per layer.)
  *
- * HYBRID ARCHITECTURE. 24 layers of which only 6 are attention; the other 18 mix
- * along the sequence with a short causal convolution (LFM's double-gated LIV block):
+ * Being hybrid costs the engine two things. Only 6 of the 24 layers are attention and
+ * the rest hold no KV, so the KV costs a quarter of what the layer count suggests.
+ * And those layers carry a recurrent conv state which, unlike a position-addressed KV
+ * cache, can only be advanced forwards: prefix reuse is allowed only when the new
+ * prompt strictly extends what was already absorbed (see conv_fwd, m->conv_pos).
+ * Getting that wrong does not crash, it silently corrupts the state.
  *
- *     B, C, x = chunk(in_proj(h), 3)
- *     y       = C * causal_depthwise_conv(B * x, kernel=conv_L)
- *     out     = out_proj(y)
- *
- * Two consequences for the engine. A conv layer has NO KV, so KV costs a quarter of
- * what the layer count suggests. And the conv carries a RECURRENT STATE (the last
- * conv_L-1 gated activations per channel) which, unlike a position-addressed KV
- * cache, can only be advanced forwards: prefix reuse is allowed only when strictly
- * EXTENDING what was already absorbed (see conv_fwd, m->conv_pos). Getting this
- * wrong does not crash, it silently corrupts the state.
- *
- * The router is SIGMOID, not softmax, and the expert bias participates in selection
- * only -- see route_row.
- *
- * MIXED PRECISION, after apex-quant: always-on tensors (attention, conv, dense MLP)
- * are q8_0, routed experts q4_0 except in the edge layers. Every tensor carries its
- * own format, so matvec dispatches per tensor; tools/convert_lfm25.py decides the
- * gradient.
+ * Mixed precision, after apex-quant: every tensor carries its own format and matvec
+ * dispatches per tensor. tools/convert_lfm25.py decides the gradient.
  *
  * No MTP, no DFlash: this model ships neither.
  *
@@ -67,7 +56,7 @@
 #define FMT_Q40 1
 #define FMT_Q80 2
 
-/* ------------------------------------------------------------------ config */
+/* config */
 typedef struct {
     int hidden, n_layers, n_heads, head_dim, n_kv_heads;
     int n_experts, topk, moe_inter, dense_inter, n_dense_layers, conv_L;
@@ -88,7 +77,6 @@ typedef struct {
     W router, expert_bias;                              /* MoE layers */
 } Layer;
 
-/* one cached expert */
 typedef struct { int eid; uint64_t used; uint8_t *buf; int pinned, busy; } Slot;
 
 typedef struct {
@@ -97,7 +85,7 @@ typedef struct {
     const uint8_t *dense;   size_t dense_len;
     int efd;                                /* experts.bin */
     /* Per layer, because the apex gradient gives different layers different expert
-     * formats and therefore different expert SIZES. Zero on conv/dense layers. */
+     * formats and therefore different expert sizes. Zero on conv/dense layers. */
     int64_t esz[MAXL], gate_b[MAXL], down_b[MAXL];
     int expert_fmt[MAXL];
     int64_t *eoff;                          /* [layer*n_experts + eid] -> file offset */
@@ -106,7 +94,7 @@ typedef struct {
     uint64_t tick;
     int64_t hit, miss;
 
-    /* LEARNED HOT-EXPERT PIN SET. Expert usage is heavily skewed and the hot set is
+    /* Learned hot-expert pin set. Expert usage is heavily skewed and the hot set is
      * stable across prompts, so routing is counted per (layer, expert), persisted to
      * usage.bin, and on the next run the top-N per layer are pinned into slots the
      * LRU may never evict -- a policy the OS page cache cannot express. */
@@ -115,7 +103,7 @@ typedef struct {
     char usage_path[4096];
 
     /* KV, attention layers only (NULL on conv layers). Every attention layer is
-     * full-context -- LFM2.5 has no sliding window -- so position t lives at index
+     * full-context, LFM2.5 having no sliding window, so position t lives at index
      * t and there is no ring aliasing. With --kvq the older positions are
      * TurboQuant-compressed and the most recent `rwin` stay f32. */
     float **kv_k, **kv_v;
@@ -124,7 +112,7 @@ typedef struct {
     Kvq *qk, *qv;
     int rwin;
 
-    /* CONV RECURRENT STATE, [n_layers][(conv_L-1) * hidden], oldest position first.
+    /* Conv recurrent state, [n_layers][(conv_L-1) * hidden], oldest position first.
      * conv_pos is how many positions have been absorbed; it is why prefix reuse is
      * restricted (see forward()). */
     float **conv_state;
@@ -143,12 +131,12 @@ typedef struct {
     int qcap, qhead, qtail, qcount, inflight, stop;
 } M;
 
-/* METAL. Off by default here, unlike gemma4: this model is 1.5 B active params over
+/* Metal is off by default here, as in gemma4: this model is 1.5 B active params over
  * ~5.9 MiB experts, so a decode step is a stream of small matvecs, and per-dispatch
  * latency plus the activation copy usually costs more than the arithmetic saved.
- * --metal turns it on -- worth trying on prefill, where the batch is large enough to
- * amortise a dispatch, and on a machine whose whole container is resident. Every GPU
- * call can decline (returning 0) and the CPU path runs instead. */
+ * --metal turns it on. It is worth trying on prefill, where the batch is large
+ * enough to amortise a dispatch, and on a machine whose whole container is resident.
+ * Every GPU call can decline (returning 0) and the CPU path runs instead. */
 static int g_use_gpu = 0;
 
 static double now(void) {
@@ -161,7 +149,7 @@ static void *xmalloc(size_t n) {
     return p;
 }
 
-/* ---------------------------------------------------------- format dispatch */
+/* format dispatch */
 static inline int64_t fmt_row_bytes(int fmt, int I) {
     return fmt == FMT_Q40 ? q40_row_bytes(I)
          : fmt == FMT_Q80 ? q80_row_bytes(I)
@@ -185,7 +173,7 @@ MAYBE_UNUSED static inline float wdot_f32(int fmt, const uint8_t *w, const float
     return (float)s;
 }
 
-/* ------------------------------------------------------------------ manifest */
+/* manifest */
 typedef struct { char name[96]; int64_t off, len; int fmt, O, I; } DEnt;
 
 static W dense_bind(const DEnt *dd, int ndense, const uint8_t *blob, const char *want) {
@@ -339,7 +327,7 @@ static void manifest(M *m, const char *dir) {
 #endif
 }
 
-/* ------------------------------------------------------------------ kernels */
+/* kernels */
 static void rmsnorm(float *o, const float *x, const float *w, int D, float eps) {
     double s = 0;
     for (int i = 0; i < D; i++) s += (double)x[i] * x[i];
@@ -355,9 +343,9 @@ static inline float silu(float x) {
  * can separate the int8-activation approximation from an actual bug. */
 static void matvec(float *y, const W *w, const float *x, int8_t *xq, float *sx) {
     int64_t rb = fmt_row_bytes(w->fmt, w->I);
-    /* The Metal kernels consume f32 activations, so they reproduce the wdot_f32 path
-     * -- i.e. MORE accurate than the int8 default, not less. They decline for f32
-     * tensors and for weights that are not GPU-mapped. */
+    /* The Metal kernels consume f32 activations, so they reproduce the wdot_f32
+     * path, more accurate than the int8 default rather than less. They decline for
+     * f32 tensors and for weights that are not GPU-mapped. */
     if (g_use_gpu && gpu_matmul(w->fmt, y, w->q, x, w->O, w->I, 1)) return;
     if (w->fmt == FMT_F32) {
         #pragma omp parallel for schedule(static)
@@ -378,9 +366,7 @@ static void matvec(float *y, const W *w, const float *x, int8_t *xq, float *sx) 
 #endif
 }
 
-/* rotate_half RoPE, full rotation (LFM2.5 has no partial rotary factor).
- *
- * The dimension loop is outside the head loop on purpose: cos/sin do not depend on
+/* The dimension loop is outside the head loop on purpose: cos/sin do not depend on
  * the head, so this is head_dim/2 transcendentals per call, not n_heads times that. */
 static void rope(float *x, int H, int D, int pos, const float *invf) {
     int half = D / 2;
@@ -439,7 +425,7 @@ static void matmul(float *Y, const W *w, const float *X, int S,
 #endif
 }
 
-/* ------------------------------------------------------------------ expert I/O */
+/* expert I/O */
 static void slot_read(M *m, int layer, int eid, uint8_t *buf) {
     int64_t off = m->eoff[(int64_t)layer * m->c.n_experts + eid];
     int64_t sz = m->esz[layer];
@@ -489,8 +475,8 @@ static int slot_for(M *m, int layer, int eid, int *need_io) {
                 layer);
         exit(1);
     }
-    /* Do NOT publish the eid yet: the buffer holds the evicted expert until the I/O
-     * completes, and the worker sets s->eid when the bytes are actually there. */
+    /* Do not publish the eid yet: the buffer holds the evicted expert until the I/O
+     * completes, and the worker sets s->eid once the bytes are actually there. */
     base[lru].eid = -1;
     base[lru].used = ++m->tick;
     *need_io = 1;
@@ -498,7 +484,7 @@ static int slot_for(M *m, int layer, int eid, int *need_io) {
     return lru;
 }
 
-/* ------------------------------------------------------------------ forward */
+/* forward */
 typedef struct {
     float *x, *xn, *q, *k, *v, *o, *tmp, *mlp;
     float *gate, *up, *eout, *h2, *bcx, *cy;
@@ -521,17 +507,10 @@ typedef struct {
     int S;
 } Buf;
 
-/* Sigmoid router whose expert bias participates in SELECTION ONLY:
- *
- *     routing_weights    = sigmoid(logits)
- *     scores_for_routing = routing_weights + expert_bias      <- selection
- *     idx                = topk(scores_for_routing)
- *     w                  = routing_weights[idx]               <- NOT the biased score
- *     if norm_topk_prob: w /= (sum(w) + 1e-6)
- *     w                 *= routed_scaling_factor
- *
- * The bias is a load-balancing nudge; letting it leak into the weight would rescale
- * every expert's contribution by an amount unrelated to the input. */
+/* expert_bias picks the experts but never weights them: topk sees sigmoid + bias,
+ * while the weight applied is the unbiased sigmoid. The bias is a load-balancing
+ * nudge, and letting it leak into the weight would rescale every expert's
+ * contribution by an amount unrelated to the input. */
 static void route_row(M *m, int li, const float *xn, int *idx, float *wts, Buf *b) {
     Cfg *c = &m->c;
     Layer *L = &m->L[li];
@@ -550,7 +529,7 @@ static void route_row(M *m, int li, const float *xn, int *idx, float *wts, Buf *
         const float *r = RP + (size_t)e * D;
         double v = 0;
         for (int i = 0; i < D; i++) v += (double)r[i] * xn[i];
-        float s = 1.0f / (1.0f + expf(-(float)v));       /* sigmoid, not softmax */
+        float s = 1.0f / (1.0f + expf(-(float)v));
         b->rwt[e] = s;
         float sel = c->use_expert_bias ? s + BI[e] : s;  /* selection score only */
         int j = K;
@@ -566,14 +545,13 @@ static void route_row(M *m, int li, const float *xn, int *idx, float *wts, Buf *
     for (int j = 0; j < K; j++) wts[j] *= c->routed_scaling;
 }
 
-/* Apply one loaded expert to every row that routed to it. SwiGLU, silu (not gelu):
- * w2( silu(w1 x) * w3 x ).
+/* Apply one loaded expert to every row that routed to it.
  *
- * The loop order matters. Parallelising over ROWS -- one thread per token -- walks
- * the whole expert per thread, streaming its ~5.9 MiB once per row (~16x redundant
- * traffic at a 128-token batch). Parallelising over OUTPUT rows instead loads a
- * weight row once and dots it against every activation while it is still in L1:
- * same flops, nrows-fold less bandwidth. */
+ * The loop order matters. Parallelising over token rows -- one thread per token --
+ * walks the whole expert per thread, streaming its ~5.9 MiB once per row (~16x
+ * redundant traffic at a 128-token batch). Parallelising over output rows instead
+ * loads a weight row once and dots it against every activation while it is still in
+ * L1: same flops, nrows-fold less bandwidth. */
 static void expert_apply_batch_cpu(M *m, int fmt, const uint8_t *G, const uint8_t *U,
         const uint8_t *Dn, size_t grb, size_t drb, const float *X, float *OUT,
         const int *rows, int nrows, const float *w, Buf *b) {
@@ -691,9 +669,9 @@ static void expert_apply(M *m, int li, const uint8_t *blob, const float *X, floa
     }
 }
 
-/* BATCH-UNION MoE. Token-at-a-time prefill reads topk experts per layer per token,
+/* Batch-union MoE. Token-at-a-time prefill reads topk experts per layer per token,
  * but the S rows of a batch collectively route to at most min(n_experts, topk*S)
- * DISTINCT experts, so the loop is inverted: gather expert -> {rows that chose it},
+ * distinct experts, so the loop is inverted: gather expert -> {rows that chose it},
  * read each once, apply it to all of them. A prompt of any length then reads at
  * most n_experts per layer.
  *
@@ -749,17 +727,18 @@ static void moe_start(M *m, int li, const float *X, float *out, int S, Buf *b) {
     /* moe_finish submits chunk n+1 before applying chunk n, so two chunks are
      * resident at once and need disjoint unpinned slots. Below 2 free slots there is
      * no room for the second chunk, so the overlap is dropped rather than evicting a
-     * slot still in use -- slower, but --pin near the slot count is the user's call.
+     * slot still in use. That is slower, but --pin near the slot count is the user's
+     * call.
      *
-     * free_slots/2 is the UPPER bound on a chunk, not the target. Take it whenever
-     * the union is small and the overlap disappears: at decode S is 1, so moe_nu is
-     * at most topk (4) against ~14 free slots, the whole union goes out as one chunk,
-     * moe_finish finds nothing left to submit, and the layer stalls on the read with
-     * nothing computing over it. This model can least afford that. Its router reads
-     * the same normed hidden the experts consume, so there is no early routing signal
-     * to prefetch from, and no dense branch sits beside the MoE either: chunk
-     * pipelining is the ONLY latency hiding it has. So aim for two chunks, and fall
-     * back to the bound only where the bound actually binds. */
+     * free_slots/2 bounds a chunk from above; it is not the target. Taking it
+     * whenever the union is small makes the overlap disappear: at decode S is 1, so
+     * moe_nu is at most topk (4) against ~14 free slots, the whole union goes out as
+     * one chunk, moe_finish finds nothing left to submit, and the layer stalls on the
+     * read with nothing computing over it. This model can least afford that. Its
+     * router reads the same normed hidden the experts consume, so there is no early
+     * routing signal to prefetch from, and no dense branch sits beside the MoE
+     * either: chunk pipelining is its only latency hiding. So aim for two chunks, and
+     * fall back to the bound only where the bound actually binds. */
     int free_slots = c->slots_per_layer - m->npin;
     b->moe_prefetch = free_slots >= 2;
     if (b->moe_prefetch) {
@@ -803,7 +782,7 @@ static void moe_finish(M *m, int li, const float *X, float *out, int S, Buf *b) 
     }
 }
 
-/* ------------------------------------------------------------------ KV
+/* KV
  * With --kvq the f32 ring holds the most recent `rwin` positions and the occupant
  * about to be overwritten is TurboQuant-encoded on its way out, so recent tokens
  * always attend at full precision -- 3-4 bit compression without a residual window
@@ -816,7 +795,7 @@ static void kv_write(M *m, int li, int pos, int nkv, int hd, int cap,
     int slot = pos % W;
 
     if (quant) {
-        /* Evict whatever the slot ACTUALLY holds rather than assuming pos-W: on a
+        /* Evict whatever the slot actually holds rather than assuming pos-W: on a
          * rewritten position that would encode the wrong vector into the packed
          * store, unrecoverably. */
         int old = m->ring_pos[li][slot];
@@ -838,13 +817,13 @@ static void kv_write(M *m, int li, int pos, int nkv, int hd, int cap,
 /* There is deliberately no kv_read: attn_fwd reads the cache in place, decoding a
  * compressed key only when the residual ring does not hold the position. */
 
-/* ------------------------------------------------------------- the two mixers */
+/* the two mixers */
 
-/* SHORT CAUSAL CONVOLUTION (Lfm2MoeShortConv), one position at a time.
+/* Short causal convolution (Lfm2MoeShortConv), one position at a time.
  *
- * Depthwise with kernel conv_L over the SEQUENCE, so per channel it is a dot of
+ * Depthwise with kernel conv_L along the sequence, so per channel it is a dot of
  * conv_L taps against the last conv_L values of (B*x). `state` holds the previous
- * conv_L-1 of those, OLDEST FIRST, so tap k pairs with state[k] and the last tap
+ * conv_L-1 of those, oldest first, so tap k pairs with state[k] and the last tap
  * with the current value. Positions must be fed in order: this is a recurrence, not
  * a cache, and it cannot be rewound. */
 static void conv_fwd(M *m, int li, const float *Xn, float *OUT, int S, Buf *b) {
@@ -875,8 +854,6 @@ static void conv_fwd(M *m, int li, const float *Xn, float *OUT, int S, Buf *b) {
     matmul(OUT, &L->conv_out, b->cy, S, b->mxq, b->msx);
 }
 
-/* GQA attention: q/k RMSNorm per head, full-rotation RoPE, causal over the whole
- * context (no sliding window), scaled by 1/sqrt(head_dim). */
 static void attn_fwd(M *m, int li, const float *Xn, float *OUT, int S,
                      int pos_base, Buf *b) {
     Cfg *c = &m->c;
@@ -956,13 +933,13 @@ static void attn_fwd(M *m, int li, const float *Xn, float *OUT, int S,
     matmul(OUT, &L->o_proj, b->o, S, b->mxq, b->msx);
 }
 
-/* ------------------------------------------------------------------ layer
+/* layer
  *
  *     h = h + operator(operator_norm(h))      operator = attention | short conv
  *     h = h + feed_forward(ffn_norm(h))       ffn      = dense SwiGLU | MoE
  *
- * Note what is NOT here: no dense branch alongside the MoE, so unlike gemma4 there
- * is no dense-MLP arithmetic to hide the expert reads behind. What remains is chunk
+ * Note what is absent: no dense branch alongside the MoE, so unlike gemma4 there is
+ * no dense-MLP arithmetic to hide the expert reads behind. What remains is chunk
  * n+1's I/O overlapping chunk n's compute, plus batch-union. */
 static void layer_fwd(M *m, int li, float *H, int S, int pos_base, Buf *b) {
     Cfg *c = &m->c;
@@ -1017,10 +994,10 @@ static void conv_reset(M *m) {
     m->conv_pos = 0;
 }
 
-/* Run S tokens from pos_base. logits may be NULL (prefill), [S,vocab], or -- the
- * common case -- only the last row via `last_only`.
+/* Run S tokens from pos_base. logits may be NULL (prefill) or [S,vocab]; the common
+ * case, only the last row, goes through `last_only`.
  *
- * pos_base == 0 means a NEW SEQUENCE and resets the conv recurrence. Any other
+ * pos_base == 0 starts a new sequence and resets the conv recurrence. Any other
  * pos_base must equal conv_pos: the conv state cannot be rewound, so a caller
  * reusing a cached prefix has to be strictly extending it. */
 static void forward_chunk(M *m, const int *ids, int S, int pos_base,
@@ -1076,7 +1053,7 @@ static void forward(M *m, const int *ids, int S, int pos_base,
     }
 }
 
-/* ------------------------------------------------------------------ pinning */
+/* pinning */
 typedef struct { int64_t n; int e; } EC;
 static int ec_desc(const void *a, const void *b) {
     int64_t x = ((const EC *)a)->n, y = ((const EC *)b)->n;
@@ -1136,17 +1113,17 @@ static void pin_save(M *m) {
     free(u);
 }
 
-/* ------------------------------------------------------------------ init */
+/* init */
 static void init(M *m, const char *dir, int n_io, int ctx_override, double ram_gb,
                  int kb, int vb, int kv_protect, int rwin, int kv_pbits) {
     m->rwin = rwin > 0 ? rwin : 128;
     manifest(m, dir);
     Cfg *c = &m->c;
 
-    /* --ctx overrides what the container was converted with, and may go UP: the
+    /* --ctx overrides what the container was converted with, and may go up: the
      * container's ctx only fixed slots_per_layer, and the weights do not care.
-     * Whether that overshoots the conversion's budget is a question about BYTES,
-     * not the context number -- with --kvq a longer context can cost less -- so the
+     * Whether that overshoots the conversion's budget depends on bytes rather than
+     * on the context number -- with --kvq a longer context can cost less -- so the
      * comparison happens below, once the real KV size is known. */
     int ctx_planned = c->ctx;
     if (ctx_override > 0) c->ctx = ctx_override;
@@ -1226,13 +1203,13 @@ static void init(M *m, const char *dir, int n_io, int ctx_override, double ram_g
                     quant ? "" : "; --kvq would cut it a lot");
     }
 
-    /* ------------------------------------------------- expert-cache plan
+    /* expert-cache plan
      * slots_per_layer is the only thing the conversion's --ram fixed, and nothing in
      * the container depends on it: experts are read one at a time and the cache is
-     * pure LRU. So a runtime --ram re-runs the planner of tools/convert_lfm25.py
-     * against numbers now known exactly -- the resident dense blob and the KV just
-     * allocated. Slots are budgeted against the LARGEST expert so the plan is safe
-     * on every layer (mixed precision makes the edge layers bigger). */
+     * a plain LRU. So a runtime --ram re-runs the planner of tools/convert_lfm25.py
+     * against figures now known -- the resident dense blob and the KV just
+     * allocated. Slots are budgeted against the largest expert so the plan holds on
+     * every layer (mixed precision makes the edge layers bigger). */
     if (ram_gb > 0) {
         int64_t esz_max = 0, esz_sum = 0, nmoe = 0;
         for (int l = 0; l < c->n_layers; l++)
@@ -1278,7 +1255,7 @@ static void init(M *m, const char *dir, int n_io, int ctx_override, double ram_g
             for (int i = 0; i < c->slots_per_layer; i++) {
                 Slot *s = &m->slots[(size_t)l * c->slots_per_layer + i];
                 s->eid = -1;
-                /* sized for THIS layer's format: edge-layer experts are bigger */
+                /* sized for this layer's format: edge-layer experts are bigger */
                 s->buf = m->esz[l] ? xmalloc(m->esz[l]) : NULL;
                 /* Map each slot once, up front: the streaming layer overwrites the
                  * bytes but never the address, so the mapping stays valid all run. */
@@ -1311,7 +1288,7 @@ static Buf *bufs(M *m, int Smax) {
     if (wide < D) wide = D;
     if (wide < imax) wide = imax;
     if (wide < 3 * D) wide = 3 * D;              /* conv in_proj output */
-    /* widest CONTRACTED dimension any matmul sees (lm_head contracts over D, not
+    /* widest contracted dimension any matmul sees (lm_head contracts over D, not
      * vocab); the batched activation scratch is sized by it */
     int cmax = D > imax ? D : imax;
 
@@ -1357,7 +1334,7 @@ static Buf *bufs(M *m, int Smax) {
     return b;
 }
 
-/* ------------------------------------------------------------------ sampling */
+/* sampling */
 typedef struct { float p; int i; } PI;
 static int pi_desc(const void *a, const void *b) {
     float x = ((const PI *)a)->p, y = ((const PI *)b)->p;
@@ -1379,7 +1356,7 @@ static void repetition_penalty(float *logits, int V, const int *ids, int n,
     }
 }
 
-/* temperature + top-k + nucleus. Greedy when temp <= 0. top_k is applied BEFORE
+/* temperature + top-k + nucleus. Greedy when temp <= 0. top_k is applied before
  * top_p, which is the order HF uses. LFM2.5's own generation defaults are
  * temp 0.2 / top_k 80 (generation_config.json). */
 static int sample(const float *logits, int V, float temp, float topp, int topk,
@@ -1420,18 +1397,9 @@ static int sample(const float *logits, int V, float temp, float topp, int topk,
     return buf[n - 1].i;
 }
 
-/* ------------------------------------------------------------ chat template
- *
- * Plain ChatML, transcribed from LFM2.5's chat_template.jinja:
- *
- *   <|startoftext|>
- *   [<|im_start|>system\n SYSTEM <|im_end|>\n]
- *   <|im_start|>user\n USER <|im_end|>\n
- *   <|im_start|>assistant\n
- *
- * There is no thinking toggle: LFM2.5 decides for itself, emitting <think>...</think>
- * inside the assistant turn, and --think forces it by pre-filling the opening tag.
- * Generation stops on <|im_end|>. */
+/* Plain ChatML, transcribed from LFM2.5's chat_template.jinja. There is no thinking
+ * toggle: the model decides for itself, emitting <think>...</think> inside the
+ * assistant turn, and --think forces it by pre-filling the opening tag. */
 static void chat_prompt(char *out, size_t cap, const char *sys,
                         const char *user, int think) {
     size_t n = 0;
@@ -1444,7 +1412,7 @@ static void chat_prompt(char *out, size_t cap, const char *sys,
     #undef ADD
 }
 
-/* ------------------------------------------- OpenAI-compatible local server */
+/* OpenAI-compatible local server */
 typedef struct {
     M *model;
     Buf *buffers;
@@ -1624,8 +1592,8 @@ static int lfm_serve_chat(LfmServerContext *ctx, int fd, jval *root) {
 
     pthread_mutex_lock(&ctx->generation_mu);
     atomic_store(&ctx->cancel, 0);
-    /* PREFIX REUSE IS RESTRICTED. The conv recurrence only moves forwards, so the
-     * cached state is reusable only when this prompt STRICTLY EXTENDS what was
+    /* Prefix reuse is restricted here. The conv recurrence only moves forwards, so
+     * the cached state is reusable only when this prompt strictly extends what was
      * absorbed. A diverging prefix -- or even an identical prompt, which would need
      * position np-1 replayed -- is reprocessed from scratch. */
     int common = 0;
@@ -1711,7 +1679,7 @@ static int run_lfm_server(M *m, Buf *buffers, LfmTok *tokenizer, const char *mod
     free(ctx.cached_ids); pthread_mutex_destroy(&ctx.generation_mu); return ok?0:1;
 }
 
-/* ------------------------------------------------------------------ main */
+/* main */
 /* Numerically diff the Metal kernels against the CPU reference on random data, in
  * both formats. The Metal path cannot be tested where it was written -- it is the
  * user's machine that decides whether it is right. Shapes cover the real ones. */
@@ -1853,9 +1821,9 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--pbits") && i + 1 < argc) kv_pbits = atoi(argv[++i]);
         /* end of flags: whatever follows is the prompt, even if it starts with '-' */
         else if (!strcmp(argv[i], "--")) { if (i + 1 < argc && !prompt) prompt = argv[++i]; }
-        /* ANY leading dash, not just a double one. A single-dash typo (-kvq for
+        /* Any leading dash, not just a double one. A single-dash typo (-kvq for
          * --kvq) must not fall through to the positional branch: it would silently
-         * become the PROMPT and quietly change what the model generates. */
+         * become the prompt and change what the model generates. */
         else if (argv[i][0] == '-') {
             fprintf(stderr, "unknown flag: %s\n\n", argv[i]);
             usage(argv[0], stderr);
@@ -1922,7 +1890,7 @@ int main(int argc, char **argv) {
         for (char *s = strchr(qs, '['); s && *s && *s != ']'; s++)
             if (*s >= '0' && *s <= '9') { ids[np++] = strtol(s, &s, 10); s--; }
 
-        /* The oracle runs on the DEQUANTISED container weights: comparing against an
+        /* The oracle runs on the dequantised container weights: comparing against an
          * fp32 reference would conflate engine bugs with the quantiser's own error. */
         snprintf(p, sizeof p, "%s/deq_logits.f32", dir);
         f = fopen(p, "rb");
@@ -2010,7 +1978,7 @@ int main(int argc, char **argv) {
             if (np <= 0) { fprintf(stderr, "empty prompt\n"); return 1; }
         }
 
-        /* ---- interactive multi-turn chat (--chat, or no prompt for compatibility) ---- */
+        /* interactive multi-turn chat (--chat, or no prompt for compatibility) */
         int interactive = (chat_mode || !prompt);
         int first_prompt = (chat_mode && prompt != NULL);
         int *cached_ids = NULL;
@@ -2068,7 +2036,7 @@ int main(int argc, char **argv) {
                 free(chat);
 
                 /* Same restriction as the server: reuse the conv state only when
-                 * this prompt strictly EXTENDS what has already been absorbed. */
+                 * this prompt strictly extends what has already been absorbed. */
                 int common = 0;
                 while (common < cached_len && common < np && cached_ids[common] == ids[common])
                     common++;
@@ -2077,7 +2045,7 @@ int main(int argc, char **argv) {
                 else
                     forward(&m, ids, np, 0, logits, 1, b);
             } else {
-                /* ---- one-shot prefill (prompt given on the command line) ---- */
+                /* one-shot prefill (prompt given on the command line) */
                 double t0p = now();
                 forward(&m, ids, np, 0, logits, 1, b);
                 tpre = now() - t0p;

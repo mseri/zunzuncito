@@ -1,13 +1,13 @@
 /* q40.h — Q4_0 block-scale int4 for colibrì (fmt=4).
  *
- * WHY a fourth format. colibrì's native int4 (fmt=2) uses ONE f32 scale per row.
- * Gemma-4's QAT checkpoints are trained against Q4_0: 32-weight blocks, each with
- * its own fp16 scale. Re-blocking those weights onto per-row scales throws away
+ * A fourth format, because colibrì's native int4 (fmt=2) uses a single f32 scale per
+ * row. Gemma-4's QAT checkpoints are trained against Q4_0: 32-weight blocks, each
+ * with its own fp16 scale. Re-blocking those weights onto per-row scales throws away
  * exactly the structure QAT optimised for — you'd pay for QAT and get RTN quality.
  * So we carry the block scales through to the kernel instead.
  *
- * LAYOUT (bit-identical to llama.cpp's block_q4_0, so a GGUF's expert tensors can
- * be memcpy'd straight into the container):
+ * The layout is bit-identical to llama.cpp's block_q4_0, so a GGUF's expert tensors
+ * can be memcpy'd straight into the container:
  *
  *   block = 32 weights = 18 bytes
  *     [0..1]   fp16 d          (scale)
@@ -16,13 +16,13 @@
  *              qs[j] high nibble -> weight j + 16
  *
  * A row of I weights is I/32 such blocks, laid out contiguously; a tensor [O,I]
- * is O such rows. I MUST be a multiple of 32 (Gemma-4's hidden/inter dims are).
+ * is O such rows. I must be a multiple of 32 (Gemma-4's hidden/inter dims are).
  * Unlike fmt=2 there is no separate `.qs` scale tensor: the scales are interleaved
  * in the weight bytes. That is a feature for a streaming engine — the scales ride
- * along in the SAME pread as the weights, so an expert load is ONE contiguous read
- * instead of weights + a second seek for the scale array.
+ * along in the same pread as the weights, so an expert load is one contiguous read
+ * rather than weights plus a second seek for the scale array.
  *
- * ACTIVATIONS are quantised Q8_0-style, also in blocks of 32 (one f32 scale per
+ * Activations are quantised Q8_0-style, also in blocks of 32 (one f32 scale per
  * block, held separately), matching the weight blocking so the dot decomposes as
  *   sum_blocks  d_w[b] * d_x[b] * <q_w[b] - 8, q_x[b]>
  * and the inner product is pure integer.
@@ -41,8 +41,8 @@
 #define Q40_BLK 32
 #define Q40_BLK_BYTES 18   /* 2 (fp16 d) + 16 (nibbles) */
 
-/* ---- fp16 <-> f32. Scalar, no F16C dependency: used only on scales (I/32 per
- * row), never in the inner loop, so a table-free bit-twiddle is plenty. ---- */
+/* fp16 <-> f32. Scalar, no F16C dependency: used only on scales (I/32 per
+ * row), never in the inner loop, so a table-free bit-twiddle is plenty. */
 static inline float q40_fp16_to_f32(uint16_t h){
     uint32_t s=(uint32_t)(h>>15)&1u, e=(uint32_t)(h>>10)&0x1fu, m=(uint32_t)h&0x3ffu;
     uint32_t bits;
@@ -79,7 +79,7 @@ static inline uint16_t q40_f32_to_fp16(float f){
     return (uint16_t)((s<<15)|((uint32_t)e<<10)|half);
 }
 
-/* ---- quantise one f32 row of I weights into I/32 q4_0 blocks ---- */
+/* quantise one f32 row of I weights into I/32 q4_0 blocks */
 static inline void q40_quant_row(const float *w, uint8_t *dst, int I){
     for(int b=0;b<I/Q40_BLK;b++){
         const float *x=w+b*Q40_BLK;
@@ -120,7 +120,7 @@ static inline void q40_dequant_row(const uint8_t *src, float *w, int I){
     }
 }
 
-/* ---- Q8_0-style activation quantisation: blocks of 32, one f32 scale each ---- */
+/* Q8_0-style activation quantisation: blocks of 32, one f32 scale each */
 static inline void q40_quant_act(const float *x, int8_t *xq, float *sx, int I){
     for(int b=0;b<I/Q40_BLK;b++){
         const float *v=x+b*Q40_BLK; int8_t *o=xq+b*Q40_BLK;

@@ -122,7 +122,7 @@ def forward(C, ids):
         h = rmsnorm(x, C.w(p + "operator_norm")[0], eps)
 
         if c["layer_types"][li]:
-            # ---- GQA attention, full causal, scaled by 1/sqrt(head_dim) ----
+            # GQA attention, full causal, scaled by 1/sqrt(head_dim)
             q = (h @ C.w(p + "q_proj").T).reshape(S, H, hd)
             k = (h @ C.w(p + "k_proj").T).reshape(S, nkv, hd)
             v = (h @ C.w(p + "v_proj").T).reshape(S, nkv, hd)
@@ -139,7 +139,7 @@ def forward(C, ids):
             o = np.einsum("hqk,khd->qhd", att, v).reshape(S, H * hd)
             y = o @ C.w(p + "o_proj").T
         else:
-            # ---- short causal depthwise conv: y = C * conv(B * x) ----
+            # short causal depthwise conv: y = C * conv(B * x)
             bcx = h @ C.w(p + "conv_in").T          # [S, 3D]
             Bg, Cg, xv = bcx[:, :D], bcx[:, D:2 * D], bcx[:, 2 * D:]
             g = Bg * xv                             # [S, D]
@@ -150,18 +150,18 @@ def forward(C, ids):
 
         x = x + y
 
-        # ---- feed forward ----
+        # feed forward
         h = rmsnorm(x, C.w(p + "ffn_norm")[0], eps)
         if li < ND:
             y = (silu(h @ C.w(p + "mlp_gate").T) * (h @ C.w(p + "mlp_up").T)) \
                 @ C.w(p + "mlp_down").T
         else:
             logits = h @ C.w(p + "router").T        # [S, NE]
-            probs = 1.0 / (1.0 + np.exp(-logits))   # SIGMOID, not softmax
+            probs = 1.0 / (1.0 + np.exp(-logits))   # sigmoid, not softmax
             bias = C.w(p + "expert_bias")[0]
             sel = probs + bias if c["use_expert_bias"] else probs
             idx = np.argsort(-sel, axis=-1, kind="stable")[:, :K]
-            wt = np.take_along_axis(probs, idx, -1)  # the UNBIASED sigmoid
+            wt = np.take_along_axis(probs, idx, -1)  # the unbiased sigmoid
             if c["norm_topk_prob"]:
                 wt = wt / (wt.sum(-1, keepdims=True) + 1e-6)
             wt = wt * c["routed_scaling"]

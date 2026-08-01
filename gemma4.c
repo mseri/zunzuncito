@@ -1,29 +1,29 @@
 /* gemma4.c — Gemma-4 26B-A4B on a small-RAM machine, by streaming experts.
  *
- * THE BET. Gemma-4 26B-A4B is 25 GB of weights of which ~3.8 B params activate per
- * token. At q4_0 that is 1.31 GB of dense weights (resident) + 12.9 GB of routed
- * experts (3840 of them, 3.19 MiB each). On a 4-8 GB machine the expert set does not
- * fit, and mmap leaves eviction to the kernel's global 4 KB-page LRU, which knows
- * nothing about expert granularity, expert hotness, or what the next layer needs. We
- * keep an explicit expert-granular per-layer LRU instead, and we prefetch.
+ * Gemma-4 26B-A4B is 25 GB of weights of which ~3.8 B params activate per token. At
+ * q4_0 that is 1.31 GB of dense weights (resident) + 12.9 GB of routed experts (3840
+ * of them, 3.19 MiB each). On a 4-8 GB machine the expert set does not fit, and mmap
+ * leaves eviction to the kernel's global 4 KB-page LRU, which knows nothing about
+ * expert granularity, expert hotness, or what the next layer needs. We keep an
+ * explicit expert-granular per-layer LRU instead, and we prefetch.
  *
- * THE STRUCTURAL EDGE. In Gemma-4 the router reads the RAW post-attention residual:
+ * The prefetch is exact rather than predicted, because of how the layer is wired:
+ * the router reads the post-attention residual, before the dense MLP touches it.
  *
  *     residual = h_after_attn
  *     h1 = post_ffn_ln_1( mlp( pre_ffn_ln(residual) ) )      <- dense MLP branch
- *     idx, w = router(residual)                              <- !! needs only residual
+ *     idx, w = router(residual)                              <- needs only residual
  *     h2 = post_ffn_ln_2( experts( pre_ffn_ln_2(residual) ) )
  *     h  = residual + post_ffn_ln(h1 + h2);  h *= layer_scalar
  *
- * So the 8 expert ids are known BEFORE the dense MLP runs. We route first, fire the
+ * So the 8 expert ids are known before the dense MLP runs. We route first, fire the
  * expert reads at the I/O threads, then compute the MLP, hiding NVMe latency behind
- * arithmetic with no prediction involved -- colibri's GLM path needs PILOT to guess
- * next-layer routing at 71.6%, whereas here it is free and exact. A synchronous mmap
- * fault cannot overlap at all.
+ * arithmetic. colibri's GLM path needs PILOT to guess next-layer routing at 71.6%;
+ * here it is free and exact. A synchronous mmap fault cannot overlap at all.
  *
  * Everything is q4_0 (see q40.h): weights carry their fp16 scales inline, so one
- * expert is ONE contiguous 4096-aligned byte range -> one pread, no scale seek.
- * With 240 expert reads per token, read COUNT is the thing to minimise.
+ * expert is a single contiguous 4096-aligned byte range -> one pread, no scale seek.
+ * With 240 expert reads per token, the read count is what we minimise.
  *
  * Build:  cc -O3 -march=native -fopenmp gemma4.c -lm -lpthread -o gemma4
  */
@@ -53,7 +53,7 @@
 #define MAXTOPK 16
 #define MAXDRAFT 16
 
-/* ------------------------------------------------------------------ config */
+/* config */
 typedef struct {
     int hidden, n_layers, n_heads, head_dim, global_head_dim;
     int n_kv_heads, n_global_kv_heads, k_eq_v_global;
@@ -76,7 +76,6 @@ typedef struct {
     int has_v;                              /* 0 on global layers: V = k_proj (k_eq_v) */
 } Layer;
 
-/* one cached expert */
 typedef struct { int eid; uint64_t used; uint8_t *buf; int pinned, busy; } Slot;
 
 typedef struct {
@@ -91,18 +90,8 @@ typedef struct {
     uint64_t tick;
     int64_t hit, miss;
 
-    /* LEARNED HOT-EXPERT PIN SET.
-     * MoE expert usage is heavily skewed: a minority of experts take a large
-     * majority of the routing mass, and which ones is stable across prompts. So we
-     * count how often each (layer, expert) is routed to, persist those counts to
-     * usage.bin, and on the next run PIN the top-N per layer into slots that the
-     * LRU may never evict. On a 4 GB box only 21 of 128 slots per layer exist, so
-     * a pure LRU keeps re-reading the same hot experts after they get pushed out by
-     * a burst of cold ones; pinning makes the hot set immune to that.
-     * This is precisely the policy the OS page cache cannot express -- it has no
-     * idea what an "expert" is, let alone which are hot. */
     /* MTP draft head (Gemma4AssistantForCausalLM). Not a separate model: it runs
-     * inside this forward, attending into THIS model's KV. See mtp_forward. */
+     * inside this forward, attending into this model's own KV. See mtp_forward. */
     int mtp;                                /* head loaded */
     int mtp_L, mtp_D, mtp_BB, mtp_nh, mtp_hd, mtp_ghd, mtp_inter, mtp_vocab;
     float mtp_eps, mtp_theta_l, mtp_theta_g, mtp_partial;
@@ -113,7 +102,7 @@ typedef struct {
     int kv_last_slide, kv_last_full;        /* the layers whose KV the head shares */
 
     /* Post-norm hidden of each row of the last forward (small batches only).
-     * The MTP head needs the hidden of the row BEFORE the token it conditions on --
+     * The MTP head needs the hidden of the row before the token it conditions on --
      * see mtp_step -- so a single "last row" is not enough. */
     float *hid_batch;                       /* [(MAXDRAFT+2) * hidden] */
     int hid_rows;
@@ -132,11 +121,11 @@ typedef struct {
     W dflash_fc, dflash_hidden_norm, dflash_norm;
     /* Intermediate hidden states captured from the backbone at target layers.
      * Sized per-forward: [n_target_layers * rows * hidden], grown on demand so a
-     * long prefill can be captured too (the drafter must condition on the WHOLE
-     * prompt, not just the last batch -- acceptance collapses otherwise). */
+     * long prefill can be captured too. The drafter must condition on the whole
+     * prompt, not just the last batch, or acceptance collapses. */
     float *dflash_target_hidden;
     int dflash_target_hidden_cap;           /* capacity, in rows */
-    /* Persistent draft-side context KV cache, one entry per ABSOLUTE position, per
+    /* Persistent draft-side context KV cache, one entry per absolute position, per
      * draft layer: [ctx * nkv * hd]. This mirrors past_key_values_draft in the
      * reference implementation: every confirmed position's projected target hidden
      * (fc + hidden_norm + k/v_proj + k_norm + rope at its own position) is cached
@@ -147,22 +136,30 @@ typedef struct {
     float *dfa_concat, *dfa_th, *dfa_kv, *dfa_sx;
     int8_t *dfa_xq;
 
+    /* Learned hot-expert pin set. Expert usage is heavily skewed: a minority of
+     * experts take most of the routing mass, and which ones is stable across
+     * prompts. We count how often each (layer, expert) is routed to, persist the
+     * counts to usage.bin, and on the next run pin the top-N per layer into slots
+     * the LRU may never evict. On a 4 GB box only 21 of 128 slots per layer exist,
+     * so a pure LRU keeps re-reading the same hot experts after a burst of cold
+     * ones pushes them out. The OS page cache cannot express this policy: it has no
+     * idea what an "expert" is, let alone which are hot. */
     int64_t *ucount;                        /* [n_layers * n_experts] routing counts */
     int npin;                               /* pinned slots per layer */
     char usage_path[4096];
 
     /* KV. Sliding layers keep a ring of `sliding_window` positions; global layers
      * keep the full context. Both store K and V: attention_k_eq_v shares the
-     * PROJECTION, not the post-processing (K is k_norm'd and roped, V is v_norm'd
+     * projection but not the post-processing (K is k_norm'd and roped, V is v_norm'd
      * and neither), so the two tensors genuinely differ.
      *
      * With --kvq the older positions are TurboQuant-compressed and only the most
-     * recent `rwin` are kept in f32. All KV growth is in the 5 global layers --
-     * the sliding ones are permanently capped by the window -- so this is a
-     * context-length feature, not a general RAM one. */
+     * recent `rwin` are kept in f32. All KV growth is in the 5 global layers, since
+     * the sliding ones are permanently capped by the window, so this buys context
+     * length rather than RAM in general. */
     float **kv_k, **kv_v;                   /* f32 residual window (or the whole cache) */
     int **ring_pos;                         /* which position occupies each ring slot */
-    /* Highest CONFIRMED position. Speculation writes KV for positions that may be
+    /* Highest confirmed position. Speculation writes KV for positions that may be
      * rejected; those must never reach the TurboQuant store, because the packed
      * store is write-once-per-position in practice and a rejected draft baked into
      * it cannot be taken back out. INT_MAX = not speculating, everything confirmed. */
@@ -181,9 +178,9 @@ typedef struct {
     int qcap, qhead, qtail, qcount, inflight, stop;
 } M;
 
-/* Metal is opt-out, not opt-in: it auto-enables when a device is present. Set to 0
- * by --no-metal, or when gpu_init() fails for any reason. Every GPU call can decline
- * (returning 0) and the CPU path runs instead, so this is never load-bearing. */
+/* Auto-enables when a Metal device is present. Set to 0 by --no-metal, or when
+ * gpu_init() fails for any reason. Every GPU call can decline (returning 0), and the
+ * CPU path runs instead, so correctness never depends on Metal. */
 static int g_use_gpu = 0;
 
 /* DFlash iterative refinement (block-diffusion denoising). The reference drafts a
@@ -192,24 +189,24 @@ static int g_use_gpu = 0;
  * whose drafted token is confident (max softmax prob >= g_dflash_conf) are frozen
  * as real input embeddings, the rest re-masked, and the block re-drafted. This is
  * in-distribution for the model and raises the accepted prefix at near-zero cost
- * relative to the target verify. g_dflash_refine = number of EXTRA passes (0 = off,
+ * relative to the target verify. g_dflash_refine counts the extra passes (0 = off,
  * i.e. reference behaviour). */
 static int g_dflash_refine = 0;
 static float g_dflash_conf = 0.9f;
 
-/* Ring capacity of a layer's KV. Sliding layers need MORE than `sliding_window`
- * slots, for two independent reasons; neither is slack:
+/* Ring capacity of a layer's KV. Sliding layers need more than `sliding_window`
+ * slots, for two independent reasons:
  *
- *  +1  The MTP head's BIDIRECTIONAL sliding mask attends t >= pos - W (W+1
+ *  +1  The MTP head's bidirectional sliding mask attends t >= pos - W (W+1
  *      positions), one further back than the backbone's causal SWA
  *      (t >= pos - W + 1, W positions). Verified against HF.
  *
- *  +MAXDRAFT  Speculation writes AHEAD and then REWINDS. A verify forward writes
+ *  +MAXDRAFT  Speculation writes ahead and then rewinds. A verify forward writes
  *      positions P..P+d, but on rejection the next step restarts at P+1 and its
  *      attention reaches back to (P+1) - W. The span that must be simultaneously
- *      live is therefore W + d + 1, not W + 1. With a W+1 ring the lookahead evicts
- *      the oldest positions of the very window the next step needs, and output
- *      degrades and draft acceptance collapses with nothing to indicate why.
+ *      live is therefore W + d + 1. With a W+1 ring the lookahead evicts the oldest
+ *      positions of the very window the next step needs; output degrades and draft
+ *      acceptance collapses with nothing to indicate why.
  *
  * At W = 1024 this costs 18 extra positions. */
 static inline int kv_cap(const Cfg *c, int li) {
@@ -226,9 +223,8 @@ static void *xmalloc(size_t n) {
     return p;
 }
 
-/* ------------------------------------------------------------------ manifest */
-/* one row of dense.idx */
-typedef struct { char name[96]; int64_t off, len; int fmt, O, I; } DEnt;
+/* manifest */
+typedef struct { char name[96]; int64_t off, len; int fmt, O, I; } DEnt;  /* dense.idx row */
 
 /* Resolve a tensor name to a view into the dense blob.
  * File scope, not nested: nested functions are a GCC extension and clang rejects
@@ -367,9 +363,9 @@ static void manifest(M *m, const char *dir) {
     m->efd = open(p, O_RDONLY);
     if (m->efd < 0) { perror(p); exit(1); }
 
-    /* We keep our OWN expert cache, so letting the OS page-cache the same bytes
-     * double-buffers them -- on a 4 GB box that duplication is pure waste and it
-     * evicts the dense weights we actually need resident. Tell the kernel not to.
+    /* We keep our own expert cache, so letting the OS page-cache the same bytes
+     * double-buffers them: on a 4 GB box that duplication wastes memory and evicts
+     * the dense weights we need resident. Tell the kernel not to.
      * F_NOCACHE is macOS's O_DIRECT analogue; POSIX_FADV_RANDOM stops Linux from
      * doing useless readahead around 3.19 MiB random reads. */
 #if defined(__APPLE__)
@@ -380,7 +376,7 @@ static void manifest(M *m, const char *dir) {
 #endif
 }
 
-/* ------------------------------------------------------------------ kernels */
+/* kernels */
 static void rmsnorm(float *o, const float *x, const float *w, int D, float eps) {
     double s = 0;
     for (int i = 0; i < D; i++) s += (double)x[i] * x[i];
@@ -399,8 +395,8 @@ static inline float silu(float x) {
  * it lets --check separate the int8-activation approximation from an actual bug. */
 static void matvec(float *y, const W *w, const float *x, int8_t *xq, float *sx) {
     /* GPU first when available. The Metal kernel consumes f32 activations, so it is
-     * numerically the q40_dot_f32 path -- i.e. MORE accurate than the int8 default,
-     * not less. It declines (returns 0) if the weights are not GPU-mapped. */
+     * numerically the q40_dot_f32 path, more accurate than the int8 default rather
+     * than less. It declines (returns 0) if the weights are not GPU-mapped. */
     if (g_use_gpu && gpu_q40_matmul(y, w->q, x, w->O, w->I, 1)) return;
 #ifdef COLI_F32ACT
     (void)xq; (void)sx;
@@ -417,15 +413,15 @@ static void matvec(float *y, const W *w, const float *x, int8_t *xq, float *sx) 
 
 /* Batched Y = W X, W q4_0 [O,I], X is [S,I] row-major, Y is [S,O] row-major.
  * One GPU dispatch fills an O*S grid, amortising launch latency and keeping the
- * device busy -- the whole point of running a block (S>1) through DFlash. Falls
- * back to S independent matvecs on the CPU path, which is what it did before. */
+ * device busy, which is why DFlash runs a whole block (S>1) at once. On the CPU
+ * path this falls back to S independent matvecs. */
 static void matmul(float *Y, const W *w, const float *X, int S, int8_t *xq, float *sx) {
     if (g_use_gpu && gpu_q40_matmul(Y, w->q, X, w->O, w->I, S)) return;
     for (int s = 0; s < S; s++)
         matvec(Y + (size_t)s * w->O, w, X + (size_t)s * w->I, xq, sx);
 }
 
-/* rotate_half RoPE. inv_freq's tail is ZERO on p-RoPE global layers (freq 0 =>
+/* rotate_half RoPE. inv_freq's tail is zero on p-RoPE global layers (freq 0 =>
  * cos 1, sin 0 => identity), so partial rotary needs no special case here. */
 static void rope(float *x, int H, int D, int pos, float theta, float partial) {
     int half = D / 2;
@@ -442,7 +438,7 @@ static void rope(float *x, int H, int D, int pos, float theta, float partial) {
     }
 }
 
-/* ------------------------------------------------------------------ expert I/O */
+/* expert I/O */
 static void slot_read(M *m, int layer, int eid, uint8_t *buf) {
     int64_t off = m->eoff[(int64_t)layer * m->c.n_experts + eid];
     for (int64_t o = 0; o < m->esz;) {
@@ -474,7 +470,7 @@ pthread_mutex_unlock(&m->mu);
 }
 /* Find or evict a slot for (layer,eid). Returns the slot index; sets *need_io if the
  * caller must fetch it. The LRU is per layer, so an expert only competes with the
- * other experts of its own layer -- under a global page LRU a hot layer-3 expert can
+ * other experts of its own layer; under a global page LRU a hot layer-3 expert can
  * be evicted by a cold layer-27 one. */
 static int slot_for(M *m, int layer, int eid, int *need_io) {
     int S = m->c.slots_per_layer;
@@ -482,15 +478,15 @@ static int slot_for(M *m, int layer, int eid, int *need_io) {
     m->ucount[(size_t)layer * m->c.n_experts + eid]++;      /* learn the hot set */
     for (int i = 0; i < S; i++)
         if (base[i].eid == eid) { base[i].used = ++m->tick; *need_io = 0; m->hit++; return i; }
-    /* evict the LRU among the UNPINNED slots. If every slot is pinned the caller
+    /* evict the LRU among the unpinned slots. If every slot is pinned the caller
      * asked for more distinct experts than the cache holds, which cannot happen:
      * moe_batch chunks by slots_per_layer, and npin < slots_per_layer is enforced. */
     int lru = -1;
     for (int i = 0; i < S; i++)
         if (!base[i].pinned && (lru < 0 || base[i].used < base[lru].used)) lru = i;
     if (lru < 0) lru = 0;
-    /* Do NOT publish the eid yet: the buffer holds the evicted expert until the I/O
-     * completes, and the worker sets s->eid when the bytes are actually there. */
+    /* Do not publish the eid yet: the buffer holds the evicted expert until the I/O
+     * completes, and the worker sets s->eid once the bytes are actually there. */
     base[lru].eid = -1;
     base[lru].used = ++m->tick;
     *need_io = 1;
@@ -498,18 +494,17 @@ static int slot_for(M *m, int layer, int eid, int *need_io) {
     return lru;
 }
 
-/* ------------------------------------------------------------------ forward */
-/* ------------------------------------------------------------------ forward
+/* forward
  *
  * One code path for prefill and decode -- decode is simply S = 1 -- and the reason to
  * unify is the MoE.
  *
- * BATCH-UNION MoE. Token-at-a-time prefill reads 8 experts per layer per token, so a
- * 1000-token prompt is 240,000 reads of 3.19 MiB. But the S rows of a batch
- * collectively route to at most min(128, 8*S) DISTINCT experts per layer, so the loop
- * is inverted: gather expert -> {rows that chose it}, read each once, apply it to all
- * of them. Prefill I/O drops from O(S * topk) to O(unique experts), bounded by 128 per
- * layer however long the prompt is -- up to a 60x cut.
+ * Token-at-a-time prefill reads 8 experts per layer per token, so a 1000-token prompt
+ * is 240,000 reads of 3.19 MiB. But the S rows of a batch collectively route to at
+ * most min(128, 8*S) distinct experts per layer, so the loop is inverted: gather
+ * expert -> {rows that chose it}, read each once, apply it to all of them. Prefill
+ * I/O drops from O(S * topk) to O(unique experts), bounded by 128 per layer however
+ * long the prompt is -- up to a 60x cut.
  *
  * Chunking bounds that against slots_per_layer. Acquiring a slot bumps it to
  * most-recently-used, so nothing acquired within a chunk can be evicted by a later
@@ -533,7 +528,6 @@ typedef struct {
     int S;
 } Buf;
 
-/* softmax router on one row. Fills idx/wts (length topk). */
 static void route_row(M *m, int li, const float *residual, int *idx, float *wts, Buf *b) {
 Cfg *c = &m->c;
 Layer *L = &m->L[li];
@@ -567,10 +561,10 @@ float mx = topv[0];
 for (int j = 0; j < K; j++) { wts[j] = expf(topv[j] - mx); sum += wts[j]; }
 for (int j = 0; j < K; j++) wts[j] = (wts[j] / sum) * L->router_pes.f[idx[j]];
 }
-/* apply one loaded expert to every row that routed to it */
-/* For CPU prefill, process all rows selected by an expert in two OpenMP passes
- * rather than launching two parallel regions per row. Each row retains distinct
- * q4 activation quantisation and gate scratch, so this changes scheduling only. */
+/* Apply one loaded expert to every row that routed to it. For CPU prefill, all the
+ * rows an expert selected go through two OpenMP passes rather than two parallel
+ * regions per row. Each row keeps its own q4 activation quantisation and gate
+ * scratch, so this changes scheduling only. */
 static void expert_apply_batch_cpu(M *m, const uint8_t *G, const uint8_t *U,
 const uint8_t *Dn, size_t grb, size_t drb, const float *X, float *OUT,
 const int *rows, int nrows, const float *w, Buf *b) {
@@ -625,7 +619,7 @@ static void expert_apply(M *m, const uint8_t *blob, const float *X, float *OUT,
 
         if (g_use_gpu) {
             /* The expert blob was gpu_map'd when its slot was allocated, so the GPU
-             * reads the very bytes the streaming cache pread into it -- no copy. */
+             * reads the very bytes the streaming cache pread into it, with no copy. */
             if (gpu_q40_matmul(b->gpu_g, G, x, MI, D, 1) &&
                 gpu_q40_matmul(b->gpu_u, U, x, MI, D, 1)) {
                 for (int o = 0; o < MI; o++)
@@ -666,7 +660,7 @@ static void expert_apply(M *m, const uint8_t *blob, const float *X, float *OUT,
     }
 }
 
-/* MoE over the whole batch: route every row, then read each DISTINCT expert once. */
+/* MoE over the whole batch: route every row, then read each distinct expert once. */
 static void moe_wait(M *m) {
 pthread_mutex_lock(&m->mu);
 while (m->inflight) pthread_cond_wait(&m->done, &m->mu);
@@ -701,8 +695,8 @@ for (int u = 0; u < cn; u++)
 pthread_mutex_unlock(&m->mu);
 }
 
-/* Route and submit the first expert chunk. The caller may now compute the dense
-* branch while NVMe reads proceed. */
+/* Route and submit the first expert chunk. The caller can now compute the dense
+* branch while the NVMe reads proceed. */
 static void moe_start(M *m, int li, const float *residual, float *out, int S, Buf *b) {
 Cfg *c = &m->c;
 Layer *L = &m->L[li];
@@ -766,7 +760,7 @@ rmsnorm(out + (size_t)s * D, out + (size_t)s * D, L->post_ffn_ln2.f, D, c->eps);
 /* Write K/V for `pos`. The f32 residual ring holds the most recent `rwin` positions;
  * the occupant about to be overwritten (position pos - rwin) is TurboQuant-encoded
  * into the packed store on its way out, so recent tokens always attend at full
- * precision -- 3-4 bit compression without a residual window produces garbage. */
+ * precision. 3-4 bit compression without a residual window produces garbage. */
 static void kv_write(M *m, int li, int pos, int nkv, int hd, int cap,
                      const float *k, const float *v) {
     int quant = m->pk[li] != NULL;
@@ -774,18 +768,18 @@ static void kv_write(M *m, int li, int pos, int nkv, int hd, int cap,
     size_t vec = (size_t)nkv * hd;
     int slot = pos % W;
 
-    /* Evict whatever the slot ACTUALLY holds -- do not assume it is position pos-W.
+    /* Evict whatever the slot actually holds; do not assume it is position pos-W.
      *
      * Speculation breaks the "each position is written exactly once, in order"
      * invariant: the verify forward writes np..np+d-1, and on a partial acceptance
-     * the next forward RE-WRITES np+acc, which held a rejected draft. On that second
+     * the next forward rewrites np+acc, which held a rejected draft. On that second
      * write the slot still holds np+acc itself, not np+acc-W, so evicting blindly
      * encodes the wrong vector into the TurboQuant store and poisons the quantised
-     * history -- output stays perfect until the residual window first spills, then
-     * degrades into noise. Tracking the true occupant makes re-writes harmless. */
+     * history. Output stays perfect until the residual window first spills, then
+     * degrades into noise. Tracking the true occupant makes rewrites harmless. */
     if (quant) {
         int old = m->ring_pos[li][slot];
-        /* Only compress a CONFIRMED position. An unconfirmed one is a speculative
+        /* Only compress a confirmed position. An unconfirmed one is a speculative
          * draft that may be rejected and rewritten; dropping it here is safe because
          * it stays in the f32 ring until it is either confirmed (and compressed on a
          * later eviction) or overwritten. This is why --rwin must exceed --ndraft. */
@@ -837,7 +831,7 @@ static void layer_fwd(M *m, int li, float *H, int S, int pos_base, Buf *b) {
     float partial = glob ? c->rope_partial_global : 1.0f;
     int cap = kv_cap(c, li);
 
-    /* ---- attention ----
+    /* attention
      * Positions are walked in order because a sliding layer's KV is a ring of
      * `sliding_window`: writing the whole batch first would overwrite keys that
      * earlier positions still need. Write-then-attend per position is correct for
@@ -854,9 +848,9 @@ static void layer_fwd(M *m, int li, float *H, int S, int pos_base, Buf *b) {
             rmsnorm(b->q + (size_t)i * hd, b->q + (size_t)i * hd, L->q_norm.f, hd, c->eps);
         rope(b->q, nh, hd, pos, theta, partial);
 
-        /* K = rope(k_norm(raw));  V = v_norm(raw), NO scale, NO rope.
-         * On global layers there is no v_proj (attention_k_eq_v) -- V reuses this
-         * same RAW k projection. Note V derives from the raw projection, not K. */
+        /* K = rope(k_norm(raw));  V = v_norm(raw), with neither scale nor rope.
+         * On global layers there is no v_proj (attention_k_eq_v), so V reuses this
+         * same k projection -- the raw one, before k_norm and rope, not K itself. */
         matvec(b->tmp, &L->k_proj, b->xn, b->xq, b->sx);
         if (L->has_v) {
             for (int i = 0; i < nkv; i++)
@@ -874,8 +868,8 @@ static void layer_fwd(M *m, int li, float *H, int S, int pos_base, Buf *b) {
 
         kv_write(m, li, pos, nkv, hd, cap, b->k, b->v);
 
-        /* the BACKBONE's causal sliding window: W positions, t >= pos - W + 1.
-         * (The MTP head uses a different, one-wider window -- see mtp_forward.) */
+        /* the backbone's causal sliding window: W positions, t >= pos - W + 1.
+         * (The MTP head uses a different, one-wider window; see mtp_forward.) */
         int lo = glob ? 0 : (pos - c->sliding_window + 1 < 0 ? 0 : pos - c->sliding_window + 1);
         /* Online softmax: decode every KV position once and retain no ctx-sized
          * score or V scratch. m/z are per-head running maximum/normaliser. */
@@ -907,20 +901,20 @@ static void layer_fwd(M *m, int li, float *H, int S, int pos_base, Buf *b) {
         for (int i = 0; i < D; i++) h[i] += b->tmp[i];
     }
 
-    /* ---- feed-forward: dense MLP and MoE are PARALLEL branches on DIFFERENT
-     * inputs, both reading the post-attention residual H.
+    /* feed-forward: the dense MLP and the MoE are parallel branches over separate
+     * normalisations, both reading the post-attention residual H.
      *
-     * The MoE goes FIRST on purpose: routing needs only H, so the expert reads are
-     * issued and then the dense MLP is computed while they are in flight. That
-     * overlap is exact (not predicted), and it is the thing a synchronous mmap
-     * fault -- llama.cpp's expert path -- structurally cannot do. */
+     * The MoE goes first on purpose: routing needs only H, so the expert reads are
+     * issued and then the dense MLP is computed while they are in flight. The
+     * overlap is exact rather than predicted, which a synchronous mmap fault --
+     * llama.cpp's expert path -- structurally cannot do. */
     float *res = b->eout;
     memcpy(res, H, sizeof(float) * (size_t)S * D);
 
     moe_start(m, li, res, b->h2, S, b);
 
-    /* Dense work now overlaps the first chunk's asynchronous expert reads. Store
-     * its post-norm result in H; H is no longer needed as an input after res copied. */
+    /* Dense work now overlaps the first chunk's asynchronous expert reads. Its
+     * post-norm result goes into H, which res has already copied out of. */
     for (int s = 0; s < S; s++) {
         const float *r = res + (size_t)s * D;
         rmsnorm(b->xn, r, L->pre_ffn_ln.f, D, c->eps);
@@ -942,7 +936,7 @@ static void layer_fwd(M *m, int li, float *H, int S, int pos_base, Buf *b) {
     }
 }
 
-/* embed one token row (the q4_0 embedding table is also the tied lm_head) */
+/* The q4_0 embedding table doubles as the tied lm_head. */
 static void embed_row(M *m, int tok, float *h) {
     Cfg *c = &m->c;
     int D = c->hidden;
@@ -964,7 +958,7 @@ static void embed_row(M *m, int tok, float *h) {
  * fc + hidden_norm, then per draft layer compute K (k_norm + rope at the row's own
  * absolute position) and V, stored at the absolute position. Overwrites are fine:
  * a position rewritten by a later forward always carries the confirmed token, so
- * the LAST write is the correct one (same argument as kv_write for the target).
+ * the last write is the correct one (same argument as kv_write for the target).
  * This is the C equivalent of past_key_values_draft + crop(start). */
 static void dflash_absorb(M *m, int pos0, int rows) {
     int D = m->dflash_D, ntl = m->dflash_n_target_layers;
@@ -994,8 +988,8 @@ static void dflash_absorb(M *m, int pos0, int rows) {
     if (pos0 + rows > m->dflash_ctx_len) m->dflash_ctx_len = pos0 + rows;
 }
 
-/* Run S tokens. logits may be NULL (prefill), or [S, vocab], or -- the common
- * case -- only the LAST row is wanted, which `last_only` gives. */
+/* Run S tokens. logits may be NULL (prefill) or [S, vocab]; `last_only` covers the
+ * common case where only the final row is wanted. */
 static void forward(M *m, const int *ids, int S, int pos_base,
                     float *logits, int last_only, Buf *b) {
     Cfg *c = &m->c;
@@ -1006,9 +1000,9 @@ static void forward(M *m, const int *ids, int S, int pos_base,
     float *H = b->x;
     for (int s = 0; s < S; s++) embed_row(m, ids[s], H + (size_t)s * D);
 
-    /* DFlash: capture hidden states at specific backbone layers.
-     * We snapshot H after each target layer, BEFORE the next layer overwrites it.
-     * The hidden states are post-norm (HF's hidden_states[layer_idx]). */
+    /* DFlash: capture hidden states at specific backbone layers. We snapshot H
+     * after each target layer, before the next layer overwrites it. The hidden
+     * states are post-norm (HF's hidden_states[layer_idx]). */
     if (m->dflash) {
         int ntl = m->dflash_n_target_layers;
         if (S > m->dflash_target_hidden_cap) {
@@ -1018,11 +1012,10 @@ static void forward(M *m, const int *ids, int S, int pos_base,
         }
         for (int l = 0; l < c->n_layers; l++) {
             layer_fwd(m, l, H, S, pos_base, b);
-            /* Check if this layer is a target */
             for (int ti = 0; ti < ntl; ti++) {
                 if (m->dflash_target_ids[ti] == l) {
-                    /* HF's hidden_states[l+1] = RAW output of layer l (no final norm).
-                     * The DFlash fc + hidden_norm was trained on these raw states. */
+                    /* HF's hidden_states[l+1] is the raw output of layer l, without
+                     * the final norm. DFlash's fc + hidden_norm was trained on those. */
                     for (int s = 0; s < S; s++)
                         memcpy(m->dflash_target_hidden + ((size_t)ti * S + s) * D,
                                H + (size_t)s * D, sizeof(float) * D);
@@ -1036,8 +1029,8 @@ static void forward(M *m, const int *ids, int S, int pos_base,
     }
 
     /* Stash the post-norm hidden (HF's last_hidden_state) of every row for a small
-     * batch, or just the final row for a long prefill. The head needs a specific
-     * row -- the last ACCEPTED one -- which is only known after verification. */
+     * batch, or just the final row for a long prefill. The head needs one specific
+     * row, the last accepted one, which is only known after verification. */
     if (m->mtp || m->dflash) {
         if (S <= MAXDRAFT + 1) {
             for (int s = 0; s < S; s++)
@@ -1062,7 +1055,7 @@ static void forward(M *m, const int *ids, int S, int pos_base,
     }
 }
 
-/* ------------------------------------------------------------------ pinning */
+/* pinning */
 typedef struct { int64_t n; int e; } EC;
 static int ec_desc(const void *a, const void *b) {
     int64_t x = ((const EC *)a)->n, y = ((const EC *)b)->n;
@@ -1121,47 +1114,39 @@ static void pin_save(M *m) {
     free(u);
 }
 
-/* ---------------------------------------------------------------- MTP head
+/* MTP head
  *
- * Gemma4AssistantForCausalLM is a draft HEAD, not a model. It has no k_proj, no
- * v_proj and no k_norm; num_kv_shared_layers == num_hidden_layers, so every one of
- * its layers takes K and V from the BACKBONE's shared_kv_states[layer_type]. The
- * backbone publishes the KV of the LAST layer of each type (store_full_length_kv):
+ * Gemma4AssistantForCausalLM is a draft head rather than a model. It has no k_proj,
+ * no v_proj and no k_norm; num_kv_shared_layers == num_hidden_layers, so every one
+ * of its layers takes K and V from the backbone's shared_kv_states[layer_type]. The
+ * backbone publishes the KV of the last layer of each type (store_full_length_kv):
  * here, layer 28 (sliding) and layer 29 (full). The head's 3 sliding layers attend
  * into the former, its full layer into the latter.
  *
- * One draft step:
- *     e   = concat(backbone_hidden, backbone_embed(tok))     [2 * 2816]
- *     h   = pre_projection(e)                                [1024]
- *     h   = 4 plain (non-MoE) decoder layers, attending into the TARGET's KV
- *     h   = norm(h)
- *     logits          = lm_head(h)            -> the drafted token
- *     backbone_hidden'= post_projection(h)    -> feeds the NEXT draft step
- *
  * At q_len == 1 the assistant's bidirectional mask degenerates to full attention
  * over whatever KV it is given (its own comment says so), so we attend over every
- * cached position -- which for the sliding source is the backbone's 1024-window and
- * for the full source is the whole context. That is exactly what the engine caches.
+ * cached position: for the sliding source that is the backbone's 1024-window, for
+ * the full source the whole context. That is exactly what the engine caches.
  *
- * THE DRAFT LOOP, taken from transformers' SinglePositionMultiTokenCandidateGenerator
+ * The draft loop comes from transformers' SinglePositionMultiTokenCandidateGenerator
  * (generation/candidate_generator.py). Four things live there rather than in the
  * model, and each is easy to get backwards:
  *
- *   1. inputs_embeds = cat([last_token_embedding, last_hidden_state], dim=-1)
- *      The EMBEDDING COMES FIRST, then the hidden state.
+ *   1. inputs_embeds = cat([last_token_embedding, last_hidden_state], dim=-1) --
+ *      the embedding comes first, then the hidden state.
  *
  *   2. last_token_embedding = target_model_input_embeddings(tok), which is
- *      get_input_embeddings() -- the target's ScaledWordEmbedding, so the embedding
- *      IS multiplied by embed_scale. And last_hidden_state is hidden_states[-1],
- *      which for Gemma4TextModel is POST final norm (verified: it is bit-identical
- *      to outputs.last_hidden_state).
+ *      get_input_embeddings(), the target's ScaledWordEmbedding: the embedding is
+ *      multiplied by embed_scale. And last_hidden_state is hidden_states[-1],
+ *      which for Gemma4TextModel comes after the final norm (verified: it is
+ *      bit-identical to outputs.last_hidden_state).
  *
- *   3. position_ids = [[input_ids.shape[1] - 1]] is computed ONCE, BEFORE the draft
+ *   3. position_ids = [[input_ids.shape[1] - 1]] is computed once, before the draft
  *      loop, and never advanced. Every drafted token is produced from the position
- *      of the last REAL token -- hence the class name, SinglePosition. Incrementing
+ *      of the last real token -- hence the class name, SinglePosition. Incrementing
  *      the position per draft step silently degrades every draft after the first.
  *
- *   4. The drafter is GREEDY: last_token_id = outputs.logits.argmax(-1), regardless
+ *   4. The drafter is greedy: last_token_id = outputs.logits.argmax(-1), regardless
  *      of the target's sampling temperature. */
 
 typedef struct {
@@ -1199,30 +1184,19 @@ static MBuf *mtp_bufs(M *m) {
     	return b;
     }
 
-    /* ------------------------------------------------------------------ DFlash
+    /* DFlash
      *
      * DFlash is a block-parallel drafter: instead of drafting one token at a time, it
      * drafts an entire block of `block_size` tokens simultaneously using bidirectional
      * attention. It conditions on hidden states extracted from specific layers of the
      * target backbone (e.g. layers 1, 6, 11, 17, 22, 27 for Gemma-4 26B).
      *
-     * The attention is special: for each position in the draft block, K and V come from
-     * BOTH the target hidden context (cross-attention) AND the draft block's own tokens
-     * (bidirectional self-attention). The two are concatenated along the sequence dim.
+     * The attention is unusual: for each position in the draft block, K and V come from
+     * the target hidden context (cross-attention) and from the draft block's own tokens
+     * (bidirectional self-attention), concatenated along the sequence dim.
      *
-     * The model is Qwen3-based (not Gemma4): each layer has q_proj, k_proj, v_proj,
-     * o_proj, q_norm, k_norm, and a plain MLP (gate/up/down). No MoE, no sliding window
-     * in the backbone sense -- the sliding_window config only affects the attention mask.
-     *
-     * The draft loop:
-     *   1. Extract target hidden states from backbone layers (done in forward()).
-     *   2. Project through fc + hidden_norm to get target_hidden.
-     *   3. Initialize block with mask tokens, first position = target's sampled token.
-     *   4. Run 5 decoder layers with DFlash attention.
-     *   5. Pass through target's lm_head to get logits.
-     *   6. Sample draft tokens from logits.
-     *   7. Verify with ONE batched target forward.
-     *   8. Accept matching tokens + one bonus token from target.
+     * The model is Qwen3-based rather than Gemma4, and its sliding_window affects
+     * only the mask, not the backbone sense of the word. dflash_step runs the loop.
      */
 
     typedef struct {
@@ -1286,7 +1260,7 @@ static MBuf *mtp_bufs(M *m) {
         int win = m->dflash_types[li] ? 0 : m->dflash_sliding_window;
         const float *CK = m->dflash_ctx_k[li], *CV = m->dflash_ctx_v[li];
 
-        /* ---- Q and the block's own K/V (all from the input_layernorm'd hidden) ----
+        /* Q and the block's own K/V (all from the input_layernorm'd hidden)
          * All S rows are normed into b->xn contiguously, then each projection is a
          * single batched matmul over the block (one GPU dispatch instead of S). */
         for (int s = 0; s < S; s++)
@@ -1307,7 +1281,7 @@ static MBuf *mtp_bufs(M *m) {
             rope(k, nkv, hd, pos_base + s, theta, 1.0f);
         }
 
-        /* ---- Attention: each block position attends to the whole cached context
+        /* Attention: each block position attends to the whole cached context
          * plus every block position (bidirectional). Two-pass softmax per (s, head)
          * with a thread-private score buffer; parallel over the S*nh tasks. */
         #pragma omp parallel for collapse(2) schedule(static)
@@ -1371,7 +1345,7 @@ static MBuf *mtp_bufs(M *m) {
             /* Post-attention residual add happens inside dflash_attn */
             dflash_attn(m, li, H, S, pos_base, b);
 
-            /* FFN: plain MLP with SiLU activation (Qwen3-style, not Gemma4's gelu_tanh).
+            /* FFN: plain MLP with SiLU, Qwen3-style rather than Gemma4's gelu_tanh.
              * Batched over the block: gate/up/down are each one matmul. */
             Layer *L = &m->dflash_layers[li];
             int MI = m->dflash_inter;
@@ -1389,7 +1363,6 @@ static MBuf *mtp_bufs(M *m) {
             }
         }
 
-        /* Final norm */
         for (int s = 0; s < S; s++)
             rmsnorm(H + (size_t)s * D, H + (size_t)s * D, m->dflash_norm.f, D, m->dflash_eps);
     }
@@ -1525,14 +1498,14 @@ static MBuf *mtp_bufs(M *m) {
     Cfg *c = &m->c;
     int D = m->mtp_D, BB = m->mtp_BB, nh = m->mtp_nh;
 
-    /* ---- concat(embed(tok), backbone_hidden) ---- */
+    /* concat(embed(tok), backbone_hidden) */
     float *emb = b->tmp;
     embed_row(m, tok, emb);                 /* includes embed_scale */
     memcpy(b->e, emb, sizeof(float) * BB);
     memcpy(b->e + BB, bh, sizeof(float) * BB);
     matvec(b->h, &m->mtp_pre, b->e, b->xq, b->sx);         /* [D] */
 
-    /* ---- 4 plain decoder layers, attending into the TARGET's KV ---- */
+    /* 4 plain decoder layers, attending into the target's KV */
     for (int li = 0; li < m->mtp_L; li++) {
         Layer *L = &m->mtp_layers[li];
         int glob = m->mtp_types[li];
@@ -1556,10 +1529,10 @@ static MBuf *mtp_bufs(M *m) {
             rmsnorm(b->q + (size_t)i * hd, b->q + (size_t)i * hd, L->q_norm.f, hd, m->mtp_eps);
         rope(b->q, nh, hd, pos, theta, partial);
 
-        /* The head's mask is BIDIRECTIONAL, and that is not cosmetic:
-         *   full layers   -> mask is None, attend every cached position;
-         *   sliding layers-> attend t >= pos - W, i.e. W + 1 positions -- ONE MORE
-         *                    than the backbone's causal SWA (t >= pos - W + 1).
+        /* The head's mask is bidirectional:
+         *   full layers    -> mask is None, attend every cached position;
+         *   sliding layers -> attend t >= pos - W, i.e. W + 1 positions, one more
+         *                     than the backbone's causal SWA (t >= pos - W + 1).
          * Verified against HF: getting this wrong (e.g. assuming q_len==1 means
          * "attend everything") changes the attention output by ~30%. */
         int lo = c->layer_types[src] ? 0
@@ -1606,7 +1579,7 @@ static MBuf *mtp_bufs(M *m) {
 }
 
 /* Load the MTP head from mtp.manifest.txt / mtp.bin, and work out which backbone
- * layers publish the KV it shares (the LAST layer of each layer_type). */
+ * layers publish the KV it shares (the last layer of each layer_type). */
 static int mtp_load(M *m, const char *dir) {
     char p[4096];
     snprintf(p, sizeof p, "%s/mtp.manifest.txt", dir);
@@ -1694,7 +1667,7 @@ static int mtp_load(M *m, const char *dir) {
         return 0;
     }
 
-    /* the backbone publishes the KV of the LAST layer of each type
+    /* the backbone publishes the KV of the last layer of each type
      * (store_full_length_kv); that is what the head shares. */
     m->kv_last_slide = m->kv_last_full = -1;
     for (int l = 0; l < m->c.n_layers; l++) {
@@ -1711,22 +1684,21 @@ static int mtp_load(M *m, const char *dir) {
     return 1;
 }
 
-/* ------------------------------------------------------------------ setup */
+/* setup */
 static void init(M *m, const char *dir, int n_io, int ctx_override, double ram_gb,
                  int kb, int vb, int kv_protect, int rwin, int kv_pbits) {
     m->rwin = rwin > 0 ? rwin : 128;
     manifest(m, dir);
     Cfg *c = &m->c;
 
-    /* --ctx overrides what the container was converted with. It is allowed to go
-     * UP: the container's ctx only fixed slots_per_layer (the expert-cache plan),
-     * and the weights do not care. Only the GLOBAL layers grow anyway -- the
-     * sliding ones are capped by sliding_window at any context.
+    /* --ctx overrides what the container was converted with, and may go up: the
+     * container's ctx only fixed slots_per_layer (the expert-cache plan), and the
+     * weights do not care. Only the global layers grow anyway; the sliding ones are
+     * capped by sliding_window at any context.
      *
-     * Whether that is a problem is a question about BYTES, not about the context
-     * number: with --kvq a much longer context can fit in less than the plan
-     * assumed, and warning there would be nonsense. The comparison is made below,
-     * once the real figure is known. */
+     * Whether that is a problem depends on bytes rather than on the context number:
+     * with --kvq a much longer context can fit in less than the plan assumed. The
+     * comparison is made below, once the real figure is known. */
     int ctx_planned = c->ctx;
     if (ctx_override > 0) c->ctx = ctx_override;
     m->ucount = calloc((size_t)c->n_layers * c->n_experts, 8);
@@ -1747,11 +1719,11 @@ static void init(M *m, const char *dir, int n_io, int ctx_override, double ram_g
         int nkv = glob ? c->n_global_kv_heads : c->n_kv_heads;
         int cap = kv_cap(c, l);          /* sliding ring is W+1: see kv_cap */
 
-        /* Protected layers get MORE BITS, not f32 -- upstream protects with extra
-         * precision, and here the distinction is expensive: Gemma-4's LAST layer is
-         * a global (full-context) one, so pinning it to f32 would cost 1.07 GiB at
-         * 128K ctx and undo most of the saving. High-bit protection costs a fraction
-         * of that. */
+        /* Protected layers get more bits rather than f32. Upstream protects with
+         * extra precision, and here the distinction is expensive: Gemma-4's last
+         * layer is a global (full-context) one, so pinning it to f32 would cost
+         * 1.07 GiB at 128K ctx and undo most of the saving. High-bit protection
+         * costs a fraction of that. */
         int prot = (l < kv_protect) || (l >= c->n_layers - kv_protect);
         int lkb = prot ? kv_pbits : kb;
         int lvb = prot ? kv_pbits : vb;
@@ -1780,10 +1752,9 @@ static void init(M *m, const char *dir, int n_io, int ctx_override, double ram_g
     else        fprintf(stderr, " (f32; --kvq would cut this a lot)");
     fprintf(stderr, "\n");
 
-    /* Compare against what the conversion budgeted -- an f32 KV at the container's
-     * own ctx. Only an ACTUAL overshoot is worth a warning: --kvq routinely buys a
-     * longer context for fewer bytes than the plan assumed, and that deserves
-     * silence, not a scare. */
+    /* Compare against what the conversion budgeted: an f32 KV at the container's own
+     * ctx. Only a real overshoot is worth a warning, since --kvq routinely buys a
+     * longer context for fewer bytes than the plan assumed. */
     {
         size_t planned = 0;
         for (int l = 0; l < c->n_layers; l++) {
@@ -1794,8 +1765,7 @@ static void init(M *m, const char *dir, int n_io, int ctx_override, double ram_g
             planned += 2 * sizeof(float) * (size_t)cap * nkv * hd;
         }
         /* With an explicit --ram the cache is about to be re-planned against this
-         * very figure, so the overshoot is already accounted for: warning would be
-         * telling the user about a problem we are in the middle of solving. */
+         * very figure, so the overshoot is already accounted for. */
         if (kvb > planned && ram_gb <= 0)
             fprintf(stderr, "warning: that is %.0f MiB more KV than the container's "
                     "plan budgeted (%.0f MiB for ctx %d, f32), so total RAM will "
@@ -1804,13 +1774,13 @@ static void init(M *m, const char *dir, int n_io, int ctx_override, double ram_g
                     kb > 0 ? "" : "; --kvq would cut it a lot");
     }
 
-    /* ------------------------------------------------- expert-cache plan
-     * slots_per_layer is the ONLY thing the conversion's --ram fixed, and nothing in
+    /* expert-cache plan
+     * slots_per_layer is the only thing the conversion's --ram fixed, and nothing in
      * the container depends on it: experts are read from experts.bin one at a time by
-     * offset and the cache is pure LRU. So --ram re-runs the planner of
-     * tools/convert_gemma4.py against the numbers we now know EXACTLY -- the resident
-     * dense blob and the KV just allocated -- instead of the ones the conversion had
-     * to assume (f32 KV at the container's own ctx). */
+     * offset and the cache is a plain LRU. So --ram re-runs the planner of
+     * tools/convert_gemma4.py against the figures we now know -- the resident dense
+     * blob and the KV just allocated -- instead of the ones the conversion had to
+     * assume (an f32 KV at the container's own ctx). */
     if (ram_gb > 0) {
         int64_t scratch = 192 << 20;
         int64_t avail = (int64_t)(ram_gb * (double)(1LL << 30))
@@ -1844,8 +1814,8 @@ static void init(M *m, const char *dir, int n_io, int ctx_override, double ram_g
         for (size_t i = 0; i < ns; i++) {
             m->slots[i].eid = -1;
             m->slots[i].buf = xmalloc(m->esz);
-            /* Map each slot once, up front. Slots are reused for different experts, so
-             * the mapping stays valid for the whole run -- the streaming layer only ever
+            /* Map each slot once, up front. Slots are reused for different experts,
+             * and the mapping stays valid for the whole run: the streaming layer
              * overwrites the bytes, never the address. */
             if (g_use_gpu && !gpu_map(m->slots[i].buf, m->esz)) {
                 fprintf(stderr, "metal: could not map expert slots; using CPU\n");
@@ -1919,7 +1889,7 @@ static Buf *bufs(M *m, int Smax) {
     return b;
 }
 
-/* ------------------------------------------------------------------ sampling */
+/* sampling */
 typedef struct { float p; int i; } PI;
 static int pi_desc(const void *a, const void *b) {
     float x = ((const PI *)a)->p, y = ((const PI *)b)->p;
@@ -1966,23 +1936,9 @@ static int sample(const float *logits, int V, float temp, float topp, int topk,
     return buf[n - 1].i;
 }
 
-/* ------------------------------------------------------------ chat template
- *
- * Transcribed from Gemma-4's chat_template.jinja. Structure:
- *
- *   <bos>
- *   [<|turn>system\n  (<|think|>\n if thinking)  SYSTEM  <turn|>\n]
- *   <|turn>user\n USER <turn|>\n
- *   <|turn>model\n
- *   [<|channel>thought\n<channel|>]      <-- ONLY when thinking is OFF
- *
- * That last line is the non-obvious part: with thinking disabled the template
- * pre-fills an EMPTY thought channel, and that is what suppresses reasoning -- omit
- * it and the model starts thinking. `<|think|>` at the top of the system turn
- * enables it. The system turn is emitted if there is a system message OR thinking is
- * on (or tools, not supported here).
- *
- * Generation stops on <turn|> (eot) or <eos>, which are the config's eos ids. */
+/* Transcribed from Gemma-4's chat_template.jinja. The non-obvious part is the
+ * trailing empty thought channel: with thinking disabled the template pre-fills one,
+ * and that is what suppresses reasoning. Omit it and the model starts thinking. */
 static void chat_prompt(char *out, size_t cap, const char *sys,
                         const char *user, int think) {
     size_t n = 0;
@@ -2000,31 +1956,32 @@ static void chat_prompt(char *out, size_t cap, const char *sys,
     #undef ADD
 }
 
-/* ------------------------------------------------------- speculative decoding
+/* speculative decoding
  *
- * Gemma-4 ships a dedicated MTP drafter as a SEPARATE model (unlike GLM's in-model
- * layer-78 head), so speculation is: draft d tokens cheaply with the small model,
- * then VERIFY all d with ONE batched forward of the big one.
+ * Gemma-4 ships a dedicated MTP drafter as a separate model, unlike GLM's in-model
+ * layer-78 head. So speculation is: draft d tokens cheaply with the small model,
+ * then verify all d with a single batched forward of the big one.
  *
  * The verification forward is where this pays off for a streaming engine. Those d
  * positions collectively route to at most min(128, 8*d) distinct experts per layer,
- * and batch-union reads each ONCE, so verifying d tokens costs barely more expert I/O
- * than decoding one: d tokens of disk latency become 1.
+ * and batch-union reads each one once, so verifying d tokens costs barely more
+ * expert I/O than decoding one: d tokens of disk latency become 1.
  *
- * LOSSLESS. At temp=0 acceptance is exact: keep a draft token iff it is the target's
- * argmax. At temp>0 we use rejection sampling against the draft's own distribution,
- * so the output distribution is identical to non-speculative sampling. Speculation
- * changes the speed, never the text.
+ * It is lossless. At temp=0 acceptance is exact: keep a draft token iff it is the
+ * target's argmax. At temp>0 we use rejection sampling against the draft's own
+ * distribution, so the output distribution matches non-speculative sampling.
+ * Speculation changes the speed, not the text.
  *
- * REJECTED KV. If we reject at position j, the KV written for positions >= pos+j is
- * garbage. We do not need to undo it: every KV slot is addressed by absolute
- * position (`pos % cap`), so the next forward simply overwrites it. */
+ * If we reject at position j, the KV written for positions >= pos+j is garbage. We
+ * do not need to undo it: every KV slot is addressed by absolute position
+ * (`pos % cap`), so the next forward simply overwrites it. */
 
-/* `dpos` = how many tokens of `ids` the DRAFTER has actually consumed into its KV.
- * It has to be tracked: the drafter emits draft[d-1] but never feeds it back, so on
- * full acceptance that position joins the accepted prefix with STALE KV behind it and
- * the drafter starts disagreeing with itself (observed: an identical drafter/target
- * pair accepting only 75%). We catch it up on exactly the accepted prefix, no more. */
+/* `dpos` counts how many tokens of `ids` the drafter has actually consumed into its
+ * KV. It has to be tracked: the drafter emits draft[d-1] but never feeds it back, so
+ * on full acceptance that position joins the accepted prefix with stale KV behind it
+ * and the drafter starts disagreeing with itself (observed: an identical
+ * drafter/target pair accepting only 75%). We catch it up on the accepted prefix
+ * and no further. */
 static int spec_step(M *tgt, M *drf, Buf *bt, Buf *bd,
                      int *ids, int np, int *dpos, float *tlog, float *dlog,
                      int d, float temp, float topp, int topk, PI *pbuf, PI *dbuf,
@@ -2034,13 +1991,13 @@ static int spec_step(M *tgt, M *drf, Buf *bt, Buf *bd,
     int draft[MAXDRAFT];
     float *dprob = xmalloc(sizeof(float) * (size_t)d * V);
 
-    /* ---- catch the drafter up on every accepted token it has not seen ---- */
+    /* catch the drafter up on every accepted token it has not seen */
     if (*dpos < np) {
         forward(drf, ids + *dpos, np - *dpos, *dpos, dlog, 1, bd);
         *dpos = np;
     }
 
-    /* ---- draft d tokens ---- */
+    /* draft d tokens */
     for (int i = 0; i < d; i++) {
         /* draft distribution at this step (needed for rejection sampling) */
         float mx = -1e30f;
@@ -2052,13 +2009,13 @@ static int spec_step(M *tgt, M *drf, Buf *bt, Buf *bd,
         for (int j = 0; j < V; j++) dp[j] /= (float)sum;
 
         draft[i] = sample(dlog, V, temp, topp, topk, dbuf, rng);
-        /* feed it back so the NEXT draft is conditioned on it */
+        /* feed it back so the next draft is conditioned on it */
         forward(drf, &draft[i], 1, np + i, dlog, 1, bd);
     }
 
-    /* ---- verify all d with ONE batched target forward ----
+    /* verify all d with a single batched target forward.
      * tlog already holds the target's distribution for position np-1 (i.e. for
-     * draft[0]); this call returns the distributions AFTER each drafted token. */
+     * draft[0]); this call returns the distributions after each drafted token. */
     float *vl = xmalloc(sizeof(float) * (size_t)d * V);
     forward(tgt, draft, d, np, vl, 0, bt);
 
@@ -2096,7 +2053,7 @@ static int spec_step(M *tgt, M *drf, Buf *bt, Buf *bd,
 
     /* The drafter consumed draft[0..d-1] at positions np..np+d-1, but only the first
      * n of those are on the accepted path. Everything past that is a rejected branch
-     * and its KV is invalid -- mark it unconsumed so the next step re-feeds it. */
+     * with invalid KV, so mark it unconsumed and the next step re-feeds it. */
     *dpos = np + n;
 
     free(dprob);
@@ -2105,10 +2062,10 @@ static int spec_step(M *tgt, M *drf, Buf *bt, Buf *bd,
 }
 
 /* Numerically diff the Metal kernel against the CPU reference on random q4_0 data.
- * This exists because the Metal path cannot be tested where it was written -- it is
- * the user's machine that decides whether it is right. Run it once before trusting
- * any GPU output. Shapes cover the real ones: attention projections, dense MLP, and
- * both expert matmuls. */
+ * The Metal path cannot be tested where it was written; the machine it runs on
+ * decides whether it is right, so run this once before trusting any GPU output.
+ * Shapes cover the real ones: attention projections, dense MLP, both expert
+ * matmuls. */
 static int check_gpu(void) {
     if (!gpu_ready()) {
         printf("no Metal device (or built without COLI_METAL) -- nothing to check\n");
@@ -2178,22 +2135,22 @@ static void lm_head_row(M *m, const float *hn, float *logits, Buf *b) {
 /* One speculation step with the MTP head.
  *
  * State carried between steps:
- *   P       -- index of the last token in `ids` (its KV is NOT yet in the target)
+ *   P       -- index of the last token in `ids` (its KV is not yet in the target)
  *   hprev   -- the target's post-norm hidden at position P-1
  *
- * That pairing is the whole thing, and it is NOT the obvious one. HF does:
+ * That pairing is the crux, and it is not the obvious one. HF does:
  *     last_hidden_state = hidden[n_last_matches]   -> position t
  *     last_token_id     = input_ids[-1]            -> position t+1
- * i.e. the hidden comes from ONE POSITION EARLIER than the token -- the EAGLE
+ * so the hidden comes from one position earlier than the token: the EAGLE
  * convention, concat(e(x_{t+1}), h_t). Pairing h_{t+1} with x_{t+1} instead collapses
  * acceptance to a few percent.
  *
- * ONE target forward per step, not two: the batch is [x_P, draft_0 .. draft_{d-1}]
- * at positions P..P+d. Row 0 both (a) puts x_P's KV into the cache and (b) yields the
- * distribution that verifies draft_0; row i yields the one that verifies draft_{i+1}.
- * And hidden row `acc` is exactly h_{P+acc}, the hprev the NEXT step needs. An extra
- * "resync" forward for the newly sampled token is waste, and is also what forces the
- * wrong pairing above.
+ * A step costs one target forward rather than two: the batch is
+ * [x_P, draft_0 .. draft_{d-1}] at positions P..P+d. Row 0 both puts x_P's KV into
+ * the cache and yields the distribution that verifies draft_0; row i yields the one
+ * that verifies draft_{i+1}. Hidden row `acc` is exactly h_{P+acc}, the hprev the
+ * next step needs. An extra "resync" forward for the newly sampled token is waste,
+ * and is also what forces the wrong pairing above.
  *
  * Batch-union makes the verify nearly free in I/O terms: the d+1 positions read each
  * distinct expert once. */
@@ -2206,7 +2163,7 @@ static int mtp_step(M *m, Buf *bt, MBuf *bd, int *ids, int P, float *hprev,
     float *dprob = xmalloc(sizeof(float) * (size_t)d * V);
     float *bh = xmalloc(sizeof(float) * BB);
 
-    /* ---- draft d tokens: (h_{P-1}, x_P) at the FIXED position P ---- */
+    /* draft d tokens: (h_{P-1}, x_P), all at the fixed position P */
     memcpy(bh, hprev, sizeof(float) * BB);
     int tok = ids[P];
     for (int i = 0; i < d; i++) {
@@ -2220,20 +2177,20 @@ static int mtp_step(M *m, Buf *bt, MBuf *bd, int *ids, int P, float *hprev,
         for (int j = 0; j < V; j++) { dp[j] = expf((dlog[j] - mx) / T); sum += dp[j]; }
         for (int j = 0; j < V; j++) dp[j] /= (float)sum;
 
-        int am = 0;                                /* the drafter is GREEDY */
+        int am = 0;                                /* the drafter is greedy */
         for (int j = 1; j < V; j++) if (dlog[j] > dlog[am]) am = j;
         tok = am;
         draft[i] = tok;
     }
     (void)dbuf;
 
-    /* ---- ONE target forward over [x_P, draft...] at positions P..P+d ---- */
+    /* a single target forward over [x_P, draft...] at positions P..P+d */
     batch[0] = ids[P];
     for (int i = 0; i < d; i++) batch[i + 1] = draft[i];
     m->kv_conf = P;                 /* anything beyond P is speculative until verified */
     /* logits=NULL: the lm_head is 738 M params (1.5 GFLOP per row), and on a rejection
      * every row past the first is thrown away. Compute it lazily instead, row by row,
-     * and stop as soon as a draft is rejected -- at ~48% acceptance that skips roughly
+     * stopping as soon as a draft is rejected; at ~48% acceptance that skips roughly
      * two of five rows. hid_batch already carries the post-norm hidden for each row. */
     forward(m, batch, d + 1, P, NULL, 0, bt);
 
@@ -2279,26 +2236,13 @@ static int mtp_step(M *m, Buf *bt, MBuf *bd, int *ids, int P, float *hprev,
     return n + 1;
 }
 
-/* DFlash block-parallel speculative step.
+/* One DFlash step, mirroring dflash_generate in the reference. `pos` is the absolute
+ * position of first_tok, whose KV is written here too. Writes first_tok + the
+ * accepted drafts to out[0..n], the bonus to *next_tok, and returns n+1.
  *
- * Unlike MTP (which drafts one token at a time), DFlash drafts an entire block of
- * `block_size` tokens at once using bidirectional attention. The draft is conditioned
- * on hidden states extracted from specific backbone layers.
- *
- * Algorithm (mirrors dflash_generate in the reference):
- *   1. Initialize block: position 0 = `first_tok` (already sampled by the previous
- *      step -- the "bonus" token), rest = mask tokens.
- *   2. Run DFlash forward (context = the persistent draft KV cache, which every
- *      target forward, prefill included, keeps up to date via dflash_absorb).
- *   3. Pass through target's lm_head; draft tokens greedily (like the paper).
- *   4. Verify with ONE batched target forward; accept the matching prefix and
- *      sample the next step's first token (the bonus) from the target's
- *      distribution at the first unverified position. That token's KV and draft
- *      context are computed by the NEXT verify forward -- no extra forward needed.
- *
- * `pos` is the absolute position of first_tok, whose KV is written here too.
- * Writes first_tok + the accepted drafts to out[0..n], the bonus to *next_tok,
- * and returns n+1 (= tokens of `out` to emit). */
+ * The bonus token needs no forward of its own: its KV and draft context fall out of
+ * the next step's verify forward, which is why the block starts at position 0 with
+ * the token the previous step sampled. */
 static int dflash_step(M *m, Buf *bt, DBuf *bd, int first_tok, int pos,
                         int d, float temp, float topp, int topk,
                         PI *pbuf, uint64_t *rng, int *out, int *accepted,
@@ -2319,20 +2263,21 @@ static int dflash_step(M *m, Buf *bt, DBuf *bd, int first_tok, int pos,
     int draft[MAXDRAFT];
     /* frozen[i] (draft index) = position i+1 held a confident token last pass and is
      * fed as a real embedding this pass instead of the mask token. Once set it stays
-     * set (monotone denoising). All zero when refinement is off -> reference path. */
+     * set (monotone denoising). All zero when refinement is off, i.e. the reference
+     * path. */
     int frozen[MAXDRAFT] = {0};
     float cap = c->final_logit_softcap;
     int npass = g_dflash_refine + 1;
     double t0 = now(), t1 = t0;
 
-    /* ---- 2/3. One or more denoising passes. Each pass: (re)embed the block with the
+    /* 2/3. One or more denoising passes. Each pass: (re)embed the block with the
      * currently frozen tokens, run the DFlash forward, then take greedy drafts from
      * the logits. On non-final passes we also measure per-position confidence and
      * freeze the confident ones so the next pass conditions on them. */
     for (int pass = 0; pass < npass; pass++) {
         int last_pass = (pass == npass - 1);
 
-        /* Embed the block using the TARGET's embedding table: position 0 is the bonus
+        /* Embed the block using the target's embedding table: position 0 is the bonus
          * token, the rest are either a frozen draft or the mask token. */
         embed_row(m, first_tok, H);
         for (int i = 1; i < d; i++) {
@@ -2358,7 +2303,7 @@ static int dflash_step(M *m, Buf *bt, DBuf *bd, int first_tok, int pos,
             if (!last_pass) {
                 /* Confidence = max softmax prob (temperature-independent, softcapped).
                  * Freeze this position for the next pass if it clears the threshold.
-                 * Skip positions already frozen -- their token is fixed. */
+                 * Positions already frozen have a fixed token, so skip them. */
                 if (frozen[i]) continue;
                 float mx = cap > 0 ? tanhf(dl[am] / cap) * cap : dl[am];
                 double sum = 0;
@@ -2383,11 +2328,11 @@ static int dflash_step(M *m, Buf *bt, DBuf *bd, int first_tok, int pos,
         }
     }
 
-    /* ---- 4. Verify with ONE batched target forward, exactly the reference's
+    /* 4. Verify with a single batched target forward over exactly the reference's
      * block: [first_tok, draft[0], ..., draft[ndraft-1]] at positions pos..pos+ndraft.
      * Row i's lm_head predicts position pos+i+1, so it verifies draft[i]. (Position
-     * pos-1's KV is already written by the previous forward; first_tok is the
-     * target's OWN sample and needs no verification.) */
+     * pos-1's KV is already written by the previous forward, and first_tok is the
+     * target's own sample, so it needs no verification.) */
     int batch[MAXDRAFT + 1];
     batch[0] = first_tok;
     for (int i = 0; i < ndraft; i++) batch[i + 1] = draft[i];
@@ -2400,7 +2345,7 @@ static int dflash_step(M *m, Buf *bt, DBuf *bd, int first_tok, int pos,
                 pos, (t1 - t0) * 1e3, (t2 - t1) * 1e3, (t3 - t2) * 1e3);
 
     float *q = xmalloc(sizeof(float) * V);
-    int n;  /* number of DRAFT tokens accepted (not counting first_tok) */
+    int n;  /* draft tokens accepted, not counting first_tok */
     out[0] = first_tok;
 
     for (n = 0; n < ndraft; n++) {
@@ -2442,7 +2387,7 @@ static int dflash_step(M *m, Buf *bt, DBuf *bd, int first_tok, int pos,
     return n + 1;  /* first_tok + n drafts */
 }
 
-/* ------------------------------------------------------------------ OpenAI-compatible local server */
+/* OpenAI-compatible local server */
 typedef struct {
     M *model;
     Buf *buffers;
@@ -2697,7 +2642,7 @@ static int run_g4_server(M *m, Buf *buffers, G4Tok *tokenizer, const char *model
     free(ctx.cached_ids); pthread_mutex_destroy(&ctx.generation_mu); return ok?0:1;
 }
 
-/* ------------------------------------------------------------------ main */
+/* main */
 static void usage(const char *prog, FILE *out) {
     fprintf(out,
         "usage: %s <dir> [flags...] [prompt]\n"
@@ -2766,13 +2711,13 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--raw")) raw = 1;
         else if (!strcmp(argv[i], "--kvq")) kvq_on = 1;
         else if (!strcmp(argv[i], "--kv") && i + 1 < argc) {
-            /* Named presets. The bits alone do not define a config -- the residual
+            /* Named presets. The bits alone do not define a config: the residual
              * window and the protected-layer count matter as much, and a half-set
              * K4/V2 (rwin=0) is the exact configuration upstream measured as broken.
              * So the presets carry all four numbers together. */
             const char *v = argv[++i];
             if (!strcmp(v, "off")) { kvq_on = 0; }
-            else if (!strcmp(v, "k6v4")) {          /* upstream's only EXACT config */
+            else if (!strcmp(v, "k6v4")) {          /* upstream's only exact config */
                 kvq_on = 1; kb = 6; vb = 4; rwin = 128; kv_protect = 2; kv_pbits = 8;
             } else if (!strcmp(v, "k4v2")) {        /* the only one that fits 256K in 4 GB */
                 kvq_on = 1; kb = 4; vb = 2; rwin = 128; kv_protect = 4; kv_pbits = 8;
@@ -2793,9 +2738,9 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--dflash")) use_dflash = 1;
         /* end of flags: whatever follows is the prompt, even if it starts with '-' */
         else if (!strcmp(argv[i], "--")) { if (i + 1 < argc && !prompt) prompt = argv[++i]; }
-        /* ANY leading dash, not just a double one. A single-dash typo (-kvq for
+        /* Any leading dash, not just a double one. A single-dash typo (-kvq for
          * --kvq) must not fall through to the positional branch: it would silently
-         * become the PROMPT and quietly change what the model generates. */
+         * become the prompt and change what the model generates. */
         else if (argv[i][0] == '-') {
             fprintf(stderr, "unknown flag: %s\n\n", argv[i]);
             usage(argv[0], stderr);
@@ -2803,9 +2748,9 @@ int main(int argc, char **argv) {
         }
         else if (!prompt) prompt = argv[i];  /* first non-flag positional arg is the prompt */
     }
-    /* Default K6/V4 + a 128-token f32 window: the ONLY configuration upstream
-     * measured as EXACT on generation. K4/V2 is reachable (--kbits 4 --vbits 2) but
-     * upstream's own corrected table has it MISSING the needle at 2K and 4K. */
+    /* Default K6/V4 + a 128-token f32 window: the only configuration upstream
+     * measured as exact on generation. K4/V2 is reachable (--kbits 4 --vbits 2) but
+     * upstream's own corrected table has it missing the needle at 2K and 4K. */
     if (!kvq_on) kb = vb = 0;
     if (chat_mode && check) {
         fprintf(stderr, "--chat cannot be used with --check\n\n");
@@ -2828,16 +2773,16 @@ int main(int argc, char **argv) {
     (void)nthreads;
 #endif
 
-    /* Metal is opt-IN (--metal), not opt-out.
+    /* Metal is opt-in, via --metal.
      *
-     * Measured on real hardware it is ~5x SLOWER than the CPU for decode, and the
-     * reason is structural, not a tuning miss: this kernel issues one dispatch and
-     * one waitUntilCompleted PER MATVEC, and a token needs thousands of them. At
+     * Measured on real hardware it is ~5x slower than the CPU for decode, and the
+     * reason is structural rather than a tuning miss: this kernel issues one dispatch
+     * and one waitUntilCompleted per matvec, and a token needs thousands of them. At
      * batch size 1 that is pure dispatch latency (~0.5 ms each) against ~40 ms of
      * actual arithmetic. A GPU only wins here with far more work per dispatch --
      * whole layers fused into one command buffer, or large prefill batches -- and
-     * even then the engine is disk-bound at a 4-8 GB budget. Shipping it on by
-     * default would just make everyone slower, so: off unless asked. */
+     * even then the engine is disk-bound at a 4-8 GB budget. On by default would
+     * make everyone slower, so it stays off unless asked for. */
     if (use_metal && !no_metal) g_use_gpu = gpu_init();
     if (chk_gpu) { if (!g_use_gpu) g_use_gpu = gpu_init(); return check_gpu(); }
 
@@ -2895,10 +2840,10 @@ int main(int argc, char **argv) {
     M dm; memset(&dm, 0, sizeof dm);
     Buf *db = NULL;
     if (dpath) {
-        /* same ctx as the target: the drafter has to span the same positions.
-         * Its KV stays f32 -- it is tiny. */
-        /* ram_gb 0: --ram budgets the TARGET's expert cache. The drafter is a dense
-         * model whose whole footprint is fixed by its own container. */
+        /* Same ctx as the target: the drafter has to span the same positions. Its KV
+         * stays f32, being tiny. ram_gb 0 because --ram budgets the target's expert
+         * cache, and the drafter is a dense model whose whole footprint is fixed by
+         * its own container. */
         init(&dm, dpath, n_io, c->ctx, 0, 0, 0, 0, rwin, 8);
         db = bufs(&dm, dm.c.ctx);
         if (dm.c.vocab != c->vocab) {
@@ -2927,7 +2872,7 @@ int main(int argc, char **argv) {
         for (char *s = strchr(qs, '['); s && *s && *s != ']'; s++)
             if (*s >= '0' && *s <= '9') { ids[np++] = strtol(s, &s, 10); s--; }
 
-        /* Prefer deq_logits.f32: the numpy oracle run on the DEQUANTISED container
+        /* Prefer deq_logits.f32: the numpy oracle run on the dequantised container
          * weights. Comparing against the fp32 HF logits instead conflates engine
          * bugs with q4_0's own error, which on a random fixture is ~10% and would
          * drown any bug worth finding. */
@@ -2982,9 +2927,9 @@ int main(int argc, char **argv) {
         printf("expert reads: %lld (%lld hits, %lld misses)\n",
                tot, (long long)m.hit, (long long)m.miss);
         /* Tolerance depends on the build: with exact activations the engine must
-         * reproduce the oracle to float precision (any gap is a bug). The default
-         * build quantises activations to int8 (Q8_0), which costs ~1e-2 on logits
-         * -- real, expected, and not a bug. Argmax must agree either way. */
+         * reproduce the oracle to float precision, and any gap is a bug. The default
+         * build quantises activations to int8 (Q8_0), which costs ~1e-2 on logits.
+         * Argmax must agree either way. */
 #ifdef COLI_F32ACT
         double tol = 1e-4;
 #else
@@ -3022,7 +2967,7 @@ int main(int argc, char **argv) {
             if (np <= 0) { fprintf(stderr, "empty prompt\n"); return 1; }
         }
 
-        /* ---- interactive multi-turn chat (--chat, or no prompt for compatibility) ---- */
+        /* interactive multi-turn chat (--chat, or no prompt for compatibility) */
         int interactive = (chat_mode || (!prompt && !check));
         int first_prompt = (chat_mode && prompt != NULL);
         int *cached_ids = NULL;
@@ -3105,7 +3050,7 @@ int main(int argc, char **argv) {
                     forward(&m, ids + common, np - common, common, logits, 1, b);
                 }
             } else {
-                /* ---- one-shot prefill (prompt given on command line) ---- */
+                /* one-shot prefill (prompt given on command line) */
                 double t0p = now();
                 forward(&m, ids, np, 0, logits, 1, b);
                 tpre = now() - t0p;
@@ -3166,8 +3111,8 @@ int main(int argc, char **argv) {
             }
 
             if (use_dflash) {
-                /* DFlash block-parallel speculative decode. ONE target forward per
-                 * step: it verifies the drafts AND writes the KV / draft context of
+                /* DFlash block-parallel speculative decode. One target forward per
+                 * step: it verifies the drafts and writes the KV / draft context of
                  * the previous step's bonus token (block position 0), exactly like
                  * the reference's rolling block. */
                 int cur = sample(logits, c->vocab, temp, topp, topk, pbuf, &rng);

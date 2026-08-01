@@ -12,7 +12,7 @@ merge rule to token IDs here, offline:
 and the engine's BPE inner loop becomes an integer hash probe. The 262K vocab and
 ~1M merge rules are then just two flat arrays.
 
-FORMAT (little-endian):
+Format (little-endian):
   magic "G4TK"           u32
   n_vocab               u32
   n_merges              u32

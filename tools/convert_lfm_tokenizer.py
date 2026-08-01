@@ -31,7 +31,7 @@ wrong:
 As in convert_tokenizer.py, merge rules are resolved to token IDs offline so the
 engine's inner loop is integer-only.
 
-FORMAT (little-endian):
+Format (little-endian):
   magic "LFTK"           u32
   n_vocab               u32
   n_merges              u32

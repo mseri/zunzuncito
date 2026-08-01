@@ -5,16 +5,16 @@ convert_lfm25.py — LiquidAI LFM2.5-8B-A1B (HF safetensors) -> lfm25 container.
 Same container shape as convert_gemma4.py (manifest.txt + dense.bin + experts.bin,
 one expert = one contiguous 4096-aligned pread), but two things differ.
 
-ARCHITECTURE. LFM2.5 is a HYBRID: 24 layers of which only 6 are attention and 18
-are short convolutions, and the first `num_dense_layers` use a dense SwiGLU MLP
-instead of the MoE. So `layer_types` here means conv-vs-attention (not sliding-vs-
-global), and layers 0..num_dense_layers-1 carry an MLP in dense.bin while the rest
-carry a router + 32 experts in experts.bin.
+The architecture is hybrid: 24 layers of which only 6 are attention and 18 are short
+convolutions, and the first `num_dense_layers` use a dense SwiGLU MLP instead of the
+MoE. So `layer_types` here means conv-vs-attention rather than sliding-vs-global, and
+layers 0..num_dense_layers-1 carry an MLP in dense.bin while the rest carry a router
++ 32 experts in experts.bin.
 
-MIXED PRECISION (the apex-quant idea, ported). apex-quant assigns different quant
-types per tensor class, exploiting that routed experts are ~97% idle and tolerate
-far more error than the always-on tensors. Its Q3_K..Q8_0 gradient maps onto the two
-block formats this engine has kernels for:
+Mixed precision comes from apex-quant, which assigns different quant types per tensor
+class, exploiting that routed experts are ~97% idle and tolerate far more error than
+the always-on tensors. Its Q3_K..Q8_0 gradient maps onto the two block formats this
+engine has kernels for:
 
     always-on  (attention, conv, dense MLP)  -> q8_0    (apex: Q6_K/Q8_0)
     routed experts, edge layers              -> q8_0    (apex: Q6_K)
@@ -44,7 +44,7 @@ BLK40, BLK80 = 18, 34
 FMT_F32, FMT_Q40, FMT_Q80 = 0, 1, 2
 
 
-# ------------------------------------------------ q4_0 (mirrors q40.h bit-for-bit)
+# q4_0 (mirrors q40.h bit-for-bit)
 def q40_quant_rows(w: np.ndarray) -> bytes:
     O, I = w.shape
     assert I % QK == 0, f"I={I} not a multiple of {QK}"
@@ -53,7 +53,7 @@ def q40_quant_rows(w: np.ndarray) -> bytes:
     ai = np.abs(x).argmax(axis=2)
     mx = np.take_along_axis(x, ai[:, :, None], axis=2)[:, :, 0]
     d = (mx / -8.0).astype(np.float32)
-    d = d.astype(np.float16).astype(np.float32)     # round d to fp16 BEFORE deriving id
+    d = d.astype(np.float16).astype(np.float32)     # round d to fp16 before deriving id
     idv = np.where(d != 0, 1.0 / np.where(d != 0, d, 1.0), 0.0).astype(np.float32)
     q = np.floor(x * idv[:, :, None] + 8.5).astype(np.int32)
     np.clip(q, 0, 15, out=q)
@@ -75,7 +75,7 @@ def q40_dequant_rows(buf, O, I):
     return (w * d[:, :, None]).reshape(O, I)
 
 
-# ------------------------------------------------ q8_0 (mirrors q40.h's q80_*)
+# q8_0 (mirrors q40.h's q80_*)
 def q80_quant_rows(w: np.ndarray) -> bytes:
     O, I = w.shape
     assert I % QK == 0, f"I={I} not a multiple of {QK}"
@@ -124,7 +124,7 @@ def dequant_rows(fmt, buf, O, I):
     return np.frombuffer(buf, np.float32).reshape(O, I)
 
 
-# ------------------------------------------------------------------ safetensors
+# safetensors
 _DT = {"F32": np.float32, "F16": np.float16, "I8": np.int8, "U8": np.uint8,
        "I32": np.int32, "I64": np.int64}
 
@@ -176,7 +176,7 @@ class Shards:
         return a.reshape(e["shape"])
 
 
-# ------------------------------------------------------------------ dense writer
+# dense writer
 class Dense:
     def __init__(self, path):
         self.f = open(path, "wb")
@@ -198,7 +198,7 @@ class Dense:
         self.f.close()
 
 
-# ------------------------------------------------------------------ RAM planner
+# RAM planner
 def plan(cfg, dense_bytes, esz_by_layer, ctx, ram_gb, kv=None):
     """slots/layer for the per-layer LRU expert cache under a RAM budget.
 
@@ -236,8 +236,8 @@ def plan(cfg, dense_bytes, esz_by_layer, ctx, ram_gb, kv=None):
     avail = int(ram_gb * (1 << 30)) - dense_bytes - kvbytes - convstate - scratch
     per = min(NE, max(0, avail // esz_max) // max(1, nmoe)) if esz_max else NE
     total = sum(esz_by_layer[li] * NE for li in moe)
-    # Budgeted against the LARGEST expert so the plan is safe on every layer, but
-    # REPORTED at the true per-layer sizes -- otherwise a mixed-precision container
+    # Budgeted against the largest expert so the plan holds on every layer, but
+    # reported at the true per-layer sizes: otherwise a mixed-precision container
     # claims a cache bigger than the expert set it is caching.
     cache = int(per) * sum(esz_by_layer[li] for li in moe)
     return {
@@ -250,7 +250,7 @@ def plan(cfg, dense_bytes, esz_by_layer, ctx, ram_gb, kv=None):
     }
 
 
-# ------------------------------------------------------------------ fixture
+# fixture
 def make_fixture(dst):
     """A tiny random LFM2-MoE with the same STRUCTURE (conv + attention layers,
     dense + MoE layers, sigmoid router with bias) and absurd dimensions. It exists
@@ -313,7 +313,7 @@ class DictShards:
         return self.T[n]
 
 
-# ------------------------------------------------------------------ build
+# build
 def build(src, dst, ctx, ram, expert_edge, embed_q8, verify, fixture=False):
     os.makedirs(dst, exist_ok=True)
 
@@ -354,14 +354,14 @@ def build(src, dst, ctx, ram, expert_edge, embed_q8, verify, fixture=False):
     L, NE, CL = cfg["n_layers"], cfg["n_experts"], cfg["conv_L"]
     ND = cfg["n_dense_layers"]
 
-    # ---- the apex precision gradient, resolved to a per-layer expert format ----
+    # the apex precision gradient, resolved to a per-layer expert format
     moe_layers = [li for li in range(L) if li >= ND]
     edge = set(moe_layers[:expert_edge] + moe_layers[-expert_edge:]) if expert_edge else set()
     expert_fmt = [0] * L
     for li in moe_layers:
         expert_fmt[li] = FMT_Q80 if li in edge else FMT_Q40
 
-    # ---------------- dense ----------------
+    # dense
     dn = Dense(os.path.join(dst, "dense.bin"))
     ALWAYS = FMT_Q80                          # attention / conv / dense MLP
     dn.add("embed_tokens", S.get("model.embed_tokens.weight"),
@@ -404,7 +404,7 @@ def build(src, dst, ctx, ram, expert_edge, embed_q8, verify, fixture=False):
     dense_bytes = dn.off
     dn.close()
 
-    # ---------------- experts ----------------
+    # experts
     ALIGN = 4096
     gb_l, db_l, esz_l = [0] * L, [0] * L, [0] * L
     for li in moe_layers:
@@ -441,7 +441,7 @@ def build(src, dst, ctx, ram, expert_edge, embed_q8, verify, fixture=False):
     if verify:
         print(f"verify: max |w - dequant(quant(w))| = {worst:.6g}")
 
-    # ---------------- plan ----------------
+    # plan
     p = plan(cfg, dense_bytes, esz_l, ctx, ram)
     cfg["slots_per_layer"] = p["slots_per_layer"]
     json.dump(cfg, open(os.path.join(dst, "cfg.json"), "w"), indent=1)

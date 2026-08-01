@@ -2,31 +2,31 @@
 """
 convert_gemma4.py — Gemma-4 26B-A4B (QAT q4_0-unquantized) -> colibri container.
 
-OUTPUT
+It writes:
   dense.bin / dense.idx     resident: embeddings, norms, attention, the per-layer
                             dense MLP (the "shared expert"), router. Matrices in
                             q4_0; norms/scalars in f32.
-  experts.bin / experts.idx streamed: 30 x 128 experts, q4_0, each expert ONE
+  experts.bin / experts.idx streamed: 30 x 128 experts, q4_0, each expert a single
                             contiguous 4096-aligned blob -> one pread, no seek.
   cfg.json                  flattened config for the engine.
 
-WHY q4_0 EVERYWHERE (dense too, not colibri's per-row fmt=2)
-  One format, one kernel, and -- the reason that matters -- dense lands at 1.31 GB
-  instead of ~2 GB, which is what makes a 4 GB budget feasible at all. q4_0 also
-  carries its fp16 scales INSIDE the weight bytes (one per 32 weights), so an
-  expert is a single contiguous byte range: no companion scale tensor to seek to.
-  With 240 expert reads per token, halving the read COUNT matters more than
-  anything we could do to bandwidth.
+Everything is q4_0, dense included, rather than colibri's per-row fmt=2. One format,
+one kernel, and -- the reason that matters -- dense lands at 1.31 GB instead of
+~2 GB, which is what makes a 4 GB budget feasible at all. q4_0 also carries its fp16
+scales inside the weight bytes (one per 32 weights), so an expert is a single
+contiguous byte range with no companion scale tensor to seek to. With 240 expert
+reads per token, halving the read count matters more than anything we could do to
+bandwidth.
 
-EXPERT LAYOUT (per expert): [ gate | up | down ], all q4_0, 4096-aligned.
+Each expert is laid out as [ gate | up | down ], all q4_0, 4096-aligned:
   gate [MI, D], up [MI, D], down [D, MI]  ->  3,346,176 B (~3.19 MiB) at the real
   dims (D=2816, MI=704).
 
-  gate_up_proj ships as [E, 2*MI, D] -- ALREADY [out, in], since Gemma4TextExperts
-  does F.linear(x, gate_up_proj[e]) then .chunk(2, dim=-1) on the OUTPUT. So gate
-  = rows [0:MI], up = rows [MI:2*MI], and NO transpose is needed. down_proj is
+  gate_up_proj ships as [E, 2*MI, D], already [out, in], since Gemma4TextExperts
+  does F.linear(x, gate_up_proj[e]) then .chunk(2, dim=-1) on the output. So gate
+  = rows [0:MI], up = rows [MI:2*MI], and no transpose is needed. down_proj is
   [E, D, MI], likewise already [out, in]. Shapes are asserted: an accidental
-  transpose here is silent garbage, not a crash.
+  transpose here is silent garbage rather than a crash.
 """
 import argparse, json, os, struct, sys
 import numpy as np
@@ -34,20 +34,20 @@ import numpy as np
 QK, BLK = 32, 18
 
 
-# ------------------------------------------------- q4_0 (mirrors q40.h bit-for-bit)
+# q4_0 (mirrors q40.h bit-for-bit)
 def q40_quant_rows(w: np.ndarray) -> bytes:
     O, I = w.shape
     assert I % QK == 0, f"I={I} not a multiple of {QK}"
     nb = I // QK
     x = w.reshape(O, nb, QK).astype(np.float32)
 
-    # q4_0's codebook is asymmetric (d*[-8..+7]), so the scale keys off the SIGNED
-    # max-|.| element, not its magnitude.
+    # q4_0's codebook is asymmetric (d*[-8..+7]), so the scale keys off the signed
+    # max-|.| element rather than its magnitude.
     ai = np.abs(x).argmax(axis=2)
     mx = np.take_along_axis(x, ai[:, :, None], axis=2)[:, :, 0]
 
     d = (mx / -8.0).astype(np.float32)
-    d = d.astype(np.float16).astype(np.float32)   # round to fp16 BEFORE deriving id:
+    d = d.astype(np.float16).astype(np.float32)   # round to fp16 before deriving id:
                                                   # the decoder only ever sees the fp16
                                                   # value, so quantising against the
                                                   # unrounded scale would push the weight
@@ -79,7 +79,7 @@ def q40_bytes(O, I):
     return O * (I // QK) * BLK
 
 
-# ------------------------------------------------------------------ safetensors
+# safetensors
 _DT = {"F32": np.float32, "F16": np.float16, "I8": np.int8, "U8": np.uint8}
 
 
@@ -127,7 +127,7 @@ class Shards:
         return a.reshape(e["shape"])
 
 
-# ------------------------------------------------------------------ dense writer
+# dense writer
 class Dense:
     def __init__(self, path):
         self.f = open(path, "wb")
@@ -154,18 +154,18 @@ class Dense:
         json.dump(self.idx, open(path, "w"))
 
 
-# ------------------------------------------------------------------ RAM planner
+# RAM planner
 def plan(cfg, dense_bytes, ctx, ram_gb, kv=None):
     """slots/layer for the per-layer LRU expert cache under a RAM budget.
 
-    FLOOR: a layer must be able to hold the topk experts the current token routes
+    There is a floor: a layer must hold the topk experts the current token routes
     to, or the cache thrashes within a single forward. Below that we say so rather
     than pretend.
     """
     D, L, NE, MI = cfg["hidden"], cfg["n_layers"], cfg["n_experts"], cfg["moe_inter"]
     esz = 2 * q40_bytes(MI, D) + q40_bytes(D, MI)
 
-    # NOTE attention_k_eq_v does NOT halve storage: K and V share the k projection
+    # attention_k_eq_v does not halve storage: K and V share the k projection
     # but differ afterwards (K = rope(k_norm(raw)), V = v_norm(raw)), so the engine
     # caches both. An earlier version of this planner counted global layers once and
     # under-reported their KV by 2x.
@@ -204,7 +204,7 @@ def plan(cfg, dense_bytes, ctx, ram_gb, kv=None):
     }
 
 
-# ------------------------------------------------------------------ build
+# build
 def build(src, dst, ctx, ram, verify, fixture=None):
     os.makedirs(dst, exist_ok=True)
 
@@ -224,8 +224,8 @@ def build(src, dst, ctx, ram, verify, fixture=None):
         #     backbone space so it can iterate there across draft steps;
         #   * enable_moe_block is false and num_experts is null.
         # Running it as an independent model therefore produces garbage, not a speedup.
-        # Supporting it means running the head INSIDE the target's forward, against the
-        # target's KV -- a different design from --draft, not a conversion problem.
+        # Supporting it means running the head inside the target's forward, against the
+        # target's KV: a different design from --draft, not a conversion problem.
         arch = (raw.get("architectures") or [""])[0]
         if raw.get("model_type") == "gemma4_assistant" or "Assistant" in arch:
             sys.exit(
@@ -273,7 +273,7 @@ def build(src, dst, ctx, ram, verify, fixture=None):
         ctx=ctx,
     )
 
-    # ---------------- dense ----------------
+    # dense
     dn = Dense(os.path.join(dst, "dense.bin"))
     dn.add_q40("embed_tokens", S.get(P + "embed_tokens.weight"))   # tied => lm_head too
     dn.add_f32("norm", S.get(P + "norm.weight"))
@@ -308,7 +308,7 @@ def build(src, dst, ctx, ram, verify, fixture=None):
     dense_bytes = dn.off
     dn.close(os.path.join(dst, "dense.idx"))
 
-    # ---------------- experts ----------------
+    # experts
     gb, db = q40_bytes(MI, D), q40_bytes(D, MI)
     esz, ALIGN = 2 * gb + db, 4096
     idx, off, worst = {}, 0, 0.0
@@ -344,7 +344,7 @@ def build(src, dst, ctx, ram, verify, fixture=None):
     if verify:
         print(f"verify: max |w - dequant(quant(w))| = {worst:.6g}")
 
-    # ---------------- plan ----------------
+    # plan
     p = plan(cfg, dense_bytes, ctx, ram)
     cfg["slots_per_layer"] = p["slots_per_layer"]
     json.dump(cfg, open(os.path.join(dst, "cfg.json"), "w"), indent=1)

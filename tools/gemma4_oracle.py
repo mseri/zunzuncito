@@ -31,7 +31,7 @@ import argparse
 import numpy as np
 
 
-# ------------------------------------------------------------------ primitives
+# primitives
 def rmsnorm(x, w, eps):
     """Gemma4RMSNorm. Computed in f32. w=None => with_scale=False."""
     x = x.astype(np.float32)
@@ -79,7 +79,7 @@ def softmax(x, axis=-1):
     return e / e.sum(axis=axis, keepdims=True)
 
 
-# ------------------------------------------------------------------ the model
+# the model
 class Gemma4Oracle:
     def __init__(self, W, cfg):
         self.W, self.c = W, cfg
@@ -95,7 +95,7 @@ class Gemma4Oracle:
         S = h.shape[0]
         k_eq_v = is_global and c["k_eq_v_global"]
 
-        # ---- attention ----
+        # attention
         x = rmsnorm(h, W[p + "input_layernorm.weight"], c["eps"])
 
         q = (x @ W[p + "self_attn.q_proj.weight"].T).reshape(S, n_h, head_dim)
@@ -133,7 +133,7 @@ class Gemma4Oracle:
         o = rmsnorm(o, W[p + "post_attention_layernorm.weight"], c["eps"])
         h = h + o
 
-        # ---- feed-forward: dense MLP and MoE are PARALLEL on DIFFERENT inputs ----
+        # feed-forward: dense MLP and MoE are PARALLEL on DIFFERENT inputs
         residual = h
 
         y = rmsnorm(residual, W[p + "pre_feedforward_layernorm.weight"], c["eps"])
@@ -197,7 +197,7 @@ class Gemma4Oracle:
         return logits
 
 
-# ------------------------------------------------------------------- self-test
+# self-test
 def selftest():
     import torch
     from transformers.models.gemma4.modeling_gemma4 import Gemma4TextModel

@@ -6,7 +6,7 @@
  * The shader is compiled at runtime with newLibraryWithSource, so there is no
  * .metallib to build, ship, or keep in sync with the binary. Costs ~50 ms once.
  *
- * Built WITHOUT ARC (-fno-objc-arc), deliberately. ARC restricts Objective-C pointers
+ * Built without ARC (-fno-objc-arc), deliberately. ARC restricts Objective-C pointers
  * as members of C structs, and the pointer->MTLBuffer map below is exactly that.
  * Under manual retain the lifetimes here are trivial: every object we create (device,
  * library, pipeline, queue, buffers) is kept for the life of the process and never
@@ -15,7 +15,7 @@
  *
  * See gpu.h for what is offloaded and why. Short version: the q4_0 matvec/matmul
  * only (~95% of the FLOPs); attention, routing, KV codec and the expert cache stay
- * on the CPU; and ANY failure here falls back to the CPU rather than aborting.
+ * on the CPU; and any failure here falls back to the CPU rather than aborting.
  */
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -24,7 +24,7 @@
 #include <string.h>
 #include <unistd.h>
 
-/* ------------------------------------------------------------------ shader */
+/* shader */
 static const char *kSrc = R"METAL(
 #include <metal_stdlib>
 using namespace metal;
@@ -34,14 +34,14 @@ using namespace metal;
 //   qs[j] high nibble -> weight j + 16
 //   w = d * (q - 8)
 //
-// One THREADGROUP per (output row, batch element); its 32 lanes stride over the
-// row's blocks and then reduce. One-row-per-thread would be simpler but leaves the
+// One threadgroup per (output row, batch element); its 32 lanes stride over the
+// row's blocks and then reduce. One row per thread would be simpler but leaves the
 // memory system idle -- the weights are the bandwidth here, and we want 32 lanes
 // streaming them concurrently.
 //
 // Activations are consumed as f32 (no int8 quantisation on the GPU), so this is
-// numerically identical to the CPU's q40_dot_f32 reference, and strictly MORE
-// accurate than the CPU's default int8-activation path.
+// numerically identical to the CPU's q40_dot_f32 reference, and more accurate than
+// the CPU's default int8-activation path.
 
 constant uint TG = 32;
 
@@ -52,7 +52,7 @@ kernel void q40_matmul(
     constant     uint   &O   [[buffer(3)]],
     constant     uint   &I   [[buffer(4)]],
     constant     uint   &S   [[buffer(5)]],
-    // Both position attributes MUST have the same dimensionality: Intel Macs' Metal
+    // Both position attributes must have the same dimensionality: Intel Macs' Metal
     // compiler rejects a uint2/uint mix outright ("all scalar types or all vector
     // types with the same number of elements"), while Apple silicon's accepts it.
     // uint3 for both is portable across every Metal device.
@@ -152,7 +152,7 @@ kernel void q80_matmul(
 }
 )METAL";
 
-/* ------------------------------------------------------------------ state */
+/* state */
 static id<MTLDevice>               g_dev  = nil;
 static id<MTLCommandQueue>         g_q    = nil;
 static id<MTLComputePipelineState> g_pipe = nil;   /* q4_0 */
@@ -226,8 +226,8 @@ int gpu_map(const void *p, size_t n) {
     @autoreleasepool {
         /* newBufferWithBytesNoCopy needs a page-aligned pointer and a page-multiple
          * length. Our allocator (posix_memalign, 4096) guarantees the alignment;
-         * round the length up. The GPU then reads the SAME pages the expert cache
-         * streamed into -- no host->device copy anywhere in the hot path. */
+         * round the length up. The GPU then reads the same pages the expert cache
+         * streamed into, with no host->device copy anywhere in the hot path. */
         size_t pg = (size_t)getpagesize();
         if ((uintptr_t)p & (uintptr_t)(pg - 1)) return 0;
         size_t len = (n + pg - 1) & ~(pg - 1);

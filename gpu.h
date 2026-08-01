@@ -1,39 +1,35 @@
 /* gpu.h — Metal backend interface (Apple silicon / Intel Mac with a Metal GPU).
  *
- * WHAT IS OFFLOADED, AND WHY ONLY THIS
- *   The quantised matvec/matmul -- q4_0 and q8_0, one kernel each -- which is ~95%
- *   of the arithmetic: the attention projections, the dense MLP, and the expert
- *   GEMMs. Nothing else. (gemma4 is q4_0 throughout; lfm25's apex gradient makes its
- *   always-on tensors q8_0, hence the second kernel.)
+ * Only the quantised matvec/matmul is offloaded -- q4_0 and q8_0, one kernel each --
+ * which is ~95% of the arithmetic: the attention projections, the dense MLP, and the
+ * expert GEMMs. (gemma4 is q4_0 throughout; lfm25's apex gradient makes its always-on
+ * tensors q8_0, hence the second kernel.)
  *
- *   Attention, routing, KV codec and the expert cache stay on the CPU on purpose:
- *   they are small, branchy, or I/O-bound, and at a 4-8 GB budget this engine is
- *   disk-bound anyway (~800 MB of expert reads per token against 7.6 GFLOP of
- *   compute), so moving arithmetic to the GPU does not help you wait on NVMe.
+ * Attention, routing, the KV codec and the expert cache stay on the CPU on purpose:
+ * they are small, branchy, or I/O-bound, and at a 4-8 GB budget this engine is
+ * disk-bound anyway (~800 MB of expert reads per token against 7.6 GFLOP of compute),
+ * so moving arithmetic to the GPU does not help you wait on NVMe.
  *
- *   Metal pays for itself in two places:
- *     * prefill, which is batched and genuinely compute-bound;
- *     * a 16 GB machine, where the whole container is resident, there is no disk in
- *       the loop, and the ~400 GB/s of unified memory bandwidth beats the CPU's ~100.
- *   Expect little from it during 4 GB decode; that is the workload, not a defect.
+ * Metal pays for itself in two places:
+ *   * prefill, which is batched and genuinely compute-bound;
+ *   * a 16 GB machine, where the whole container is resident, there is no disk in
+ *     the loop, and the ~400 GB/s of unified memory bandwidth beats the CPU's ~100.
+ * Expect little from it during 4 GB decode.
  *
- * UNIFIED MEMORY
- *   Expert slots and the dense blob are page-aligned (posix_memalign, 4096) and
- *   wrapped with newBufferWithBytesNoCopy, so the GPU reads the SAME pages the
- *   streaming cache filled. There is no host->device copy anywhere in the hot path;
- *   a copy would cost more than the matmul saves.
+ * Expert slots and the dense blob are page-aligned (posix_memalign, 4096) and wrapped
+ * with newBufferWithBytesNoCopy, so the GPU reads the same pages the streaming cache
+ * filled. There is no host->device copy anywhere in the hot path; one would cost more
+ * than the matmul saves.
  *
- * NUMERICS
- *   The Metal kernel consumes f32 activations and decodes q4_0 weights on the fly, so
- *   it is numerically equivalent to the CPU's q40_dot_f32: it matches the COLI_F32ACT
- *   reference path and is strictly more accurate than the default int8 activation
- *   path. `--check-gpu` diffs the two and prints the max relative error; run it once
- *   on your machine before trusting any output.
+ * The Metal kernel consumes f32 activations and decodes q4_0 weights on the fly, so
+ * it is numerically equivalent to the CPU's q40_dot_f32: it matches the COLI_F32ACT
+ * reference path and is more accurate than the default int8 activation path.
+ * `--check-gpu` diffs the two and prints the max relative error; run it once on your
+ * machine before trusting any output.
  *
- * FAILURE POLICY
- *   Every entry point is fallible. No Metal device, shader compile failure, buffer
- *   allocation failure -> gpu_init returns 0 and the engine runs entirely on the CPU.
- *   Metal is never load-bearing for correctness.
+ * Every entry point is fallible. No Metal device, a shader compile failure or a
+ * buffer allocation failure all leave gpu_init returning 0 and the engine running
+ * entirely on the CPU, so correctness never depends on Metal.
  */
 #ifndef COLI_GPU_H
 #define COLI_GPU_H
@@ -79,7 +75,7 @@ int  gpu_matmul(int fmt, float *y, const uint8_t *W, const float *x,
 
 #else
 /* Non-Apple builds, or Metal explicitly disabled: every entry point becomes a no-op
- * that DECLINES. gemma4.c needs no #ifdefs in its hot path -- it just asks the GPU,
+ * that declines. gemma4.c then needs no #ifdefs in its hot path -- it asks the GPU,
  * is told no, and runs on the CPU. */
 static inline int  gpu_init(void)        { return 0; }
 static inline void gpu_shutdown(void)    { }

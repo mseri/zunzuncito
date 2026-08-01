@@ -3,20 +3,20 @@
  * From tonbistudio/turboquant-pytorch (Google's TurboQuant, ICLR 2026), V3 variant:
  * MSE-only (no QJL), asymmetric K/V bit-widths, bit-packed, layer-adaptive.
  *
- * WHAT IT BUYS. Gemma-4's sliding layers cap their KV at 1024 positions, so 25 of 30
+ * What it buys: Gemma-4's sliding layers cap their KV at 1024 positions, so 25 of 30
  * layers cost a fixed 400 MiB whatever the context, and all KV growth is in the 5
  * global layers. At 4 GB and 4K ctx, quantising KV buys about one extra expert slot.
  * At 32K it takes the cache from 9 slots/layer to 21, and at 128K it is the
- * difference between running and not running. This is a CONTEXT-LENGTH feature, not
- * a general RAM feature.
+ * difference between running and not running. So this buys context length rather
+ * than RAM in general.
  *
- * THE ALGORITHM
+ * The algorithm:
  *   quantise:  x -> n = |x|, u = x/n -> RHT -> scale by sqrt(d) -> Lloyd-Max round
  *              each coordinate independently -> pack b bits/coord + store n
  *   restore:   unpack -> centroids -> /sqrt(d) -> inverse RHT -> * n
  *
  * The rotation is the trick: it makes every coordinate of a unit vector approximately
- * N(0, 1/d) whatever the original vector looked like, so ONE precomputed scalar
+ * N(0, 1/d) whatever the original vector looked like, so a single precomputed scalar
  * quantiser (Lloyd-Max for a standard normal) is optimal for every coordinate. No
  * per-tensor calibration, no outlier problem.
  *
@@ -26,8 +26,8 @@
  * requires d to be a power of two, and Gemma-4's head dims are 256 and 512, so this
  * is exact rather than a compromise.
  *
- * ON K4/V2. Upstream's corrected generation table has K4/V2 with no residual window
- * missing the needle at both 2K and 4K, and warns that "high attention score
+ * A word on K4/V2. Upstream's corrected generation table has K4/V2 with no residual
+ * window missing the needle at both 2K and 4K, and warns that "high attention score
  * similarity (99.5%+) does not guarantee working generation". The 99% top-1 figure
  * usually quoted for "K4/V2 + protected layers" comes from their attention-score
  * table, which is the one they say is not predictive. Their only config measured
@@ -45,11 +45,11 @@
 
 #define KVQ_MAXBITS 8
 /* Gemma-4 head dims are 256 (sliding) and 512 (global). Bounding this lets the codec
- * use fixed stack arrays instead of alloca -- which is a GNU-ism, and a stack-overflow
- * waiting to happen if a head dim ever grows. */
+ * use fixed stack arrays instead of alloca, which is a GNU-ism and would overflow the
+ * stack if a head dim ever grew. */
 #define KVQ_MAXD 1024
 
-/* ---------------------------------------------------------------- Lloyd-Max
+/* Lloyd-Max
  * Optimal scalar quantiser for a standard normal: centroids solving the
  * fixed point c_i = E[X | X in cell_i], boundaries at the midpoints. Solved once
  * at startup by Lloyd iteration over a fine grid -- a few ms, no tables to ship. */
@@ -100,7 +100,7 @@ static inline int kvq_round(const KvqLM *q, float v) {
     return lo;
 }
 
-/* ------------------------------------------------- randomised Hadamard transform */
+/* randomised Hadamard transform */
 /* in-place fast Walsh-Hadamard; d must be a power of two */
 static void kvq_fwht(float *a, int d) {
     for (int len = 1; len < d; len <<= 1)
@@ -125,7 +125,7 @@ static inline void kvq_irht(float *a, const int8_t *sign, int d) {
     for (int i = 0; i < d; i++) a[i] *= s * sign[i];
 }
 
-/* ------------------------------------------------------------------ bit packing */
+/* bit packing */
 static inline void kvq_pack(uint8_t *dst, const int *q, int d, int bits) {
     memset(dst, 0, ((size_t)d * bits + 7) / 8);
     for (int i = 0; i < d; i++) {
@@ -145,7 +145,7 @@ static inline void kvq_unpack(const uint8_t *src, int *q, int d, int bits) {
     }
 }
 
-/* ------------------------------------------------------------------ the codec */
+/* the codec */
 typedef struct {
     int d, bits;
     int8_t *sign;          /* [d] the RHT's random sign flips */

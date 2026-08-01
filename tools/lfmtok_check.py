@@ -16,11 +16,11 @@ Needs `tokenizers` (or `transformers`) for the reference.
 import argparse, json, random, subprocess, sys, os
 
 
-# ---------------------------------------------------------------- reference
-# Used only when `tokenizers`/`transformers` is unavailable. It is a SECOND,
+# reference
+# Used only when `tokenizers`/`transformers` is unavailable. It is a second,
 # independent transcription of the same spec (straight-line Python against
 # str.isalpha()/isnumeric(), rather than C ranges + a hand-rolled state machine),
-# so it catches transcription bugs -- but it is NOT authoritative. Run the check
+# so it catches transcription bugs, but it is not authoritative. Run the check
 # again with the real HF tokenizer installed before trusting the tokenizer.
 WS = set([0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x20, 0x85, 0xA0, 0x1680,
           0x2028, 0x2029, 0x202F, 0x205F, 0x3000] + list(range(0x2000, 0x200B)))

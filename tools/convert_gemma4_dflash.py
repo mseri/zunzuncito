@@ -8,10 +8,10 @@ the target backbone.
 
 The model is Qwen3-based (not Gemma4), with 5 decoder layers, each having its own
 q_proj, k_proj, v_proj, o_proj, q_norm, k_norm, and a plain MLP (gate/up/down).
-Attention is special: K/V come from BOTH the target hidden context AND the draft
-block's own tokens (concatenated), and the mask is bidirectional within the block.
+Attention is unusual: K/V come from the target hidden context and from the draft
+block's own tokens, concatenated, and the mask is bidirectional within the block.
 
-OUTPUT: dflash.bin / dflash.manifest.txt, same conventions as the main container
+It writes dflash.bin / dflash.manifest.txt, same conventions as the main container
 (q4_0 matrices, f32 norms).
 """
 import argparse, json, os, sys

@@ -1,22 +1,13 @@
-/* g4tok.h — SentencePiece-BPE tokenizer for Gemma-4 (262K vocab, byte_fallback).
+/* g4tok.h — Gemma-4's tokenizer, against the container tools/convert_tokenizer.py
+ * writes.
  *
- * Loads the flat container produced by tools/convert_tokenizer.py. Every merge rule
- * was resolved to token IDs offline, so the BPE loop here is integer-only: no string
- * comparisons, no hashing of substrings. Merge lookup is a single open-addressed
- * probe on the 64-bit key (a << 32 | b).
+ * Every merge rule was resolved to token IDs offline, so the BPE loop here is
+ * integer-only: no string comparisons, no hashing of substrings. Merge lookup is a
+ * single open-addressed probe on the 64-bit key (a << 32 | b), and symbols live in a
+ * doubly-linked list so a merge is O(1).
  *
- * ENCODE
- *   1. normalise: apply the Replace rules (Gemma's is ' ' -> U+2581 "▁").
- *   2. carve out special/added tokens by exact match (control tokens like <|think|>
- *      must never be BPE'd).
- *   3. seed symbols: one per UTF-8 codepoint. A codepoint absent from the vocab
- *      falls back to its raw BYTES as <0xNN> tokens -- that is what byte_fallback
- *      means, and it is why this tokenizer can never emit <unk> on valid UTF-8.
- *   4. BPE: repeatedly apply the lowest-RANK applicable merge. Rank, not greed:
- *      picking the leftmost or the longest merge gives different (wrong) output.
- *
- * Symbols live in a doubly-linked list so a merge is O(1) and the scan is O(n) per
- * round. Prompts are short; this is not the bottleneck (a 3.19 MiB expert read is).
+ * Merges apply in rank order. Taking the leftmost or the longest instead gives wrong
+ * output, which is the one easy way to get this subtly wrong.
  */
 #ifndef G4TOK_H
 #define G4TOK_H
@@ -169,7 +160,7 @@ bad:
     return NULL;
 }
 
-/* ------------------------------------------------------------------ encode */
+/* encode */
 typedef struct { int32_t id; int prev, next; } G4Sym;
 
 /* BPE one span of normalised text (no special tokens inside) */
@@ -191,7 +182,7 @@ static int g4_bpe(const G4Tok *t, const char *s, int n, int *out, int cap, int n
              * byte_fallback tokenizer never produces <unk> on valid UTF-8.
              * If the vocab lacks the byte tokens (only possible in a degenerate
              * vocab -- the real Gemma one has all 256), fall back to a single unk
-             * for the whole codepoint rather than DROPPING the input. */
+             * for the whole codepoint rather than dropping the input. */
             int have = 1;
             for (int k = 0; k < len; k++)
                 if (t->byte_tok[(unsigned char)s[i + k]] < 0) { have = 0; break; }
@@ -210,8 +201,8 @@ static int g4_bpe(const G4Tok *t, const char *s, int n, int *out, int cap, int n
     }
     if (ns) sy[ns - 1].next = -1;
 
-    /* repeatedly apply the LOWEST-RANK applicable merge (not the leftmost, not the
-     * longest -- rank order is what defines BPE, and the other two give wrong output) */
+    /* repeatedly apply the lowest-rank applicable merge, not the leftmost and not
+     * the longest: rank order defines BPE, and the other two give wrong output */
     for (;;) {
         int best = -1, brank = 0x7fffffff;
         int32_t bid = -1;
@@ -286,7 +277,7 @@ static int g4tok_encode(const G4Tok *t, const char *text, int *out, int cap) {
     return nout;
 }
 
-/* ------------------------------------------------------------------ decode */
+/* decode */
 static int g4tok_decode(const G4Tok *t, const int *ids, int n, char *out, int cap) {
     int m = 0;
     for (int i = 0; i < n; i++) {

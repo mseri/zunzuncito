@@ -1,25 +1,14 @@
-/* lfmtok.h — ByteLevel (GPT-2 style) BPE tokenizer for LFM2.5 (128K vocab).
+/* lfmtok.h — LFM2.5's tokenizer. Same container and integer-only BPE as g4tok.h;
+ * what differs is the pre-tokenizer.
  *
- * The counterpart of g4tok.h for a completely different tokenizer family. Gemma's
- * is SentencePiece: normalise, then BPE the whole string, with byte_fallback to
- * catch anything unknown. LFM2.5's is ByteLevel:
+ * The input is split on the Qwen2/Llama-3 regex before BPE, and merges never cross a
+ * piece boundary. Skipping the split silently produces different ids, so it is not an
+ * optimisation to drop.
  *
- *   1. carve out special/added tokens by exact match on the RAW text.
- *   2. SPLIT each gap with the Qwen2/Llama-3 pre-tokenizer regex. BPE runs
- *      independently per piece and merges NEVER cross a piece boundary. Skipping
- *      this step silently produces different ids -- it is not an optimisation.
- *   3. map each byte of a piece through the GPT-2 byte->unicode table, so BPE
- *      operates in an alphabet of 256 printable characters ('Ġ' for space, etc.).
- *      There is no byte_fallback and no <unk>: every byte is always representable,
- *      so this tokenizer cannot fail on arbitrary input, including invalid UTF-8.
- *   4. ignore_merges: if the piece's byte-level spelling IS a vocab token, emit it
- *      directly without running BPE.
- *   5. otherwise BPE by lowest RANK, exactly as in g4tok.h.
- *
- * The regex is hand-coded (step 2) following the structure llama.cpp uses for the
- * same pattern. It needs Unicode \p{L} / \p{N} membership, which the converter
- * ships as sorted ranges in the container (binary-searched here); \s is the
- * 25-codepoint White_Space set and is hardcoded.
+ * The regex is hand-coded, following the structure llama.cpp uses for the same
+ * pattern. It needs Unicode \p{L} / \p{N} membership, which the converter ships as
+ * sorted ranges in the container (binary-searched here); \s is the 25-codepoint
+ * White_Space set and is hardcoded.
  */
 #ifndef LFMTOK_H
 #define LFMTOK_H
@@ -56,7 +45,7 @@ typedef struct {
     int16_t u2b[512];      /* codepoint -> byte, or -1 */
 } LfmTok;
 
-/* ------------------------------------------------------------------ hashing */
+/* hashing */
 static uint64_t lfm_hash(const char *s, int n) {
     uint64_t h = 1469598103934665603ULL;
     for (int i = 0; i < n; i++) { h ^= (unsigned char)s[i]; h *= 1099511628211ULL; }
@@ -88,7 +77,7 @@ static int lfm_merge_find(const LfmTok *t, int32_t a, int32_t b, int32_t *id) {
 
 static size_t lfm_pow2(size_t n) { size_t c = 8; while (c < n * 2) c <<= 1; return c; }
 
-/* ------------------------------------------------------- character classes */
+/* character classes */
 static int lfm_in_ranges(const LfmRange *r, int n, uint32_t c) {
     int lo = 0, hi = n - 1;
     while (lo <= hi) {
@@ -112,7 +101,7 @@ static int lfm_is_space(uint32_t c) {
            c == 0x2029 || c == 0x202F || c == 0x205F || c == 0x3000;
 }
 
-/* ------------------------------------------------------------------- UTF-8 */
+/* UTF-8 */
 /* Decode one codepoint. Invalid bytes decode as themselves (Latin-1), which keeps
  * the splitter total: byte-level BPE must never reject its input. */
 static int lfm_utf8_next(const char *s, int n, int i, uint32_t *cp) {
@@ -141,7 +130,7 @@ static int lfm_utf8_put(char *o, uint32_t c) {
     return 4;
 }
 
-/* -------------------------------------------------------------------- load */
+/* load */
 static void lfm_byte_table(LfmTok *t) {
     int used[256] = {0};
     int n = 0;
@@ -243,7 +232,7 @@ static int lfmtok_id(const LfmTok *t, const char *name) {
     return -1;
 }
 
-/* ------------------------------------------------------------------ BPE */
+/* BPE */
 typedef struct { int32_t id; int prev, next; } LfmSym;
 
 /* BPE one pre-tokenizer piece, given as RAW bytes. */
@@ -304,13 +293,13 @@ static int lfm_bpe(const LfmTok *t, const char *s, int n, int *out, int cap, int
     return nout;
 }
 
-/* ------------------------------------------------------- pre-tokenizer split
+/* pre-tokenizer split
  *
  * Hand-coded equivalent of
  *   (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}
  *   | ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
  * Alternatives are tried in order, exactly as the regex engine would.
- * Returns the number of CODEPOINTS consumed starting at `i` (always >= 1). */
+ * Returns the number of codepoints consumed starting at `i` (always >= 1). */
 static int lfm_split_one(const LfmTok *t, const uint32_t *cp, int n, int i) {
     #define CP(k) ((i + (k) < n) ? cp[i + (k)] : 0u)
     #define LOWER(c) (((c) >= 'A' && (c) <= 'Z') ? (c) + 32 : (c))
@@ -359,7 +348,7 @@ static int lfm_split_one(const LfmTok *t, const uint32_t *cp, int n, int i) {
     }
 
     /* 5/6/7. the whitespace runs. Measure the whole run once, then decide:
-     *   \s*[\r\n]+   -> cut after the LAST newline in the run
+     *   \s*[\r\n]+   -> cut after the last newline in the run
      *   \s+(?!\S)    -> a run followed by a non-space keeps one space back, so the
      *                   next piece can start with " x" via alternative 2 or 4
      *   \s+          -> otherwise the whole run */
@@ -379,7 +368,7 @@ static int lfm_split_one(const LfmTok *t, const uint32_t *cp, int n, int i) {
     #undef LOWER
 }
 
-/* ------------------------------------------------------------------ encode */
+/* encode */
 static int lfmtok_encode(const LfmTok *t, const char *text, int *out, int cap) {
     size_t bn = strlen(text);
     int nout = 0;
@@ -433,7 +422,7 @@ static int lfmtok_encode(const LfmTok *t, const char *text, int *out, int cap) {
     return nout;
 }
 
-/* ------------------------------------------------------------------ decode */
+/* decode */
 static int lfmtok_decode(const LfmTok *t, const int *ids, int n, char *out, int cap) {
     int m = 0;
     for (int i = 0; i < n; i++) {
