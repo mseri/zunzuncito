@@ -6,10 +6,13 @@ gemma4
 gemma4-exact
 lfm25
 lfm25-exact
+maple
+maple-exact
 test_kvq
 test_lfmtok
 test_metal_sim
 test_q40
+test_tq2
 venv/
 .venv/
 vendor/
@@ -17,3 +20,4 @@ __pycache__/
 temp/
 lfm/
 lfm-ct/
+maple-ct/

@@ -1,17 +1,18 @@
 # zunzuncito — colibrì-style MoE engines for a small-RAM machine
 
-Two engines share this repo, along with the q4_0/q8_0 kernels (`q40.h`), the
-TurboQuant KV cache (`kvq.h`), the OpenAI server, and one idea: stream the routed
-experts from disk under an expert-granular cache instead of leaving it to the OS page
-cache.
+Three engines share this repo, along with the q4_0/q8_0 kernels (`q40.h`), the ternary
+kernels (`tq2.h`), the TurboQuant KV cache (`kvq.h`), the OpenAI server, and one idea:
+stream the routed experts from disk under an expert-granular cache instead of leaving
+it to the OS page cache.
 
 | binary | model | notes |
 |--------|-------|-------|
 | `gemma4` | Gemma-4 26B-A4B | 30 attention layers, 128 experts/layer, MTP + DFlash speculation |
 | `lfm25`  | [LFM2.5-8B-A1B](https://huggingface.co/LiquidAI/LFM2.5-8B-A1B) | hybrid 18 short-conv + 6 attention layers, 32 tiny experts/layer, apex-quant mixed precision |
+| `maple`  | [Maple-preview 20B-A1B](https://github.com/deepgrove-ai/mlx-lm-deepgrove) | ternary throughout, 256 experts/layer, sliding + full attention, FlashHead |
 
-Most of this README is about `gemma4`; see [LFM2.5-8B-A1B](#lfm25--lfm25-8b-a1b) for
-the other one.
+Most of this README is about `gemma4`; see [LFM2.5-8B-A1B](#lfm25--lfm25-8b-a1b) and
+[Maple](#maple--maple-preview-20b-a1b) for the other two.
 
 ## gemma4 — Gemma-4 26B-A4B
 
@@ -424,6 +425,167 @@ batch prefill         ──►  sequential         bit-identical
 expert pinning        ──►  unpinned           bit-identical
 HF tokenizer          ──►  lfmtok.h           475/475 exact (incl. 400 fuzzed)
 ```
+
+## maple — Maple-preview 20B-A1B
+
+`maple` runs DeepGrove's Maple preview, a 20 B-parameter MoE with ~1 B active. The
+premise is different from the other two: the checkpoint is ternary. Every matrix in
+the model, the four attention projections and all three expert projections, is stored
+as 2-bit codes with one scale per output row, and across the whole checkpoint those
+codes only ever take the values 0, 1 and 2:
+
+```
+w = alpha_row * (code - 1)          so every weight is -alpha, 0 or +alpha
+```
+
+That is trained, not something the converter chose, and it changes what this engine
+has to decide. There is no `--expert-edge` and no q8_0 tier: apex-quant's premise is
+that routed experts tolerate more error than always-on tensors, and here both are
+already at the floor. The converter's job is to repack losslessly, and `--verify`
+checks exactly that: `max |w - dequant(pack(w))| = 0`, not "small".
+
+20 B of parameters land in a 4.57 GiB expert container plus 449 MiB resident, so an
+expert is 780 KiB against gemma4's 3.19 MiB and lfm25's 5.9 MiB. On an 8 GB machine
+roughly two thirds of the expert set stays cached at `--ram 4`.
+
+### The ternary kernel
+
+`tq2.h` is where the interesting part lives. Two things fall out of a per-row scale:
+
+1. The scale leaves the inner loop. q4_0 and q8_0 carry an fp16 scale per 32 weights,
+   so their kernels decode a scale and issue an FMA per block. Here a whole row is one
+   integer accumulation and one multiply at the end. So the layout is per tensor
+   rather than per row, `alpha[O]` then `codes[O][I/4]`, which also gives every code
+   row a clean power-of-two stride instead of q4_0's 18-bytes-per-block interleave.
+2. The -1 offset is free. With u8 codes and i8 activations,
+   `<c-1, x> = <c, x> - sum(x)`, and `sum(x)` depends on neither the row nor the
+   tensor nor the expert. It is one scalar per activation vector, computed once by
+   `tq2_quant_act` and subtracted at the end of every row of every tensor that
+   consumes it. q4_0 pays the equivalent correction (its -8) per block, per row.
+
+On NEON it is cheaper still: `sdot` multiplies signed by signed, so the codes become
+{-1,0,+1} with one `vsubq_s8` and the scalar is not needed at all. Both routes are
+exact integer arithmetic on the same operands, so the ISAs agree bit for bit.
+
+Three tensor classes are not ternary. The embedding table, the lm_head and the
+FlashHead centroids are 4-bit affine with a scale and a bias per group of 64, so
+`tq2.h` carries that format through too (`q4a`) rather than re-quantising onto q4_0,
+which would cost the same 36 bytes per 64 weights while throwing the zero point away.
+Norms and the router stay f32, since a routing error is not a small numeric error, it
+picks a different expert.
+
+### Attention
+
+Gemma-shaped rather than Llama-shaped: three sliding-window layers (512) to every full
+one, RoPE on the sliding layers only and NoPE on the full ones, partial rotary over
+the first half of each head, and qk-norm. The sliding layers cap their KV at 512
+positions however long the context is, so the KV costs a quarter of what 24 layers
+suggests: 132 MiB at ctx 4096, since only the 6 full layers store 4096 deep.
+`--kvq` therefore applies to the full-attention layers only; compressing a layer that
+is already bounded buys nothing and costs accuracy.
+
+One consequence worth stating because getting it wrong does not crash: a prefill batch
+cannot publish all its keys before attending. On a sliding layer the ring is exactly
+512 long, so writing position `p+127` would evict `p-385`, which row 0 of that same
+batch still needs. `attn_fwd` interleaves publish-and-attend per position; the
+projections above it are still batched.
+
+### FlashHead
+
+The one approximation on offer, and it is the checkpoint's own. The vocabulary is
+clustered into 4748 groups of 32; decode scores the centroids, takes the best 512
+clusters, and computes exact logits only for those 16384 tokens. Everything else is
+-inf, so greedy decoding is exact whenever the true argmax lies in a probed cluster.
+
+At 4 bits the lm_head is 151936 x 2048 = 175 MiB, the single biggest read of a decode
+step, more bytes than the rest of the model put together. Probing 512 clusters reads
+about 24 MiB instead.
+
+Measured on an M1, `--ram 4`, 4 threads, 100 tokens, best of 5, with the three
+configurations interleaved run-by-run. Consecutive blocks of runs drift by more than
+the effect being measured, which is enough to invert the answer:
+
+| head | decode |
+|------|--------|
+| exact | 30.8 tok/s |
+| flash, 512 probes (default) | 35.3 tok/s |
+| flash, 128 probes | 37.0 tok/s |
+
+So +15% at the shipped setting, not the 7x the byte count suggests: at ~1 B active
+params a decode step is not purely bandwidth-bound, and the fixed costs (attention over
+the full-attention layers, ~50 OpenMP fork/joins, the vocabulary-wide sampling scan)
+do not move. Sorting the probed ids to make the gather monotonic looked like an obvious
+further win and was worth 30.4 vs 30.3 tok/s, i.e. nothing, because a probed row is
+already 1152 contiguous bytes and the prefetcher had nothing left to gain from ordering
+the rows themselves. That negative result is recorded in `flash_logits` rather than
+the code.
+
+`--noflash` uses the exact head; `--probes N` overrides the cluster count.
+
+### Convert and run
+
+```sh
+python3 tools/convert_maple.py /path/to/maple-preview-mlx ./maple-ct --ram 4 --ctx 4096
+python3 tools/convert_lfm_tokenizer.py /path/to/maple-preview-mlx/tokenizer.json ./maple-ct/tok.bin
+./maple ./maple-ct --ram 4 "explain how a rainbow forms"
+```
+
+Maple reuses `lfmtok.h`: its tokenizer is the same Qwen2 byte-level BPE LFM2.5 uses.
+Two things differ and both are now container fields rather than assumptions: the
+digit run (`\p{N}` here, `\p{N}{1,3}` there) and an NFC normaliser. The engine does not
+implement NFC; instead the converter ships the set of codepoints whose NFC quick-check
+is not Yes, so `lfmtok_nfc_safe()` can prove the ids match HF's when none of them
+occurs (which covers ASCII, precomposed accents and every CJK script) and warn when
+they do. Existing `LFTK` containers still load unchanged.
+
+Measured on an M1 (8 GB, 4 threads), prefill on a 1605-token prompt:
+
+| `--ram` | slots/layer | prefill | decode | expert-cache hit |
+|---------|-------------|---------|--------|------------------|
+| 4 | 181/256 | 51.8 tok/s | 34.1 tok/s | 83% |
+| 3 | 125/256 | 52.0 tok/s | 34.5 tok/s | 82% |
+| 2 | 69/256 | 48.1 tok/s | 28.5 tok/s | 73% |
+
+Note there is no row for `--ram 8`: this is an 8 GB machine, so asking for the whole
+container resident costs more in memory pressure than the cache hits are worth, and it
+measures *slower* than `--ram 4` (30.9 against 34.2 tok/s). The budget is a budget for
+the whole machine, not for the process.
+
+`--pin` earns its keep here as it does elsewhere: at `--ram 3`, pinning 40 experts per
+layer from `usage.bin` (65.9% of past routing) lifts the hit rate from 77.8% to 84.5%
+and decode from 28.8 to 34.5 tok/s.
+
+Flags mirror the other two engines. Sampling defaults are 0.7 / 0.95 / 40. The chat
+template opens a `<think>` block unconditionally (this is a reasoning model and the
+template gives no way to turn it off), so the flag is `--nothink` rather than
+`--think`. No Metal: `gpu.h` speaks q4_0 and q8_0, and there is nothing ternary for it
+to accelerate yet, so `--metal` is accepted and says so.
+
+### Checking it
+
+```sh
+make check-maple PYTHON=.venv/bin/python
+```
+
+That runs the ternary and q4a kernels against an independent scalar reference written
+from the format description (all three ISA paths), then builds a tiny random fixture
+and diffs the engine against `tools/maple_oracle.py`, a numpy forward pass over the
+dequantised container weights.
+
+```
+numpy oracle          ──►  maple.c            2.5e-7   (exact-activation build)
+batch prefill         ──►  sequential         both match the oracle
+expert pinning        ──►  unpinned           bit-identical
+tq2/q4a SIMD          ──►  scalar reference   NEON, AVX2 and portable all agree
+HF tokenizer          ──►  lfmtok.h           475/475 exact (incl. 400 fuzzed)
+```
+
+The oracle is a second transcription of the same reading of `maple.py`, so it cannot
+catch a systematic misunderstanding of the architecture: if the RoPE convention or the
+sliding-window boundary were read wrongly, both would be wrong together.
+`tools/maple_mlx_check.py` closes that gap by diffing greedy generation against the
+actual mlx-lm reference on the real checkpoint. It needs `mlx-lm` and a Metal GPU, so
+it is not part of `make check-maple`; run it by hand after any architecture change.
 
 ## Not implemented yet
 

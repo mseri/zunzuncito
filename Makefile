@@ -69,7 +69,7 @@ endif
 CFLAGS  ?= $(OPT) $(WARN) $(ARCHFLAGS) $(OMPFLAGS) $(METAL_CFLAGS) -I.
 LDFLAGS ?= -lm -lpthread $(OMPLIBS) $(METAL_LDFLAGS)
 
-all: gemma4 lfm25
+all: gemma4 lfm25 maple
 
 # -fno-objc-arc on purpose: ARC forbids Objective-C pointers as C-struct members, and
 # the pointer->MTLBuffer map needs exactly that. Manual retain, and nothing is ever
@@ -100,6 +100,24 @@ lfm25: $(LFM_DEPS) $(METAL_OBJ)
 # to separate the int8-activation approximation from an actual bug when validating.
 lfm25-exact: $(LFM_DEPS) $(METAL_OBJ)
 	$(CC) $(LFM_CFLAGS) -DCOLI_F32ACT lfm25.c $(METAL_OBJ) -o $@ $(LFM_LDFLAGS)
+
+# Maple. No Metal object: the model is ternary throughout and gpu.h speaks q4_0/q8_0,
+# so there is currently nothing for the GPU backend to accelerate. --metal is
+# accepted and says so.
+MAPLE_DEPS = maple.c q40.h tq2.h lfmtok.h kvq.h openai_http.h openai_json.h
+MAPLE_CFLAGS = $(OPT) $(WARN) $(ARCHFLAGS) $(OMPFLAGS) -I.
+MAPLE_LDFLAGS = -lm -lpthread $(OMPLIBS)
+
+maple: $(MAPLE_DEPS)
+	$(CC) $(MAPLE_CFLAGS) maple.c -o $@ $(MAPLE_LDFLAGS)
+
+# COLI_F32ACT keeps activations in f32 (weights stay ternary). Slower; used only to
+# separate the int8-activation approximation from an actual bug when validating.
+maple-exact: $(MAPLE_DEPS)
+	$(CC) $(MAPLE_CFLAGS) -DCOLI_F32ACT maple.c -o $@ $(MAPLE_LDFLAGS)
+
+test_tq2: tests/test_tq2.c tq2.h q40.h
+	$(CC) $(OPT) $(ARCHFLAGS) -I. tests/test_tq2.c -o $@ -lm
 
 test_lfmtok: tests/test_lfmtok.c lfmtok.h
 	$(CC) $(OPT) $(ARCHFLAGS) -I. tests/test_lfmtok.c -o $@ -lm
@@ -150,8 +168,28 @@ check-lfm25: lfm25 lfm25-exact test_lfmtok
 	./lfm25       $(LFMFIX) --check-gpu        # Metal vs CPU (no-op without Metal)
 	./lfm25       $(LFMFIX) --check --metal    # engine with the GPU path enabled
 
-clean:
-	rm -f gemma4 gemma4-exact lfm25 lfm25-exact \
-	      test_q40 test_kvq test_metal_sim test_lfmtok metal.o
+# maple regression: the ternary/q4a kernels against an independent reference, the
+# tokenizer against HF, and the engine against a numpy oracle run on the DEQUANTISED
+# container weights.
+#
+# tools/maple_mlx_check.py is deliberately NOT here: it needs mlx-lm and a Metal GPU,
+# and it compares against the real 5 GB checkpoint. Run it by hand once after any
+# change to the architecture -- it is the only check that would catch a systematic
+# misreading of maple.py, which the oracle shares by construction.
+MAPFIX ?= /tmp/mapfix
 
-.PHONY: all check check-lfm25 clean
+check-maple: maple maple-exact test_tq2 test_lfmtok
+	./test_tq2
+	$(PYTHON) tools/convert_maple.py --fixture --ctx 64 --ram 8 --verify $(MAPFIX)
+	$(PYTHON) tools/maple_oracle.py $(MAPFIX)
+	./maple-exact $(MAPFIX) --check            # engine vs oracle, must be ~1e-7
+	./maple-exact $(MAPFIX) --check --nobatch  # batch-union == sequential
+	./maple-exact $(MAPFIX) --check --batch 3  # and at a batch that straddles chunks
+	./maple-exact $(MAPFIX) --check --pin 3    # pinning must not change the logits
+	./maple       $(MAPFIX) --check            # int8-activation build
+
+clean:
+	rm -f gemma4 gemma4-exact lfm25 lfm25-exact maple maple-exact \
+	      test_q40 test_kvq test_metal_sim test_lfmtok test_tq2 metal.o
+
+.PHONY: all check check-lfm25 check-maple clean

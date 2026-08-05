@@ -31,6 +31,9 @@ class RefTokenizer:
         d = json.load(open(path, encoding="utf-8"))
         self.vocab = d["model"]["vocab"]
         self.ignore_merges = bool(d["model"].get("ignore_merges"))
+        # Read the digit run off the pattern rather than hardcoding either checkpoint's.
+        pat = ((d.get("pre_tokenizer") or {}).get("pretokenizers") or [{}])[0]
+        self.digit_max = 3 if "{1,3}" in pat.get("pattern", {}).get("Regex", "") else 1
         self.ranks = {}
         for r, m in enumerate(d["model"]["merges"]):
             x, y = (m if isinstance(m, list) else m.split(" ", 1))
@@ -55,7 +58,7 @@ class RefTokenizer:
     def _is_s(c): return ord(c) in WS         # \p{White_Space}
 
     def split(self, s):
-        """(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}
+        """(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,digit_max}
            | ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"""
         out, i, n = [], 0, len(s)
         L, N, S = self._is_l, self._is_n, self._is_s
@@ -79,10 +82,10 @@ class RefTokenizer:
                     while j < n and L(s[j]):
                         j += 1
                     k = j - i
-            # 3. \p{N}{1,3}
+            # 3. \p{N}{1,digit_max}
             if k is None and N(c):
                 j = i
-                while j < n and j - i < 3 and N(s[j]):
+                while j < n and j - i < self.digit_max and N(s[j]):
                     j += 1
                 k = j - i
             # 4.  ?[^\s\p{L}\p{N}]+[\r\n]*

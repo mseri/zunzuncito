@@ -24,6 +24,16 @@ typedef struct { uint32_t lo, hi; } LfmRange;
 typedef struct {
     int n_vocab, n_merges, n_special, n_lrange, n_nrange;
     int32_t ignore_merges, bos, eos;
+    /* Longest run of digits one piece may take: 3 for LFM2.5's \p{N}{1,3}, 1 for
+     * Maple/Qwen2's bare \p{N}. It is the only part of the split regex that varies
+     * between the two checkpoints, and getting it wrong renumbers every multi-digit
+     * number in the prompt, so the converter writes it rather than the engine
+     * assuming it. */
+    int32_t digit_max;
+    /* Codepoints whose NFC quick-check is not Yes -- i.e. the only ones NFC could
+     * rewrite. Empty for tokenizers with no normaliser; see lfmtok_nfc_safe(). */
+    LfmRange *qr;
+    int n_qcrange;
 
     char **tok;            /* [n_vocab] byte-level spellings, NUL-terminated */
     uint16_t *tlen;
@@ -148,18 +158,25 @@ static LfmTok *lfmtok_load(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) { perror(path); return NULL; }
     char magic[4];
-    if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "LFTK", 4)) {
+    /* "LFT2" adds digit_max after eos. "LFTK" is the original container and has no
+     * such field, so it keeps the \p{N}{1,3} it was written against; existing lfm25
+     * tok.bin files load unchanged. */
+    int v2;
+    if (fread(magic, 1, 4, f) != 4 ||
+        (!(v2 = !memcmp(magic, "LFT2", 4)) && memcmp(magic, "LFTK", 4))) {
         fprintf(stderr, "%s: bad magic\n", path); fclose(f); return NULL;
     }
     LfmTok *t = calloc(1, sizeof *t);
-    uint32_t nv, nm, ns, nl, nn, ig; int32_t bos, eos;
+    uint32_t nv, nm, ns, nl, nn, ig, nq = 0; int32_t bos, eos, dmax = 3;
     if (fread(&nv, 4, 1, f) != 1 || fread(&nm, 4, 1, f) != 1 ||
         fread(&ns, 4, 1, f) != 1 || fread(&nl, 4, 1, f) != 1 ||
         fread(&nn, 4, 1, f) != 1 || fread(&ig, 4, 1, f) != 1 ||
         fread(&bos, 4, 1, f) != 1 || fread(&eos, 4, 1, f) != 1) goto bad;
+    if (v2 && (fread(&dmax, 4, 1, f) != 1 || fread(&nq, 4, 1, f) != 1)) goto bad;
+    if (dmax < 1) dmax = 1;
     t->n_vocab = nv; t->n_merges = nm; t->n_special = ns;
-    t->n_lrange = nl; t->n_nrange = nn;
-    t->ignore_merges = ig; t->bos = bos; t->eos = eos;
+    t->n_lrange = nl; t->n_nrange = nn; t->n_qcrange = nq;
+    t->ignore_merges = ig; t->bos = bos; t->eos = eos; t->digit_max = dmax;
 
     t->tok = calloc(nv, sizeof(char *));
     t->tlen = calloc(nv, sizeof(uint16_t));
@@ -203,6 +220,8 @@ static LfmTok *lfmtok_load(const char *path) {
     if (nl && fread(t->lr, sizeof(LfmRange), nl, f) != nl) goto bad;
     t->nr = calloc(nn ? nn : 1, sizeof(LfmRange));
     if (nn && fread(t->nr, sizeof(LfmRange), nn, f) != nn) goto bad;
+    t->qr = calloc(nq ? nq : 1, sizeof(LfmRange));
+    if (nq && fread(t->qr, sizeof(LfmRange), nq, f) != nq) goto bad;
     fclose(f);
 
     t->vcap = lfm_pow2(nv);
@@ -221,6 +240,28 @@ bad:
     fprintf(stderr, "%s: truncated\n", path);
     fclose(f);
     return NULL;
+}
+
+/* 1 if NFC provably leaves `text` alone, so the ids below match HF's exactly.
+ *
+ * Always 1 for a tokenizer with no normaliser (n_qcrange == 0). Maple's declares
+ * NFC, and implementing it here would mean canonical decomposition, combining-class
+ * reordering and a composition table for a transform that is the identity on
+ * essentially all prompt text. So the engine proves the identity case instead: NFC
+ * leaves any string alone if none of its codepoints fails the NFC quick-check, and
+ * that covers ASCII, precomposed accents and every CJK script. It fails on
+ * decomposed input ("e" + U+0301), where HF would compose first and we do not; the
+ * caller is expected to say so rather than pretend. */
+__attribute__((unused))
+static int lfmtok_nfc_safe(const LfmTok *t, const char *text) {
+    if (!t->n_qcrange) return 1;
+    int n = (int)strlen(text);
+    for (int i = 0; i < n;) {
+        uint32_t c;
+        i += lfm_utf8_next(text, n, i, &c);
+        if (c >= 0x300 && lfm_in_ranges(t->qr, t->n_qcrange, c)) return 0;
+    }
+    return 1;
 }
 
 /* id of a named special token, or -1. Used for the chat template's stop tokens:
@@ -296,9 +337,10 @@ static int lfm_bpe(const LfmTok *t, const char *s, int n, int *out, int cap, int
 /* pre-tokenizer split
  *
  * Hand-coded equivalent of
- *   (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}
+ *   (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,digit_max}
  *   | ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
- * Alternatives are tried in order, exactly as the regex engine would.
+ * Alternatives are tried in order, exactly as the regex engine would. digit_max
+ * comes from the container (see the struct).
  * Returns the number of codepoints consumed starting at `i` (always >= 1). */
 static int lfm_split_one(const LfmTok *t, const uint32_t *cp, int n, int i) {
     #define CP(k) ((i + (k) < n) ? cp[i + (k)] : 0u)
@@ -327,10 +369,10 @@ static int lfm_split_one(const LfmTok *t, const uint32_t *cp, int n, int i) {
         }
     }
 
-    /* 3. \p{N}{1,3} */
+    /* 3. \p{N}{1,digit_max} */
     if (lfm_is_number(t, CP(0))) {
         int k = 0;
-        while (k < 3 && i + k < n && lfm_is_number(t, cp[i + k])) k++;
+        while (k < t->digit_max && i + k < n && lfm_is_number(t, cp[i + k])) k++;
         return k;
     }
 

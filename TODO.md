@@ -1,5 +1,41 @@
 # TODO
 
+## Metal for the ternary kernel
+
+`gpu.h` speaks q4_0 and q8_0. `maple` is ternary throughout, so `--metal` currently
+accepts the flag and declines, and the whole model runs on the CPU.
+
+The shape of the work is a `tq2` kernel alongside the two in `metal.mm`, plus a `q4a`
+one for the lm_head and the FlashHead centroids. Ternary is the easiest case that
+backend will ever get: the codes unpack with two shifts and a mask, there is no
+per-block scale to decode, and the row reduces to an integer accumulation times one
+f32, so a threadgroup per output row with a simdgroup reduction is close to the whole
+kernel.
+
+Whether it is worth building is the open question, and the same one `gpu.h` already
+argues about. The README's numbers are on an M1 where 4 threads beat 8 (`--ram 4`:
+34.2 tok/s at 4, degrading past that), which says the CPU path is already near its
+memory roofline rather than compute-starved. Prefill is the honest target: at a
+128-token batch it is genuinely compute-bound and runs at 49 tok/s, so that is where a
+dispatch amortises. Measure prefill, not decode, before deciding.
+
+## Router bytes
+
+At `--ram 4` with the FlashHead on, a decode step reads roughly 63 MiB of attention
+weights, 150 MiB of experts, 24 MiB of head, and then 50 MiB of router, because the
+router is f32 at 256 x 2048 per layer across 24 layers. That is 17% of the step for
+0.05% of the parameters.
+
+Both sibling engines keep the router f32 on the grounds that a routing error is not a
+small numeric error, it picks a different expert, and Maple's own config sets
+`router_dtype: fp32` for exactly that reason. But fp32 is a statement about the
+*accumulation*, not the storage: the checkpoint ships these weights as bf16 and we
+widen them at conversion time. Storing them bf16 and widening in the kernel would halve
+the bytes with no change to the arithmetic that the config is actually asking for.
+
+Worth about 25 MiB/token, so ~8% of the step. Needs a bf16 matvec that accumulates in
+f32, and a check that top-8 selection does not move on a real prompt set.
+
 ## Partial q3 experts, and the kernel that needs
 
 For low-RAM systems (`--ram 4` and below), where the engine is disk-bound and
@@ -52,6 +88,9 @@ Container sizes at 3.5 bit/weight (a plain 3-bit block codec: 32 weights, fp16 s
 |---|---|---|---|
 | gemma4 experts (all q4_0) | 12.9 GB | ~10.0 GB | ~8.6 GB |
 | lfm25 experts (`--expert-edge 2`) | 4.72 GiB | ~3.98 GiB | ~3.61 GiB |
+
+This does not apply to `maple`, whose experts are already ternary at 2.0 bpw and were
+trained that way. Going below it is not a quantisation choice left to make.
 
 lfm25 gains less in relative terms because only 18 of its 22 MoE layers are q4_0 to
 begin with. The four q8_0 edge layers are 30% of the expert bytes and stay put.
