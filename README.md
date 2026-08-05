@@ -7,8 +7,8 @@ it to the OS page cache.
 
 | binary | model | notes |
 |--------|-------|-------|
-| `gemma4` | Gemma-4 26B-A4B | 30 attention layers, 128 experts/layer, MTP + DFlash speculation |
-| `lfm25`  | [LFM2.5-8B-A1B](https://huggingface.co/LiquidAI/LFM2.5-8B-A1B) | hybrid 18 short-conv + 6 attention layers, 32 tiny experts/layer, apex-quant mixed precision |
+| `gemma4` | Gemma-4 26B-A4B | 30 attention layers, 128 experts/layer, MTP + DFlash speculation, optional FlashHead |
+| `lfm25`  | [LFM2.5-8B-A1B](https://huggingface.co/LiquidAI/LFM2.5-8B-A1B) | hybrid 18 short-conv + 6 attention layers, 32 tiny experts/layer, apex-quant mixed precision, optional FlashHead |
 | `maple`  | [Maple-preview 20B-A1B](https://github.com/deepgrove-ai/mlx-lm-deepgrove) | ternary throughout, 256 experts/layer, sliding + full attention, FlashHead |
 
 Most of this README is about `gemma4`; see [LFM2.5-8B-A1B](#lfm25--lfm25-8b-a1b) and
@@ -107,6 +107,11 @@ The minimum viable budget is 2.70 GB (the floor is `topk` = 8 slots/layer).
 The converter needs the full checkpoint readable, but it streams it, so it needs very
 little RAM — only disk space. Expect it to take a while, since it re-quantises every
 tensor.
+
+It also builds a [FlashHead](#flashhead) unless you pass `--no-flash`. That is a
+k-means over the embedding table and the one step that is not streaming: it holds the
+head in RAM (2.8 GiB at Gemma-4's dimensions) for the duration. `--flash-iters` and
+`--flash-probes` tune it. The engine ignores the result unless run with `--flash`.
 
 ## Run
 
@@ -221,6 +226,40 @@ NVMe. Metal could still help for:
 - prefill, which is batched and genuinely compute-bound;
 - a 16 GB budget, where the whole container is resident and there is no disk in the
   loop, so unified memory bandwidth may beat the CPU bandwidth.
+
+### FlashHead
+
+Gemma-4 ties the lm_head to the embedding table: 262144 x 2816, which at q4_0 is
+**415 MiB read for a single matvec per decode step**, more than the attention weights
+and the routed experts of that step put together. Of the three engines this is where
+the idea should pay best.
+
+`--flash` cuts that down. The converter groups the head rows into 8192 clusters of 32
+(balanced spherical k-means, `tools/flashhead.py`), decode scores the 13 MiB of
+centroids, and exact logits are computed only for the 883 best clusters: 28256 rows,
+about 58 MiB, 10.8% of the vocabulary. Everything else is -inf, so greedy decoding is
+exact whenever the true argmax lies in a probed cluster.
+
+It is off by default, unlike `maple`'s, because there the clustering ships in the
+checkpoint and here it is built post-hoc from the embedding table.
+
+Two Gemma-4 specifics. The softcap is applied to the probed logits only:
+`tanh(-inf/30)*30` is -30, not -inf, so capping the whole vector afterwards would turn
+every pruned token into a perfectly samplable one at the floor of the distribution.
+And `--flash` is refused under `--mtp` and `--dflash`: the draft verifier needs real
+logits for tokens the head would prune, or acceptance stops measuring the drafter.
+
+`--flash-check` runs the exact head alongside on the same row and reports argmax
+agreement plus `max |probed - exact|`, which must be 0. Use it before trusting the
+approximation on a prompt set you care about. On LFM2.5 the same construction agrees
+100/100 on greedy decoding, but that is a different vocabulary and a different
+embedding geometry, and the decode speedup there was inside the noise. I do not have a
+Gemma-4 checkpoint on this machine, so the byte counts above are arithmetic and the
+tok/s is unmeasured.
+
+`--probes N` overrides the cluster count. An already-converted container can be
+upgraded in place with `python3 tools/add_flashhead.py ./g4 --src /path/to/checkpoint`
+instead of re-converting.
 
 ## KV-cache compression (TurboQuant V3)
 
@@ -392,6 +431,9 @@ python3 tools/convert_lfm_tokenizer.py /path/to/LFM2.5-8B-A1B/tokenizer.json ./l
 ./lfm25 ./lfm-ct "explain MoE routing"
 ```
 
+The converter also builds a [FlashHead](#flashhead-1) unless given `--no-flash`; the
+engine ignores it unless run with `--flash`.
+
 At `--ram 8 --ctx 4096 --expert-edge 2` that gives 606 MiB dense resident, 4.72 GiB
 of experts, 96 MiB KV and 29 of 32 slots/layer. Measured on an Intel Mac at 8 threads:
 ~24 tok/s prefill, ~16 tok/s decode, ~90% expert-cache hit.
@@ -406,6 +448,60 @@ template has no thinking toggle, the model decides for itself.
 
 The tokenizer has its own container (`lfmtok.h`, magic `LFTK`) rather than reusing
 `g4tok.h`.
+
+### FlashHead
+
+The same approximation Maple uses, built here instead of read out of the checkpoint.
+The head is tied to the embedding table, 128000 x 2048, which at q4_0 is 140 MiB read
+per decode step for a single matvec. The converter clusters those rows into 4000
+groups of 32 and decode scores the centroids first, computing exact logits only for
+the 431 best clusters (10.8% of the vocabulary). Everything else is -inf.
+
+It is off by default; `--flash` turns it on. `maple` differs because there the
+clustering is the checkpoint's own and the model was released with it enabled. Here
+`tools/flashhead.py` runs balanced spherical k-means over the embedding table after
+the fact, so the exact head stays the default.
+
+Measured on an M1 (8 GB, 4 threads), 100 greedy tokens, interleaved run-by-run,
+best of 4 pairs:
+
+| `--ram` | head | decode | argmax agreement |
+|---------|------|--------|------------------|
+| 6 | exact | 14.2 tok/s | -- |
+| 6 | flash, 431 probes | 14.9 tok/s | 100/100 |
+| 4 | exact | 12.0 tok/s | -- |
+| 4 | flash, 431 probes | 12.3 tok/s | 100/100 |
+
+So: correct, and worth almost nothing on this machine. The reason is the byte
+accounting rather than the head. At `--ram 4` a decode step is dominated by streaming
+~150 MiB of experts off disk at a 77% hit rate, and 140 MiB of *resident* head is a
+small share of a 100 ms step; Maple gets +15% from the same idea because its step is
+6 ms and the head is a quarter of it. Run-to-run drift on this machine is larger than
+the effect, which is why the runs are interleaved and why the table is a best of four.
+
+What the approximation costs is agreement, and that is measurable. `--flash-check`
+runs the exact head alongside on the same row and reports how often the two pick the
+same token, plus `max |probed - exact|`, which must be 0: a probed logit comes out of
+the same kernel and is not approximated at all, only the candidate set is.
+
+| probes | vocabulary scored | argmax agreement |
+|--------|-------------------|------------------|
+| 431 (default) | 10.8% | 100/100 |
+| 128 | 3.2% | 100/100 |
+| 64 | 1.6% | 99/100 |
+
+`--probes N` overrides the count. Control tokens (EOS and the chat template's markers,
+120 ids for LFM2.5) are always scored, since a token at -inf cannot be sampled and a
+model that cannot emit EOS does not stop.
+
+An existing container can be upgraded without re-converting:
+
+```sh
+python3 tools/add_flashhead.py ./lfm-ct --src /path/to/LFM2.5-8B-A1B
+```
+
+That clusters the container's own (dequantised) head and appends 4.9 MiB to
+`dense.bin`, ~50 s. `--src` is read only for the forced control-token ids.
 
 ### Checking it
 

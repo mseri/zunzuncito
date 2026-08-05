@@ -62,6 +62,9 @@ typedef struct {
     int layer_types[MAXL];                 /* 1 = full/global, 0 = sliding */
     float eps, rope_theta_local, rope_theta_global, rope_partial_global;
     float final_logit_softcap, embed_scale;
+    /* FlashHead; n_clusters == 0 means the container was built without one */
+    int flash_n_clusters, flash_cluster_size, flash_n_probes;
+    int flash_scaled_centroids, flash_n_force;
 } Cfg;
 
 /* a weight: q4_0 blob or f32 vector, both just views into the mmap'd dense blob */
@@ -106,6 +109,16 @@ typedef struct {
      * see mtp_step -- so a single "last row" is not enough. */
     float *hid_batch;                       /* [(MAXDRAFT+2) * hidden] */
     int hid_rows;
+
+    /* FlashHead: an approximate lm_head, see flash_logits(). Bound only when the
+     * container carries one; use_flash is what the decode path tests. */
+    W flash_centroids, flash_token_map, flash_cluster_scale, flash_force;
+    int use_flash;
+    /* --flash-check: run the exact head alongside and count how often the two agree. */
+    int flash_check;
+    long long flash_steps, flash_agree, flash_probed;
+    double flash_worst;                     /* max |probed logit - exact logit| */
+    float *flash_exact;
 
     /* DFlash block-parallel drafter (DFlashDraftModel). Drafts an entire block of
      * tokens at once using bidirectional attention conditioned on backbone hidden
@@ -285,6 +298,11 @@ static void manifest(M *m, const char *dir) {
             else if (!strcmp(k, "rope_partial_global")) c->rope_partial_global = atof(v);
             else if (!strcmp(k, "final_logit_softcap")) c->final_logit_softcap = atof(v);
             else if (!strcmp(k, "embed_scale"))       c->embed_scale = atof(v);
+            else if (!strcmp(k, "flash_n_clusters"))   c->flash_n_clusters = atoi(v);
+            else if (!strcmp(k, "flash_cluster_size")) c->flash_cluster_size = atoi(v);
+            else if (!strcmp(k, "flash_n_probes"))     c->flash_n_probes = atoi(v);
+            else if (!strcmp(k, "flash_scaled_centroids")) c->flash_scaled_centroids = atoi(v);
+            else if (!strcmp(k, "flash_n_force"))      c->flash_n_force = atoi(v);
             continue;
         }
         long long a, b, cc;
@@ -334,6 +352,13 @@ static void manifest(M *m, const char *dir) {
     /* embed doubles as the lm_head (tie_word_embeddings) -- stashed in a spare slot */
     m->L[MAXL - 1].q_proj = dense_bind(dd, ndense, blob, "embed_tokens");
     m->L[MAXL - 1].o_proj = dense_bind(dd, ndense, blob, "norm");
+
+    if (c->flash_n_clusters) {
+        m->flash_centroids     = dense_bind(dd, ndense, blob, "flash_centroids");
+        m->flash_token_map     = dense_bind(dd, ndense, blob, "flash_token_map");
+        m->flash_cluster_scale = dense_bind(dd, ndense, blob, "flash_cluster_scale");
+        m->flash_force         = dense_bind(dd, ndense, blob, "flash_force");
+    }
 
     char nm[128];
     for (int l = 0; l < c->n_layers; l++) {
@@ -525,6 +550,10 @@ typedef struct {
     float *ewt;       /* [S * topk] weight */
     int *rows;        /* scratch: rows routed to one expert */
     int *uniq;        /* distinct experts in the batch */
+    /* FlashHead scratch */
+    float *fsim;      /* [n_clusters] centroid scores */
+    int *fsel;        /* [n_clusters] index scratch for the top-probe selection */
+    int *fids;        /* [n_probes*cluster_size + n_force] candidate token ids */
     int S;
 } Buf;
 
@@ -936,6 +965,103 @@ static void layer_fwd(M *m, int li, float *H, int S, int pos_base, Buf *b) {
     }
 }
 
+/* FlashHead
+ *
+ * Two phases. Score the `n_clusters` quantised centroids against the final hidden,
+ * take the best `n_probes`, and compute exact lm_head logits only for the tokens
+ * those clusters contain (plus a fixed set of forced control tokens such as EOS).
+ * Every other logit is -inf, so greedy decoding is exact whenever the true argmax
+ * lies in a probed cluster, and sampling is exact on the same condition.
+ *
+ * The win is bandwidth, not flops, and it is larger here than in either sibling: the
+ * head is tied to the embedding table, 262144 x 2816, which at q4_0 is 415 MiB read
+ * per decode step for one matvec -- more than the attention weights and the routed
+ * experts of that step put together. Probing 883 of 8192 clusters reads the 13 MiB of
+ * centroids plus 28256 rows, about 58 MiB.
+ *
+ * The softcap goes on the probed logits only. tanh(-inf/cap)*cap is -cap, not -inf,
+ * so capping the whole vector afterwards would turn every pruned token into a
+ * perfectly samplable one at the floor of the distribution.
+ *
+ * Unlike Maple's, this clustering is not the checkpoint's: tools/flashhead.py builds
+ * it from the embedding table at conversion time. See there for what that costs. */
+static int flash_partition(float *v, int *idx, int n, int k);
+
+static void flash_logits(M *m, const float *hn, float *logits, Buf *b) {
+    Cfg *c = &m->c;
+    int NC = c->flash_n_clusters, CS = c->flash_cluster_size, NP = c->flash_n_probes;
+    int V = c->vocab, D = c->hidden;
+    const W *e = &m->L[MAXL - 1].q_proj;              /* tied lm_head */
+    size_t rb = q40_row_bytes(D);
+
+    matvec(b->fsim, &m->flash_centroids, hn, b->xq, b->sx);
+    /* The converter folds the per-cluster scale into the centroid rows; the flag
+     * exists so a container built without that folding still reads correctly. The
+     * scale matters: centroids are directions, and scaling by the largest member
+     * norm keeps a cluster holding one big embedding from being ranked on cosine
+     * alone. */
+    if (!c->flash_scaled_centroids) {
+        const float *cs = m->flash_cluster_scale.f;
+        for (int i = 0; i < NC; i++) b->fsim[i] *= cs[i];
+    }
+
+    for (int i = 0; i < NC; i++) b->fsel[i] = i;
+    flash_partition(b->fsim, b->fsel, NC, NP);
+
+    const int32_t *tm = (const int32_t *)m->flash_token_map.q;
+    int n = 0;
+    for (int i = 0; i < NP; i++) {
+        const int32_t *row = tm + (size_t)b->fsel[i] * CS;
+        for (int j = 0; j < CS; j++) b->fids[n++] = row[j];   /* -1 = padding slot */
+    }
+    if (c->flash_n_force) {
+        const int32_t *fo = (const int32_t *)m->flash_force.q;
+        for (int j = 0; j < c->flash_n_force; j++) b->fids[n++] = fo[j];
+    }
+
+    float cap = c->final_logit_softcap;
+    for (int i = 0; i < V; i++) logits[i] = -INFINITY;
+#ifdef COLI_F32ACT
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < n; i++) {
+        int id = b->fids[i];
+        if (id < 0 || id >= V) continue;
+        float l = q40_dot_f32(e->q + (size_t)id * rb, hn, D);
+        logits[id] = cap > 0 ? tanhf(l / cap) * cap : l;
+    }
+#else
+    q40_quant_act(hn, b->xq, b->sx, D);
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < n; i++) {
+        int id = b->fids[i];
+        if (id < 0 || id >= V) continue;
+        float l = q40_dot(e->q + (size_t)id * rb, b->xq, b->sx, D);
+        logits[id] = cap > 0 ? tanhf(l / cap) * cap : l;
+    }
+#endif
+}
+
+/* Move the k largest of v[] to the front of idx[] (order within the k is not
+ * defined). Quickselect on the index array: at 8192 clusters and k = 883 a full sort
+ * would cost more than the centroid matvec it is selecting from. */
+static int flash_partition(float *v, int *idx, int n, int k) {
+    int lo = 0, hi = n - 1;
+    uint64_t rng = 0x9e3779b97f4a7c15ULL;
+    while (lo < hi) {
+        rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;
+        int p = lo + (int)((rng >> 33) % (uint64_t)(hi - lo + 1));
+        float pivot = v[idx[p]];
+        int t = idx[p]; idx[p] = idx[hi]; idx[hi] = t;
+        int store = lo;
+        for (int i = lo; i < hi; i++)
+            if (v[idx[i]] > pivot) { t = idx[i]; idx[i] = idx[store]; idx[store] = t; store++; }
+        t = idx[store]; idx[store] = idx[hi]; idx[hi] = t;
+        if (store == k) break;
+        if (store < k) lo = store + 1; else hi = store - 1;
+    }
+    return k;
+}
+
 /* The q4_0 embedding table doubles as the tied lm_head. */
 static void embed_row(M *m, int tok, float *h) {
     Cfg *c = &m->c;
@@ -1047,6 +1173,35 @@ static void forward(M *m, const int *ids, int S, int pos_base,
     for (int s = s0; s < S; s++) {
         rmsnorm(b->xn, H + (size_t)s * D, fnorm->f, D, c->eps);
         float *out = logits + (size_t)(last_only ? 0 : s) * c->vocab;
+        if (m->use_flash) {
+            flash_logits(m, b->xn, out, b);               /* softcaps its own rows */
+            if (m->flash_check) {
+                /* Same row, same hidden, both heads: the probed logits must be
+                 * bit-identical (only the candidate SET is approximate, not the
+                 * arithmetic), and the argmax agrees whenever the exact argmax fell
+                 * in a probed cluster. */
+                float *ex = m->flash_exact;
+                matvec(ex, embed, b->xn, b->xq, b->sx);
+                if (c->final_logit_softcap > 0) {
+                    float cap = c->final_logit_softcap;
+                    for (int i = 0; i < c->vocab; i++) ex[i] = tanhf(ex[i] / cap) * cap;
+                }
+                int ea = 0, fa = 0;
+                for (int i = 1; i < c->vocab; i++) {
+                    if (ex[i] > ex[ea]) ea = i;
+                    if (out[i] > out[fa]) fa = i;
+                }
+                for (int i = 0; i < c->vocab; i++) {
+                    if (!isfinite(out[i])) continue;
+                    m->flash_probed++;
+                    double d = fabs((double)out[i] - ex[i]);
+                    if (d > m->flash_worst) m->flash_worst = d;
+                }
+                m->flash_steps++;
+                m->flash_agree += (ea == fa);
+            }
+            continue;
+        }
         matvec(out, embed, b->xn, b->xq, b->sx);          /* tied lm_head */
         if (c->final_logit_softcap > 0) {
             float cap = c->final_logit_softcap;
@@ -1886,6 +2041,13 @@ static Buf *bufs(M *m, int Smax) {
     b->ehq = xmalloc((size_t)Smax * (c->moe_inter + 64));
     b->esx = xmalloc(sizeof(float) * (size_t)Smax * (D / Q40_BLK + 8));
     b->ehs = xmalloc(sizeof(float) * (size_t)Smax * (c->moe_inter / Q40_BLK + 8));
+    if (c->flash_n_clusters) {
+        b->fsim = xmalloc(sizeof(float) * (c->flash_n_clusters + 64));
+        b->fsel = xmalloc(sizeof(int) * (c->flash_n_clusters + 64));
+        size_t nf = (size_t)c->flash_n_probes * c->flash_cluster_size
+                  + c->flash_n_force + 64;
+        b->fids = xmalloc(sizeof(int) * nf);
+    }
     return b;
 }
 
@@ -2652,6 +2814,10 @@ static void usage(const char *prog, FILE *out) {
         "         [--mtp] [--dflash] [--drefine N] [--dconf F]\n"
         "                                DFlash extra denoising passes (default 0) and\n"
         "                                per-token freeze confidence (default 0.9)\n"
+        "         [--flash]              approximate lm_head: score clustered\n"
+        "                                centroids, compute only the top clusters\n"
+        "         [--probes N]           FlashHead clusters probed per token\n"
+        "         [--flash-check]        also run the exact head, report agreement\n"
         "         [--ctx N]              override the container's context length\n"
         "         [--ram F]              re-plan the expert cache for an F GB budget\n"
         "         [--io N] [--nobatch] [--threads N]\n"
@@ -2682,6 +2848,7 @@ int main(int argc, char **argv) {
     int no_metal = 0, chk_gpu = 0, use_mtp = 0, use_dflash = 0, use_metal = 0;
     int check = 0, n_io = 8, max_tokens = 0, nobatch = 0, npin = 0, draft = 0, nthreads = 2;
     int serve_mode = 0, serve_port = 8484, ctx_override = 0;
+    int want_flash = 0, probes = 0, flash_check = 0;
     double ram_gb = 0;                   /* 0 = keep the container's own plan */
     const char *dpath = NULL;
     float temp = 1.0f, topp = 0.95f;   /* Gemma-4 generation defaults */
@@ -2690,6 +2857,9 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "--serve")) serve_mode = 1;
         else if (!strcmp(argv[i], "--port") && i + 1 < argc) serve_port = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--check")) check = 1;
+        else if (!strcmp(argv[i], "--flash")) want_flash = 1;
+        else if (!strcmp(argv[i], "--flash-check")) { flash_check = 1; want_flash = 1; }
+        else if (!strcmp(argv[i], "--probes") && i + 1 < argc) probes = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--nobatch")) nobatch = 1;
         else if (!strcmp(argv[i], "--threads") && i + 1 < argc) nthreads = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--io") && i + 1 < argc) n_io = atoi(argv[++i]);
@@ -2794,6 +2964,32 @@ int main(int argc, char **argv) {
                 gpu_name());
     Cfg *c = &m.c;
     pin_load(&m, npin);
+    /* Opt-in, and off under --check (which diffs the oracle's exact logits) and under
+     * speculation. MTP and DFlash verify a whole draft block by running the head on
+     * several rows at once, and a draft token whose true logit was pruned to -inf
+     * would be rejected for a reason that has nothing to do with the drafter: the
+     * acceptance test stops measuring what it is supposed to. */
+    if (probes > 0 && c->flash_n_clusters) {
+        if (probes > c->flash_n_clusters) probes = c->flash_n_clusters;
+        c->flash_n_probes = probes;
+    }
+    m.use_flash = c->flash_n_clusters && want_flash && !check && !use_mtp && !use_dflash;
+    if (want_flash && !c->flash_n_clusters)
+        fprintf(stderr, "--flash: this container has no FlashHead (rebuild it "
+                "without --no-flash); using the exact head\n");
+    if (want_flash && (use_mtp || use_dflash))
+        fprintf(stderr, "--flash is off under speculation: the draft verifier needs "
+                "real logits for tokens the head would prune\n");
+    if (m.use_flash) {
+        fprintf(stderr, "flash head: %d/%d clusters x %d probed (%.1f%% of the "
+                "vocabulary scored)\n", c->flash_n_probes, c->flash_n_clusters,
+                c->flash_cluster_size,
+                100.0 * c->flash_n_probes * c->flash_cluster_size / c->vocab);
+        if (flash_check) {
+            m.flash_check = 1;
+            m.flash_exact = xmalloc(sizeof(float) * (size_t)c->vocab);
+        }
+    }
     Buf *b = bufs(&m, c->ctx);
 
     if (serve_mode) {
@@ -2936,6 +3132,27 @@ int main(int argc, char **argv) {
         double tol = 3e-2;
 #endif
         int ok = (agree == np) && (worst / den < tol);
+
+        /* FlashHead, on the same rows: a probed logit comes out of the same kernel
+         * on the same hidden and must be the same float, which is a hard failure;
+         * argmax agreement is the approximation itself and is reported rather than
+         * enforced -- on a random fixture the clusters carry no structure, so any
+         * threshold here would be a threshold on noise. */
+        if (c->flash_n_clusters) {
+            float *fl = xmalloc(sizeof(float) * c->vocab);
+            m.flash_exact = xmalloc(sizeof(float) * (size_t)c->vocab);
+            m.use_flash = m.flash_check = 1;
+            for (int s = 0; s < np; s++)
+                forward(&m, ids + s, 1, s, fl, 1, b);
+            m.use_flash = m.flash_check = 0;
+            printf("flash head: %lld/%lld argmax agree with the exact head on the "
+                   "same rows, %.1f%% of the vocabulary probed, max |probed - exact| "
+                   "= %.3g\n", m.flash_agree, m.flash_steps,
+                   100.0 * m.flash_probed / ((double)m.flash_steps * c->vocab),
+                   m.flash_worst);
+            if (m.flash_worst != 0.0) { printf("  probed logits are not exact\n"); ok = 0; }
+            free(fl); free(m.flash_exact); m.flash_exact = NULL;
+        }
         printf("%s\n", ok ? "PASS" : "FAIL");
         return !ok;
     }
@@ -3240,6 +3457,11 @@ int main(int argc, char **argv) {
                            n / (double)steps);
                 printf("expert cache: %.1f%% hit (%lld reads total, %d pinned/layer)\n",
                        100.0 * m.hit / (tot ? tot : 1), tot, m.npin);
+                if (m.flash_check && m.flash_steps)
+                    printf("flash head  : %lld/%lld argmax agree with the exact head "
+                           "(%.1f%%), max |probed - exact| = %.3g\n",
+                           m.flash_agree, m.flash_steps,
+                           100.0 * m.flash_agree / m.flash_steps, m.flash_worst);
                 pin_save(&m);
             }
 

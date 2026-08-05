@@ -1,5 +1,6 @@
 metal.o
 g4/
+g4
 g4-asst/
 g4-dflash/
 gemma4
@@ -19,5 +20,8 @@ vendor/
 __pycache__/
 temp/
 lfm/
+lfm
 lfm-ct/
+lfm-ct-flash/
+maple/
 maple-ct/
