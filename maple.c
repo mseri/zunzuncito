@@ -56,6 +56,7 @@
 #endif
 #include "q40.h"
 #include "tq2.h"
+#include "gpu.h"
 #include "lfmtok.h"
 #include "kvq.h"
 #include "openai_json.h"
@@ -150,6 +151,13 @@ typedef struct {
     struct { int layer, eid, slot; } *q;
     int qcap, qhead, qtail, qcount, inflight, stop;
 } M;
+
+/* Metal, off unless --metal. It is compiled in (metal.mm has tq2 and q4a kernels
+ * alongside the q4_0/q8_0 pair the other engines use) but stays opt-in, for the
+ * reason gpu.h documents: at 1 B active params over 780 KiB experts, decode is
+ * dispatch-latency- and disk-bound, so the GPU only pays off on prefill and on the
+ * exact lm_head. Any failure anywhere clears this and the engine runs on the CPU. */
+static int g_use_gpu = 0;
 
 static double now(void) {
     struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
@@ -299,6 +307,10 @@ static void manifest(M *m, const char *dir) {
     }
     close(fd);
     m->dense = blob; m->dense_len = sz;
+    if (g_use_gpu && !gpu_map(blob, (size_t)sz)) {
+        fprintf(stderr, "metal: could not map the dense blob; using CPU\n");
+        g_use_gpu = 0;
+    }
 
     m->embed      = dense_bind(dd, ndense, blob, "embed", 0);
     m->lm_head    = dense_bind(dd, ndense, blob, "lm_head", 0);
@@ -380,6 +392,10 @@ static inline float w_dot_f32(const W *w, int o, const float *x) {
 /* y = W x. COLI_F32ACT keeps activations in f32 (weights stay quantised) so --check
  * can separate the int8-activation approximation from an actual bug. */
 static void matvec(float *y, const W *w, const float *x, Act *a) {
+    /* The Metal kernels consume f32 activations, so they reproduce the w_dot_f32
+     * path -- more accurate than the int8 default rather than less. They decline for
+     * f32/i32 tensors and for weights that are not GPU-mapped. */
+    if (g_use_gpu && gpu_matmul(w->fmt, y, w->q, x, w->O, w->I, 1)) return;
     if (w->fmt == FMT_F32) {
         #pragma omp parallel for schedule(static)
         for (int o = 0; o < w->O; o++) y[o] = w_dot_f32(w, o, x);
@@ -403,6 +419,9 @@ static void matvec(float *y, const W *w, const float *x, Act *a) {
  * while it is still in cache. */
 static void matmul(float *Y, const W *w, const float *X, int S, Act *a) {
     if (S == 1) { matvec(Y, w, X, a); return; }
+    /* One dispatch fills the whole O*S grid, which is where Metal has a chance:
+     * prefill is batched and compute-bound. */
+    if (g_use_gpu && gpu_matmul(w->fmt, Y, w->q, X, w->O, w->I, S)) return;
     int I = w->I, O = w->O, nb = I / Q40_BLK;
 #ifdef COLI_F32ACT
     (void)a; (void)nb;
@@ -517,6 +536,10 @@ typedef struct {
     int *rows;        /* scratch: rows routed to one expert */
     float *roww;      /* scratch: their weights */
     int *uniq;        /* distinct experts in the batch */
+    /* GPU expert scratch: the rows routed to one expert are scattered through X, so
+     * the Metal path gathers them contiguously and scatters the result back. Only
+     * allocated when --metal is in effect. */
+    float *gx, *gg, *gu, *gd;
     /* FlashHead scratch */
     float *fsim;      /* [n_clusters] centroid scores */
     int *fsel;        /* [n_clusters] index scratch for the top-probe selection */
@@ -574,6 +597,32 @@ static void expert_apply(M *m, const uint8_t *blob, const float *X, float *OUT,
     W G = { FMT_TQ2, MI, D, blob, NULL };
     W U = { FMT_TQ2, MI, D, blob + m->gate_b, NULL };
     W Dn = { FMT_TQ2, D, MI, blob + 2 * m->gate_b, NULL };
+
+    /* GPU path. The expert slot was gpu_map'd at allocation, so the weights are read
+     * in place; only the participating activation rows move. A decline at any of the
+     * three dispatches falls through to the CPU below, which recomputes from X --
+     * OUT has not been touched yet, so there is nothing to undo. */
+    if (g_use_gpu) {
+        for (int r = 0; r < nrows; r++)
+            memcpy(b->gx + (size_t)r * D, X + (size_t)rows[r] * D, sizeof(float) * D);
+        if (gpu_matmul(FMT_TQ2, b->gg, G.q, b->gx, MI, D, nrows) &&
+            gpu_matmul(FMT_TQ2, b->gu, U.q, b->gx, MI, D, nrows)) {
+            for (size_t i = 0; i < (size_t)nrows * MI; i++) {
+                float g = b->gg[i], u = b->gu[i];
+                if (g > CL) g = CL;
+                u = u < -CL ? -CL : (u > CL ? CL : u);
+                b->gg[i] = silu(g) * u;
+            }
+            if (gpu_matmul(FMT_TQ2, b->gd, Dn.q, b->gg, D, MI, nrows)) {
+                for (int r = 0; r < nrows; r++) {
+                    float *out = OUT + (size_t)rows[r] * D;
+                    const float *dr = b->gd + (size_t)r * D;
+                    for (int o = 0; o < D; o++) out[o] += w[r] * dr[o];
+                }
+                return;
+            }
+        }
+    }
 
 #ifdef COLI_F32ACT
     #pragma omp parallel for schedule(static)
@@ -1200,6 +1249,12 @@ static void init(M *m, const char *dir, int n_io, int ctx_override, double ram_g
                 Slot *s = &m->slots[(size_t)l * c->slots_per_layer + i];
                 s->eid = -1;
                 s->buf = xmalloc(m->esz);
+                /* Map each slot once, up front: the streaming layer overwrites the
+                 * bytes but never the address, so the mapping stays valid all run. */
+                if (g_use_gpu && !gpu_map(s->buf, (size_t)m->esz)) {
+                    fprintf(stderr, "metal: could not map expert slots; using CPU\n");
+                    g_use_gpu = 0;
+                }
             }
     }
 
@@ -1253,6 +1308,13 @@ static Buf *bufs(M *m, int Smax) {
     b->rows = xmalloc(sizeof(int) * (size_t)Smax * K);
     b->roww = xmalloc(sizeof(float) * (size_t)Smax * K);
     b->uniq = xmalloc(sizeof(int) * c->n_experts);
+    if (g_use_gpu) {
+        /* at most every row of the batch routes to a given expert */
+        b->gx = xmalloc(sizeof(float) * ((size_t)Smax * D + 64));
+        b->gg = xmalloc(sizeof(float) * ((size_t)Smax * MI + 64));
+        b->gu = xmalloc(sizeof(float) * ((size_t)Smax * MI + 64));
+        b->gd = xmalloc(sizeof(float) * ((size_t)Smax * D + 64));
+    }
     if (c->flash_n_clusters) {
         b->fsim = xmalloc(sizeof(float) * (c->flash_n_clusters + 64));
         b->fsel = xmalloc(sizeof(int) * (c->flash_n_clusters + 64));
@@ -1455,8 +1517,10 @@ static int mp_serve_chat(MapleServerContext *ctx, int fd, jval *root) {
     }
     if (!has_user) return samosa_http_json_error(fd,400,"invalid_messages","A text user message is required.");
 
-    int stream = 0, max_tokens = 2048, topk = 40, seed = 0;
-    float temperature = 0.7f, topp = 0.95f, penalty = 1.0f;
+    int stream = 0, max_tokens = 2048, seed = 0;
+    /* same defaults the CLI resolves: top-k 20 behind the FlashHead, off without */
+    int topk = ctx->model->use_flash ? 20 : 0;
+    float temperature = 1.0f, topp = 0.95f, penalty = 1.0f;
     jval *v = json_get(root,"stream"); if (v && v->t == J_BOOL) stream = v->boolean;
     v = json_get(root,"max_tokens"); if (!v) v = json_get(root,"max_completion_tokens");
     if (v) {
@@ -1612,11 +1676,95 @@ static int run_maple_server(M *m, Buf *buffers, LfmTok *tokenizer, int vlimit,
 }
 
 /* main */
+/* Numerically diff the Metal kernels against the CPU reference on random data, in
+ * both of maple's formats. Whether the kernels are right is a property of the
+ * machine they run on, so the check has to travel with the binary.
+ *
+ * The random tensors are built format-aware rather than as random bytes: an fp16
+ * field filled from a PRNG hits inf/NaN often enough that a whole row goes NaN, and
+ * a NaN diff compares false against every threshold, so the test would pass without
+ * noticing. Scales and biases are therefore drawn as finite floats; only the
+ * code/nibble payload is random bytes. */
+static int check_gpu(void) {
+    if (!gpu_ready()) {
+        printf("no Metal device (or built without COLI_METAL) -- nothing to check\n");
+        return 0;
+    }
+    printf("metal device: %s\n\n", gpu_name());
+    struct { int fmt, O, I; const char *what; } shp[] = {
+        {FMT_TQ2, 2048, 2048, "square proj (tq2)"},
+        {FMT_TQ2,  512, 2048, "narrow proj (tq2)"},
+        {FMT_TQ2,  512, 2048, "expert gate/up (tq2)"},
+        {FMT_TQ2, 2048,  512, "expert down (tq2)"},
+        {FMT_Q4A, 4096, 2048, "lm_head slab (q4a)"},
+        {FMT_Q4A, 4736, 2048, "flash centroids (q4a)"},
+    };
+    int fail = 0;
+    for (unsigned t = 0; t < sizeof shp / sizeof *shp; t++) {
+        int fmt = shp[t].fmt, O = shp[t].O, I = shp[t].I;
+        size_t wb = (size_t)(fmt == FMT_TQ2 ? tq2_tensor_bytes(O, I)
+                                            : q4a_tensor_bytes(O, I));
+        uint8_t *Wt = xmalloc((wb + 4095) & ~(size_t)4095);
+        float *x  = xmalloc(sizeof(float) * I);
+        float *yg = xmalloc(sizeof(float) * O), *yc = xmalloc(sizeof(float) * O);
+
+        uint64_t r = 0x243f6a8885a308d3ULL ^ t;
+        #define NEXT() (r = r * 6364136223846793005ULL + 1442695040888963407ULL)
+        #define UNIT() ((float)((int64_t)(NEXT() >> 40) - 8388608) / 8388608.0f)
+        for (size_t i = 0; i < wb; i++) Wt[i] = (uint8_t)(NEXT() >> 40);
+        if (fmt == FMT_TQ2) {
+            /* row scales are f32 and live at the front of the tensor */
+            float *al = (float *)Wt;
+            for (int o = 0; o < O; o++) al[o] = 0.01f + 0.04f * fabsf(UNIT());
+        } else {
+            /* one fp16 scale and one fp16 bias per 64-weight group */
+            for (int o = 0; o < O; o++) {
+                uint8_t *row = Wt + (size_t)o * q4a_row_bytes(I);
+                for (int g = 0; g < I / Q4A_GRP; g++) {
+                    uint8_t *grp = row + (size_t)g * Q4A_GRP_BYTES;
+                    uint16_t hd = q40_f32_to_fp16(0.002f + 0.01f * fabsf(UNIT()));
+                    uint16_t hm = q40_f32_to_fp16(0.05f * UNIT());
+                    memcpy(grp, &hd, 2);
+                    memcpy(grp + 2, &hm, 2);
+                }
+            }
+        }
+        for (int i = 0; i < I; i++) x[i] = UNIT();
+        #undef UNIT
+        #undef NEXT
+
+        W w = { fmt, O, I, Wt, (const float *)Wt };
+        if (!gpu_map(Wt, wb)) {
+            printf("  %-24s gpu_map FAILED\n", shp[t].what); fail = 1; goto next;
+        }
+        if (!gpu_matmul(fmt, yg, Wt, x, O, I, 1)) {
+            printf("  %-24s gpu_matmul DECLINED\n", shp[t].what); fail = 1; goto next;
+        }
+        for (int o = 0; o < O; o++) yc[o] = w_dot_f32(&w, o, x);
+
+        double worst = 0, mag = 0;
+        for (int o = 0; o < O; o++) {
+            double d = fabs((double)yg[o] - (double)yc[o]);
+            if (!(d <= worst)) worst = d;         /* NaN-safe: a NaN lands here */
+            if (fabs(yc[o]) > mag) mag = fabs(yc[o]);
+        }
+        double rel = worst / (mag + 1e-9);
+        printf("  %-24s [%5d x %5d]  max rel err %.3e  %s\n",
+               shp[t].what, O, I, rel, rel < 1e-4 ? "ok" : "MISMATCH");
+        if (!(rel < 1e-4)) fail = 1;
+    next:
+        free(Wt); free(x); free(yg); free(yc);
+    }
+    printf("\n%s\n", fail ? "GPU CHECK FAILED -- do not pass --metal" : "GPU CHECK PASSED");
+    return fail;
+}
+
 static void usage(const char *prog, FILE *out) {
     fprintf(out,
         "usage: %s <dir> [flags...] [prompt]\n"
         "         [--chat] [--system S] [--nothink] [--raw] [--max_tokens N]\n"
-        "         [--temp F] [--topp F] [--topk N]   (default 0.7 / 0.95 / 40)\n"
+        "         [--temp F] [--topp F] [--topk N]   (default 1.0 / 0.95 / 20 with\n"
+        "                                 the FlashHead, top-k off without it)\n"
         "         [--penalty F]           repetition penalty (default 1, = off)\n"
         "         [--ctx N]               override the container's context length\n"
         "         [--ram F]               re-plan the expert cache for an F GB budget\n"
@@ -1627,7 +1775,10 @@ static void usage(const char *prog, FILE *out) {
         "                                 container's, higher = more exact + slower)\n"
         "         [--kv off|k6v4|k4v2]    KV compression, full-attention layers only\n"
         "         [--kvq] [--kbits N] [--vbits N] [--rwin N]\n"
+        "         [--metal]               offload the matmuls to the GPU (off by\n"
+        "                                 default: usually slower here, see matvec)\n"
         "         [--check]               diff against the numpy oracle's logits\n"
+        "         [--check-gpu]           diff the Metal kernels against the CPU\n"
         "         [--help]\n",
         prog);
 }
@@ -1645,14 +1796,16 @@ int main(int argc, char **argv) {
     int batch = 128, ctx_override = 0, noflash = 0, probes = 0;
     double ram_gb = 0;                   /* 0 = keep the container's own plan */
     int serve_mode = 0, serve_port = 8484;
-    int want_metal = 0;
-    float temp = 0.7f, topp = 0.95f, penalty = 1.0f;
-    int topk = 40;
+    int want_metal = 0, chk_gpu = 0;
+    float temp = 1.0f, topp = 0.95f, penalty = 1.0f;
+    /* -1 = "not given on the command line", resolved against the FlashHead below */
+    int topk = -1;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--serve")) serve_mode = 1;
         else if (!strcmp(argv[i], "--port") && i + 1 < argc) serve_port = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--check")) check = 1;
         else if (!strcmp(argv[i], "--metal")) want_metal = 1;
+        else if (!strcmp(argv[i], "--check-gpu")) chk_gpu = 1;
         else if (!strcmp(argv[i], "--nobatch")) nobatch = 1;
         else if (!strcmp(argv[i], "--noflash")) noflash = 1;
         else if (!strcmp(argv[i], "--probes") && i + 1 < argc) probes = atoi(argv[++i]);
@@ -1707,9 +1860,12 @@ int main(int argc, char **argv) {
 #else
     (void)nthreads;
 #endif
-    if (want_metal)
-        fprintf(stderr, "metal: this model is ternary throughout and the Metal "
-                "backend speaks only q4_0/q8_0; using the CPU\n");
+    /* before init(): the dense blob and the expert slots are GPU-mapped as they are
+     * allocated, and that only happens if the device came up */
+    if (want_metal || chk_gpu) g_use_gpu = gpu_init();
+    if (chk_gpu) return check_gpu();
+    if (want_metal && !g_use_gpu)
+        fprintf(stderr, "metal: no device available; using CPU\n");
 
     M m; memset(&m, 0, sizeof m);
     double t0 = now();
@@ -1725,6 +1881,12 @@ int main(int argc, char **argv) {
     /* The FlashHead is an approximation of the lm_head, so --check (which diffs every
      * logit against the oracle) always uses the exact head. */
     m.use_flash = c->flash_n_clusters && !noflash && !check;
+    /* Maple's recommended sampling is 1.0 / 0.95 / 20 with the FlashHead, 1.0 / 0.95
+     * with top-k off without it. The head is why they differ: it already restricts
+     * the candidates to the probed clusters, so top-k 20 is the tail cut on top of
+     * that, whereas with the exact head all 151936 logits are real and top-p does
+     * the cutting alone. An explicit --topk always wins. */
+    if (topk < 0) topk = m.use_flash ? 20 : 0;
     pin_load(&m, npin);
     if (batch < 1) batch = 1;
     if (batch > c->ctx) batch = c->ctx;
@@ -1736,6 +1898,8 @@ int main(int argc, char **argv) {
             "top-%d, %d slots/layer, dense %.1f MiB, ready in %.2fs\n",
             c->n_layers, nswa, c->n_layers - nswa, c->n_experts, c->topk,
             c->slots_per_layer, m.dense_len / 1048576.0, now() - t0);
+    if (g_use_gpu)
+        fprintf(stderr, "metal: %s (tq2/q4a matmul offloaded)\n", gpu_name());
     if (m.use_flash)
         fprintf(stderr, "flash head: probing %d/%d clusters -> %d of %d vocab rows "
                 "scored per token\n", c->flash_n_probes, c->flash_n_clusters,

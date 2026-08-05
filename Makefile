@@ -101,20 +101,20 @@ lfm25: $(LFM_DEPS) $(METAL_OBJ)
 lfm25-exact: $(LFM_DEPS) $(METAL_OBJ)
 	$(CC) $(LFM_CFLAGS) -DCOLI_F32ACT lfm25.c $(METAL_OBJ) -o $@ $(LFM_LDFLAGS)
 
-# Maple. No Metal object: the model is ternary throughout and gpu.h speaks q4_0/q8_0,
-# so there is currently nothing for the GPU backend to accelerate. --metal is
-# accepted and says so.
-MAPLE_DEPS = maple.c q40.h tq2.h lfmtok.h kvq.h openai_http.h openai_json.h
-MAPLE_CFLAGS = $(OPT) $(WARN) $(ARCHFLAGS) $(OMPFLAGS) -I.
-MAPLE_LDFLAGS = -lm -lpthread $(OMPLIBS)
+# Maple. Metal is compiled in (the backend has tq2 and q4a kernels for this model's
+# two formats) but stays off unless you pass --metal; see g_use_gpu in maple.c for
+# why, and for where it does pay.
+MAPLE_DEPS = maple.c q40.h tq2.h gpu.h lfmtok.h kvq.h openai_http.h openai_json.h
+MAPLE_CFLAGS = $(OPT) $(WARN) $(ARCHFLAGS) $(OMPFLAGS) $(METAL_CFLAGS) -I.
+MAPLE_LDFLAGS = -lm -lpthread $(OMPLIBS) $(METAL_LDFLAGS)
 
-maple: $(MAPLE_DEPS)
-	$(CC) $(MAPLE_CFLAGS) maple.c -o $@ $(MAPLE_LDFLAGS)
+maple: $(MAPLE_DEPS) $(METAL_OBJ)
+	$(CC) $(MAPLE_CFLAGS) maple.c $(METAL_OBJ) -o $@ $(MAPLE_LDFLAGS)
 
 # COLI_F32ACT keeps activations in f32 (weights stay ternary). Slower; used only to
 # separate the int8-activation approximation from an actual bug when validating.
-maple-exact: $(MAPLE_DEPS)
-	$(CC) $(MAPLE_CFLAGS) -DCOLI_F32ACT maple.c -o $@ $(MAPLE_LDFLAGS)
+maple-exact: $(MAPLE_DEPS) $(METAL_OBJ)
+	$(CC) $(MAPLE_CFLAGS) -DCOLI_F32ACT maple.c $(METAL_OBJ) -o $@ $(MAPLE_LDFLAGS)
 
 test_tq2: tests/test_tq2.c tq2.h q40.h
 	$(CC) $(OPT) $(ARCHFLAGS) -I. tests/test_tq2.c -o $@ -lm
@@ -131,7 +131,7 @@ test_kvq: tests/test_kvq.c kvq.h
 # Simulates the Metal shader lane-for-lane on the CPU and diffs it against the
 # reference. Validates the shader LOGIC (nibble order, the unaligned fp16 scale, the
 # strided reduction) on any machine, Metal or not.
-test_metal_sim: tests/test_metal_sim.c q40.h
+test_metal_sim: tests/test_metal_sim.c q40.h tq2.h
 	$(CC) $(OPT) $(ARCHFLAGS) -I. tests/test_metal_sim.c -o $@ -lm
 
 # Full regression. Needs python3 + torch + transformers (for the fixture only).
@@ -187,6 +187,8 @@ check-maple: maple maple-exact test_tq2 test_lfmtok
 	./maple-exact $(MAPFIX) --check --batch 3  # and at a batch that straddles chunks
 	./maple-exact $(MAPFIX) --check --pin 3    # pinning must not change the logits
 	./maple       $(MAPFIX) --check            # int8-activation build
+	./maple       $(MAPFIX) --check-gpu        # Metal vs CPU (no-op without Metal)
+	./maple       $(MAPFIX) --check --metal    # engine with the GPU path enabled
 
 clean:
 	rm -f gemma4 gemma4-exact lfm25 lfm25-exact maple maple-exact \

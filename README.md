@@ -555,11 +555,20 @@ the whole machine, not for the process.
 layer from `usage.bin` (65.9% of past routing) lifts the hit rate from 77.8% to 84.5%
 and decode from 28.8 to 34.5 tok/s.
 
-Flags mirror the other two engines. Sampling defaults are 0.7 / 0.95 / 40. The chat
+Flags mirror the other two engines. Sampling defaults follow the model's own
+recommendation, and they depend on the head: `--temp 1.0 --topp 0.95 --topk 20` with
+the FlashHead, and `--temp 1.0 --topp 0.95` with top-k off under `--noflash`. The
+FlashHead has already restricted the candidates to the probed clusters, so top-k 20
+is the tail cut on top of that; with the exact head all 151936 logits are real and
+top-p does the cutting alone. An explicit `--topk` overrides either. The chat
 template opens a `<think>` block unconditionally (this is a reasoning model and the
 template gives no way to turn it off), so the flag is `--nothink` rather than
-`--think`. No Metal: `gpu.h` speaks q4_0 and q8_0, and there is nothing ternary for it
-to accelerate yet, so `--metal` is accepted and says so.
+`--think`. `--metal` works and is off by default, as on the other two: `metal.mm`
+carries a `tq2` and a `q4a` kernel next to the q4_0/q8_0 pair, and `--check-gpu`
+diffs them against the CPU. The ternary kernel has the cheapest inner loop of the
+four, since a per-row scale leaves nothing to decode per block, but that does not buy
+any decode throughput (see [Metal](#metal) for why). Prefill and `--noflash` are
+where it wins.
 
 ### Checking it
 

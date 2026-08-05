@@ -1,9 +1,10 @@
 /* gpu.h — Metal backend interface (Apple silicon / Intel Mac with a Metal GPU).
  *
- * Only the quantised matvec/matmul is offloaded -- q4_0 and q8_0, one kernel each --
- * which is ~95% of the arithmetic: the attention projections, the dense MLP, and the
- * expert GEMMs. (gemma4 is q4_0 throughout; lfm25's apex gradient makes its always-on
- * tensors q8_0, hence the second kernel.)
+ * Only the quantised matvec/matmul is offloaded -- q4_0, q8_0, tq2 and q4a, one
+ * kernel each -- which is ~95% of the arithmetic: the attention projections, the
+ * dense MLP, and the expert GEMMs. (gemma4 is q4_0 throughout; lfm25's apex gradient
+ * makes its always-on tensors q8_0, hence the second kernel; maple is ternary
+ * throughout with a 4-bit affine embedding/head, hence the other two.)
  *
  * Attention, routing, the KV codec and the expert cache stay on the CPU on purpose:
  * they are small, branchy, or I/O-bound, and at a 4-8 GB budget this engine is
@@ -37,10 +38,18 @@
 #include <stdint.h>
 #include <stddef.h>
 
-/* Weight formats the kernels speak. The values match lfm25.c's FMT_* on purpose so
- * that engine can pass its tensor format straight through. */
+/* Weight formats the kernels speak. The values match lfm25.c's and maple.c's FMT_*
+ * on purpose so either engine can pass its tensor format straight through.
+ *
+ * TQ2 and Q4A are maple's, and unlike the q4_0/q8_0 pair they are not two tiers of
+ * one idea: tq2 is the ternary body of the model (one f32 scale per output ROW, so
+ * the kernel's inner loop is a pure accumulation with no per-block scale to decode),
+ * q4a the 4-bit affine format holding its embedding table, lm_head and FlashHead
+ * centroids. See tq2.h for both layouts. */
 #define GPU_FMT_Q40 1
 #define GPU_FMT_Q80 2
+#define GPU_FMT_TQ2 3
+#define GPU_FMT_Q4A 4
 
 #ifdef COLI_METAL
 
@@ -64,8 +73,13 @@ int  gpu_map(const void *p, size_t n);
  * and the caller falls back to the CPU. */
 int  gpu_q40_matmul(float *y, const uint8_t *W, const float *x, int O, int I, int S);
 
-/* Same, for either GPU_FMT_Q40 or GPU_FMT_Q80 weights. Returns 0 (caller falls back
- * to the CPU) for any other format, or if that kernel failed to compile. */
+/* Same, for any GPU_FMT_* above. Returns 0 (caller falls back to the CPU) for any
+ * other format, if that kernel failed to compile, or if the shape does not divide
+ * the format's group (32 for q4_0/q8_0, 64 for tq2/q4a).
+ *
+ * For GPU_FMT_TQ2, `W` is the whole tensor -- the O row scales first, then the code
+ * rows -- because that is how tq2.h lays it out and how maple binds it; the kernel
+ * derives both halves from O. */
 int  gpu_matmul(int fmt, float *y, const uint8_t *W, const float *x,
                 int O, int I, int S);
 

@@ -1,4 +1,4 @@
-/* metal.mm — Metal backend for the q4_0 matmul. Built only on Darwin.
+/* metal.mm — Metal backend for the quantised matmul. Built only on Darwin.
  *
  * Objective-C++ (not .m) so the shader can be a raw string literal; plain
  * Objective-C has none, and escaping 60 lines of Metal by hand is a bug farm.
@@ -13,9 +13,10 @@
  * released; the only transient objects are the per-call command buffer and encoder,
  * which are autoreleased inside an @autoreleasepool.
  *
- * See gpu.h for what is offloaded and why. Short version: the q4_0 matvec/matmul
- * only (~95% of the FLOPs); attention, routing, KV codec and the expert cache stay
- * on the CPU; and any failure here falls back to the CPU rather than aborting.
+ * See gpu.h for what is offloaded and why. Short version: the quantised
+ * matvec/matmul only (~95% of the FLOPs), one kernel per weight format; attention,
+ * routing, KV codec and the expert cache stay on the CPU; and any failure here falls
+ * back to the CPU rather than aborting.
  */
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -150,6 +151,129 @@ kernel void q80_matmul(
     }
     if (lane == 0u) Y[(ulong)s * O + row] = part[0];
 }
+
+// tq2: ternary, ONE f32 scale per output row and 2-bit codes packed 4 per byte.
+//   tensor = alpha[O] (f32) followed by codes[O][I/4]
+//   group  = 64 weights = 16 bytes; byte k holds weights k, k+16, k+32, k+48 at bit
+//            positions 0, 2, 4, 6
+//   w = alpha_row * (code - 1),  code in {0,1,2}
+//
+// The row-wise scale is what makes this the cheapest inner loop of the four: the
+// q4_0/q8_0 kernels above assemble an fp16 from bytes once per 32 weights, whereas
+// here the scale leaves the loop entirely and the body is a mask, a subtract and an
+// FMA.
+//
+// The CPU's int8 path folds the -1 into a precomputed sum(x) (see tq2.h); with f32
+// activations there is nothing to hoist, so the -1 is applied inline and this
+// reproduces tq2_dot_f32 instead.
+kernel void tq2_matmul(
+    device const uchar  *W   [[buffer(0)]],   // alpha[O] f32, then codes[O][I/4]
+    device const float  *X   [[buffer(1)]],   // [S, I]
+    device       float  *Y   [[buffer(2)]],   // [S, O]
+    constant     uint   &O   [[buffer(3)]],
+    constant     uint   &I   [[buffer(4)]],
+    constant     uint   &S   [[buffer(5)]],
+    uint3 gid  [[threadgroup_position_in_grid]],
+    uint3 tid  [[thread_position_in_threadgroup]])
+{
+    const uint row  = gid.x;
+    const uint s    = gid.y;
+    const uint lane = tid.x;
+    if (row >= O || s >= S) return;
+
+    const uint ng = I / 64u;                       // groups of 64 weights
+    device const float *alpha = (device const float *)W;
+    device const uchar *w = W + (ulong)O * 4u + (ulong)row * (ulong)(I / 4u);
+    device const float *x = X + (ulong)s * I;
+
+    float acc = 0.0f;
+    for (uint g = lane; g < ng; g += TG) {
+        device const uchar *c = w + (ulong)g * 16u;
+        device const float *xv = x + (ulong)g * 64u;
+        float s0 = 0.0f;
+        for (uint k = 0; k < 16u; ++k) {
+            uchar b = c[k];
+            s0 += (float)((int)( b       & 3) - 1) * xv[k];
+            s0 += (float)((int)((b >> 2) & 3) - 1) * xv[k + 16u];
+            s0 += (float)((int)((b >> 4) & 3) - 1) * xv[k + 32u];
+            s0 += (float)((int)( b >> 6)      - 1) * xv[k + 48u];
+        }
+        acc += s0;
+    }
+
+    threadgroup float part[TG];
+    part[lane] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint off = TG / 2u; off > 0u; off >>= 1u) {
+        if (lane < off) part[lane] += part[lane + off];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane == 0u) Y[(ulong)s * O + row] = alpha[row] * part[0];
+}
+
+// q4a: 4-bit affine, an fp16 scale AND an fp16 bias per group of 64 weights.
+//   group = 36 bytes: d, m, then two 16-byte nibble blocks
+//     bytes  4..19  low nibble -> w[j],      high -> w[j + 16]
+//     bytes 20..35  low nibble -> w[j + 32], high -> w[j + 48]
+//   w = d * q + m,  q in [0,15]
+//
+// The bias needs sum(x) over the group, which unlike tq2's -1 does not factor out of
+// the row (it is weighted by m), but it is one extra add in the same loop.
+kernel void q4a_matmul(
+    device const uchar  *W   [[buffer(0)]],   // [O, (I/64)*36]
+    device const float  *X   [[buffer(1)]],   // [S, I]
+    device       float  *Y   [[buffer(2)]],   // [S, O]
+    constant     uint   &O   [[buffer(3)]],
+    constant     uint   &I   [[buffer(4)]],
+    constant     uint   &S   [[buffer(5)]],
+    uint3 gid  [[threadgroup_position_in_grid]],
+    uint3 tid  [[thread_position_in_threadgroup]])
+{
+    const uint row  = gid.x;
+    const uint s    = gid.y;
+    const uint lane = tid.x;
+    if (row >= O || s >= S) return;
+
+    const uint ng = I / 64u;
+    const ulong rb = (ulong)ng * 36u;
+    device const uchar *w = W + (ulong)row * rb;
+    device const float *x = X + (ulong)s * I;
+
+    float acc = 0.0f;
+    for (uint g = lane; g < ng; g += TG) {
+        device const uchar *grp = w + (ulong)g * 36u;
+
+        // 36 is even, but the tensor base need not be 2-byte aligned relative to the
+        // buffer origin, so assemble both fp16s from bytes
+        ushort db = (ushort)grp[0] | ((ushort)grp[1] << 8);
+        ushort mb = (ushort)grp[2] | ((ushort)grp[3] << 8);
+        float d = (float)as_type<half>(db);
+        float m = (float)as_type<half>(mb);
+
+        device const float *xv = x + (ulong)g * 64u;
+        float dp = 0.0f, sv = 0.0f;
+        for (uint h = 0; h < 2u; ++h) {
+            device const uchar *nib = grp + 4u + h * 16u;
+            device const float *u = xv + h * 32u;
+            for (uint j = 0; j < 16u; ++j) {
+                uchar q = nib[j];
+                dp += (float)(q & 0x0F) * u[j];
+                dp += (float)(q >>   4) * u[j + 16u];
+                sv += u[j] + u[j + 16u];
+            }
+        }
+        acc += d * dp + m * sv;
+    }
+
+    threadgroup float part[TG];
+    part[lane] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint off = TG / 2u; off > 0u; off >>= 1u) {
+        if (lane < off) part[lane] += part[lane + off];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane == 0u) Y[(ulong)s * O + row] = part[0];
+}
 )METAL";
 
 /* state */
@@ -157,6 +281,8 @@ static id<MTLDevice>               g_dev  = nil;
 static id<MTLCommandQueue>         g_q    = nil;
 static id<MTLComputePipelineState> g_pipe = nil;   /* q4_0 */
 static id<MTLComputePipelineState> g_pipe8 = nil;  /* q8_0 */
+static id<MTLComputePipelineState> g_pipet = nil;  /* tq2  */
+static id<MTLComputePipelineState> g_pipea = nil;  /* q4a  */
 static char g_name[128] = "none";
 static int  g_ok = 0;
 
@@ -205,8 +331,23 @@ int gpu_init(void) {
             g_pipe8 = [g_dev newComputePipelineStateWithFunction:fn8 error:&err];
             [fn8 release];
         }
+        /* tq2/q4a are maple's and equally optional: gemma4 and lfm25 never ask for
+         * them, and a failure here only costs maple its GPU path. */
+        id<MTLFunction> fnt = [lib newFunctionWithName:@"tq2_matmul"];
+        if (fnt) {
+            g_pipet = [g_dev newComputePipelineStateWithFunction:fnt error:&err];
+            [fnt release];
+        }
+        id<MTLFunction> fna = [lib newFunctionWithName:@"q4a_matmul"];
+        if (fna) {
+            g_pipea = [g_dev newComputePipelineStateWithFunction:fna error:&err];
+            [fna release];
+        }
         g_q = [g_dev newCommandQueue];
-        if (!g_q) { g_dev = nil; g_pipe = nil; g_pipe8 = nil; return 0; }
+        if (!g_q) {
+            g_dev = nil; g_pipe = nil; g_pipe8 = nil; g_pipet = nil; g_pipea = nil;
+            return 0;
+        }
         g_ok = 1;
         return 1;
     }
@@ -215,7 +356,8 @@ int gpu_init(void) {
 void gpu_shutdown(void) {
     g_ok = 0;
     g_nmap = 0;
-    g_pipe = nil; g_pipe8 = nil; g_q = nil; g_dev = nil; g_x = nil; g_y = nil;
+    g_pipe = nil; g_pipe8 = nil; g_pipet = nil; g_pipea = nil;
+    g_q = nil; g_dev = nil; g_x = nil; g_y = nil;
 }
 
 int gpu_ready(void)        { return g_ok; }
@@ -268,14 +410,29 @@ static int ensure(id<MTLBuffer> *buf, size_t *cap, size_t need) {
 int gpu_matmul(int fmt, float *y, const uint8_t *W, const float *x,
                int O, int I, int S) {
     if (!g_ok || (I & 31) || O <= 0 || S <= 0) return 0;
-    if (fmt != GPU_FMT_Q40 && fmt != GPU_FMT_Q80) return 0;
 
-    id<MTLComputePipelineState> pipe = (fmt == GPU_FMT_Q40) ? g_pipe : g_pipe8;
+    /* pipeline, plus how many bytes of `W` the kernel will touch. tq2 is the odd one
+     * out on both counts: its groups are 64 wide, and the tensor carries O row scales
+     * ahead of the code rows. */
+    id<MTLComputePipelineState> pipe;
+    size_t need;
+    switch (fmt) {
+    case GPU_FMT_Q40: pipe = g_pipe;  need = (size_t)(I / 32) * 18 * (size_t)O; break;
+    case GPU_FMT_Q80: pipe = g_pipe8; need = (size_t)(I / 32) * 34 * (size_t)O; break;
+    case GPU_FMT_TQ2:
+        if (I & 63) return 0;
+        pipe = g_pipet; need = (size_t)O * 4 + (size_t)O * (size_t)(I / 4);
+        break;
+    case GPU_FMT_Q4A:
+        if (I & 63) return 0;
+        pipe = g_pipea; need = (size_t)(I / 64) * 36 * (size_t)O;
+        break;
+    default: return 0;
+    }
     if (!pipe) return 0;
 
-    size_t rb = (size_t)(I / 32) * (fmt == GPU_FMT_Q40 ? 18 : 34);
     size_t off = 0;
-    id<MTLBuffer> wb = find_map(W, rb * (size_t)O, &off);
+    id<MTLBuffer> wb = find_map(W, need, &off);
     if (!wb) return 0;                     /* weights not GPU-mapped -> CPU path */
 
     @autoreleasepool {
