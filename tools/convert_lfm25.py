@@ -39,9 +39,12 @@ dimension to be a multiple of 32.
 import argparse, json, os, struct, sys
 import numpy as np
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import flashhead
+
 QK = 32
 BLK40, BLK80 = 18, 34
-FMT_F32, FMT_Q40, FMT_Q80 = 0, 1, 2
+FMT_F32, FMT_Q40, FMT_Q80, FMT_I32 = 0, 1, 2, 5
 
 
 # q4_0 (mirrors q40.h bit-for-bit)
@@ -194,6 +197,17 @@ class Dense:
         self.off += len(b)
         return b
 
+    def add_i32(self, name, w):
+        w = np.ascontiguousarray(w, dtype=np.int32)
+        if w.ndim == 1:
+            w = w.reshape(1, -1)
+        b = w.tobytes()
+        self.f.write(b)
+        self.idx[name] = {"off": self.off, "len": len(b), "fmt": FMT_I32,
+                          "shape": [int(w.shape[0]), int(w.shape[1])]}
+        self.off += len(b)
+        return b
+
     def close(self):
         self.f.close()
 
@@ -314,7 +328,8 @@ class DictShards:
 
 
 # build
-def build(src, dst, ctx, ram, expert_edge, embed_q8, verify, fixture=False):
+def build(src, dst, ctx, ram, expert_edge, embed_q8, verify, want_flash=True,
+          flash_probes=0, flash_iters=10, fixture=False):
     os.makedirs(dst, exist_ok=True)
 
     if fixture:
@@ -364,9 +379,27 @@ def build(src, dst, ctx, ram, expert_edge, embed_q8, verify, fixture=False):
     # dense
     dn = Dense(os.path.join(dst, "dense.bin"))
     ALWAYS = FMT_Q80                          # attention / conv / dense MLP
-    dn.add("embed_tokens", S.get("model.embed_tokens.weight"),
-           FMT_Q80 if embed_q8 else FMT_Q40)
+    emb = S.get("model.embed_tokens.weight")
+    dn.add("embed_tokens", emb, FMT_Q80 if embed_q8 else FMT_Q40)
     dn.add("embedding_norm", S.get("model.embedding_norm.weight"), FMT_F32)
+
+    # FlashHead, built from the same table before anything else needs it: the
+    # clustering normalises `emb` in place, so this consumes it.
+    flash = {}
+    if want_flash:
+        if not fixture:
+            print(f"flash head: clustering {emb.shape[0]} x {emb.shape[1]} lm_head "
+                  f"rows", flush=True)
+        log = (lambda *a, **k: None) if fixture else print
+        fh = flashhead.build(emb, n_probes=flash_probes, iters=flash_iters, log=log)
+        force = np.asarray(flashhead.force_tokens(src, cfg["vocab"]), np.int32)
+        dn.add("flash_centroids", fh["centroids"], FMT_Q40)
+        dn.add_i32("flash_token_map", fh["token_map"])
+        dn.add("flash_cluster_scale", fh["cluster_scale"].reshape(1, -1), FMT_F32)
+        dn.add_i32("flash_force", force.reshape(1, -1) if force.size
+                   else np.zeros((1, 1), np.int32))
+        flash = dict(fh["cfg"], n_force=int(force.size))
+    del emb
 
     for li in range(L):
         p = f"model.layers.{li}."
@@ -444,6 +477,7 @@ def build(src, dst, ctx, ram, expert_edge, embed_q8, verify, fixture=False):
     # plan
     p = plan(cfg, dense_bytes, esz_l, ctx, ram)
     cfg["slots_per_layer"] = p["slots_per_layer"]
+    cfg.update({f"flash_{k}": v for k, v in flash.items()})
     json.dump(cfg, open(os.path.join(dst, "cfg.json"), "w"), indent=1)
 
     with open(os.path.join(dst, "manifest.txt"), "w") as m:
@@ -492,16 +526,24 @@ def main():
     ap.add_argument("--embed-q8", action="store_true",
                     help="q8_0 the (tied) embedding/lm_head instead of q4_0")
     ap.add_argument("--verify", action="store_true")
+    ap.add_argument("--no-flash", dest="flash", action="store_false",
+                    help="do not build the FlashHead (exact lm_head only)")
+    ap.add_argument("--flash-probes", type=int, default=0,
+                    help="clusters probed per decode step (default: ~11%% of them, "
+                         "the fraction Maple's shipped head uses)")
+    ap.add_argument("--flash-iters", type=int, default=10,
+                    help="k-means iterations for the FlashHead clustering")
     ap.add_argument("--fixture", action="store_true",
                     help="build a tiny random model for the oracle check")
     a = ap.parse_args()
     if a.fixture:
         build(None, a.dst, a.ctx, a.ram, a.expert_edge, a.embed_q8, a.verify,
-              fixture=True)
+              a.flash, a.flash_probes, a.flash_iters, fixture=True)
     else:
         if not a.src:
             ap.error("src is required unless --fixture")
-        build(a.src, a.dst, a.ctx, a.ram, a.expert_edge, a.embed_q8, a.verify)
+        build(a.src, a.dst, a.ctx, a.ram, a.expert_edge, a.embed_q8, a.verify,
+              a.flash, a.flash_probes, a.flash_iters)
 
 
 if __name__ == "__main__":

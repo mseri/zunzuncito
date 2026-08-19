@@ -65,13 +65,26 @@ _PATTERN_TEMPLATE = (
     r"| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
 )
 
+# Ling-3.0 writes the SAME split a different way: the contraction alternatives are
+# factored into one group, the optional and the plus are made possessive, and the
+# newline run is spelt \s*[\r\n] instead of \s*[\r\n]+. None of that changes what is
+# matched. The possessive quantifiers only forbid backtracking, which lfm_split_one
+# does not do anyway, and `\s*[\r\n]` is greedy-\s* followed by one newline, which
+# consumes exactly the run up to and including the last newline -- the same cut
+# `\s*[\r\n]+` makes, and the one the engine computes as `last_nl`.
+_PATTERN_TEMPLATE_LING = (
+    r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}%s"
+    r"| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"
+)
+
 
 def digit_run(pattern):
     """Longest digit run the split allows, or None if the pattern is not one we
     hand-code."""
-    for suffix, dmax in (("", 1), ("{1,3}", 3)):
-        if pattern == _PATTERN_TEMPLATE % suffix:
-            return dmax
+    for template in (_PATTERN_TEMPLATE, _PATTERN_TEMPLATE_LING):
+        for suffix, dmax in (("", 1), ("{1,3}", 3)):
+            if pattern == template % suffix:
+                return dmax
     return None
 
 
@@ -205,12 +218,16 @@ def main():
             if s == name:
                 return i
         return -1
-    # Only used to seed the engine's defaults; both engines name their stop tokens
-    # explicitly. LFM2.5 opens with <|startoftext|>, Maple/Qwen2 with <|endoftext|>.
+    # Only used to seed the engine's defaults; every engine names its stop tokens
+    # explicitly. LFM2.5 and Ling open with <|startoftext|>, Maple/Qwen2 with
+    # <|endoftext|>; the turn ends at <|im_end|> for the first two and <|role_end|>
+    # for Ling.
     bos = find_id("<|startoftext|>")
     if bos < 0:
         bos = find_id("<|endoftext|>")
     eos = find_id("<|im_end|>")
+    if eos < 0:
+        eos = find_id("<|role_end|>")
 
     lr = category_ranges("L")
     nr = category_ranges("N")

@@ -31,6 +31,9 @@ Each expert is laid out as [ gate | up | down ], all q4_0, 4096-aligned:
 import argparse, json, os, struct, sys
 import numpy as np
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import flashhead
+
 QK, BLK = 32, 18
 
 
@@ -149,6 +152,16 @@ class Dense:
                           "shape": [int(x) for x in w.shape]}
         self.off += len(b)
 
+    def add_i32(self, name, w):
+        w = np.ascontiguousarray(w, dtype=np.int32)
+        if w.ndim == 1:
+            w = w.reshape(1, -1)
+        b = w.tobytes()
+        self.f.write(b)
+        self.idx[name] = {"off": self.off, "len": len(b), "fmt": "i32",
+                          "shape": [int(x) for x in w.shape]}
+        self.off += len(b)
+
     def close(self, path):
         self.f.close()
         json.dump(self.idx, open(path, "w"))
@@ -222,7 +235,8 @@ def plan(cfg, dense_bytes, ctx, ram_gb, kv=None):
 
 
 # build
-def build(src, dst, ctx, ram, verify, fixture=None):
+def build(src, dst, ctx, ram, verify, want_flash=True, flash_probes=0,
+          flash_iters=10, fixture=None):
     os.makedirs(dst, exist_ok=True)
 
     if fixture is not None:
@@ -292,8 +306,27 @@ def build(src, dst, ctx, ram, verify, fixture=None):
 
     # dense
     dn = Dense(os.path.join(dst, "dense.bin"))
-    dn.add_q40("embed_tokens", S.get(P + "embed_tokens.weight"))   # tied => lm_head too
+    emb = S.get(P + "embed_tokens.weight")
+    dn.add_q40("embed_tokens", emb)                                # tied => lm_head too
     dn.add_f32("norm", S.get(P + "norm.weight"))
+
+    # FlashHead, built from the same table before anything else needs `emb`: the
+    # clustering normalises it in place, so this consumes it.
+    flash = {}
+    if want_flash:
+        print(f"flash head: clustering {emb.shape[0]} x {emb.shape[1]} lm_head rows",
+              flush=True)
+        fh = flashhead.build(emb, n_probes=flash_probes, iters=flash_iters)
+        force = np.asarray(flashhead.force_tokens(src, cfg["vocab"]), np.int32)
+        dn.add_q40("flash_centroids", fh["centroids"])
+        dn.add_i32("flash_token_map", fh["token_map"])
+        dn.add_f32("flash_cluster_scale", fh["cluster_scale"].reshape(1, -1))
+        dn.add_i32("flash_force", force.reshape(1, -1) if force.size
+                   else np.zeros((1, 1), np.int32))
+        flash = dict(fh["cfg"], n_force=int(force.size))
+        print(f"flash head: forcing {force.size} control tokens "
+              f"{force.tolist() if force.size <= 12 else ''}")
+    del emb
 
     for li in range(L):
         q, o = f"{P}layers.{li}.", f"layers.{li}."
@@ -364,11 +397,12 @@ def build(src, dst, ctx, ram, verify, fixture=None):
     # plan
     p = plan(cfg, dense_bytes, ctx, ram)
     cfg["slots_per_layer"] = p["slots_per_layer"]
+    cfg.update({f"flash_{k}": v for k, v in flash.items()})
     json.dump(cfg, open(os.path.join(dst, "cfg.json"), "w"), indent=1)
 
     # manifest.txt: the same information, flat, for the C engine. Parsing JSON in C
     # to recover a 3840-row offset table is fragility with no upside.
-    FMT = {"f32": 0, "q40": 1}
+    FMT = {"f32": 0, "q40": 1, "i32": 5}
     with open(os.path.join(dst, "manifest.txt"), "w") as m:
         for k, v in cfg.items():
             if k == "layer_types":
@@ -407,6 +441,13 @@ def main():
     ap.add_argument("--ram", type=float, default=8.0, help="RAM budget, GB")
     ap.add_argument("--ctx", type=int, default=4096)
     ap.add_argument("--verify", action="store_true")
+    ap.add_argument("--no-flash", dest="flash", action="store_false",
+                    help="do not build the FlashHead (exact lm_head only)")
+    ap.add_argument("--flash-probes", type=int, default=0,
+                    help="clusters probed per decode step (default: ~11%% of them, "
+                         "the fraction Maple's shipped head uses)")
+    ap.add_argument("--flash-iters", type=int, default=10,
+                    help="k-means iterations for the FlashHead clustering")
     ap.add_argument("--fixture", action="store_true",
                     help="build a tiny random Gemma-4 container for engine tests")
     a = ap.parse_args()
@@ -414,11 +455,13 @@ def main():
     if a.fixture:
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         from gemma4_fixture import make_fixture
-        build(None, a.dst, a.ctx, a.ram, a.verify, fixture=make_fixture(a.dst))
+        build(None, a.dst, a.ctx, a.ram, a.verify, a.flash, a.flash_probes,
+              a.flash_iters, fixture=make_fixture(a.dst))
     else:
         if not a.src:
             sys.exit("need src")
-        build(a.src, a.dst, a.ctx, a.ram, a.verify)
+        build(a.src, a.dst, a.ctx, a.ram, a.verify, a.flash, a.flash_probes,
+              a.flash_iters)
 
 
 if __name__ == "__main__":

@@ -69,7 +69,7 @@ endif
 CFLAGS  ?= $(OPT) $(WARN) $(ARCHFLAGS) $(OMPFLAGS) $(METAL_CFLAGS) -I.
 LDFLAGS ?= -lm -lpthread $(OMPLIBS) $(METAL_LDFLAGS)
 
-all: gemma4 lfm25 maple
+all: gemma4 lfm25 maple ling
 
 # -fno-objc-arc on purpose: ARC forbids Objective-C pointers as C-struct members, and
 # the pointer->MTLBuffer map needs exactly that. Manual retain, and nothing is ever
@@ -115,6 +115,20 @@ maple: $(MAPLE_DEPS) $(METAL_OBJ)
 # separate the int8-activation approximation from an actual bug when validating.
 maple-exact: $(MAPLE_DEPS) $(METAL_OBJ)
 	$(CC) $(MAPLE_CFLAGS) -DCOLI_F32ACT maple.c $(METAL_OBJ) -o $@ $(MAPLE_LDFLAGS)
+
+# Ling-3.0-tiny. Same two block formats as lfm25, so metal.mm needs nothing new;
+# Metal is compiled in but stays off unless you pass --metal.
+LING_DEPS = ling.c q40.h lfmtok.h kvarn.h gpu.h openai_http.h openai_json.h
+LING_CFLAGS = $(OPT) $(WARN) $(ARCHFLAGS) $(OMPFLAGS) $(METAL_CFLAGS) -I.
+LING_LDFLAGS = -lm -lpthread $(OMPLIBS) $(METAL_LDFLAGS)
+
+ling: $(LING_DEPS) $(METAL_OBJ)
+	$(CC) $(LING_CFLAGS) ling.c $(METAL_OBJ) -o $@ $(LING_LDFLAGS)
+
+# COLI_F32ACT keeps activations in f32 (weights stay quantised). Slower; used only to
+# separate the int8-activation approximation from an actual bug when validating.
+ling-exact: $(LING_DEPS) $(METAL_OBJ)
+	$(CC) $(LING_CFLAGS) -DCOLI_F32ACT ling.c $(METAL_OBJ) -o $@ $(LING_LDFLAGS)
 
 test_tq2: tests/test_tq2.c tq2.h q40.h
 	$(CC) $(OPT) $(ARCHFLAGS) -I. tests/test_tq2.c -o $@ -lm
@@ -190,8 +204,33 @@ check-maple: maple maple-exact test_tq2 test_lfmtok
 	./maple       $(MAPFIX) --check-gpu        # Metal vs CPU (no-op without Metal)
 	./maple       $(MAPFIX) --check --metal    # engine with the GPU path enabled
 
+# ling regression: the engine against a numpy oracle run on the DEQUANTISED container
+# weights, plus the tokenizer against HF.
+#
+# tools/ling_hf_check.py is deliberately NOT here: it needs torch + transformers +
+# fla-core and the real 8 GB checkpoint. Run it by hand once after any change to the
+# architecture -- it is the only check that would catch a systematic misreading of the
+# KDA kernel, which the oracle shares by construction.
+LINGFIX ?= /tmp/lingfix
+
+check-ling: ling ling-exact test_lfmtok
+	$(PYTHON) tools/convert_ling.py --fixture --ctx 64 --ram 8 $(LINGFIX)
+	$(PYTHON) tools/ling_oracle.py $(LINGFIX)
+	./ling-exact $(LINGFIX) --check            # engine vs oracle, must be ~1e-6
+	./ling-exact $(LINGFIX) --check --nobatch  # batch-union == sequential
+	./ling-exact $(LINGFIX) --check --pin 3    # pinning must not change the logits
+	./ling       $(LINGFIX) --check            # int8-activation build
+	./ling       $(LINGFIX) --check-gpu        # Metal vs CPU (no-op without Metal)
+	./ling       $(LINGFIX) --check --metal    # engine with the GPU path enabled
+	@# The tokenizer needs the real checkpoint (the fixture has no vocabulary), so it
+	@# is checked only when ./ling-tiny-fp8 is present rather than failing the suite.
+	@if [ -f ./ling-tiny-fp8/tokenizer.json ]; then \
+	   $(PYTHON) tools/convert_lfm_tokenizer.py ./ling-tiny-fp8/tokenizer.json $(LINGFIX)/tok.bin && \
+	   $(PYTHON) tools/lfmtok_check.py ./ling-tiny-fp8 $(LINGFIX)/tok.bin; \
+	 else echo "skipping the tokenizer check: no ./ling-tiny-fp8"; fi
+
 clean:
-	rm -f gemma4 gemma4-exact lfm25 lfm25-exact maple maple-exact \
+	rm -f gemma4 gemma4-exact lfm25 lfm25-exact maple maple-exact ling ling-exact \
 	      test_q40 test_kvarn test_metal_sim test_lfmtok test_tq2 metal.o
 
-.PHONY: all check check-lfm25 check-maple clean
+.PHONY: all check check-lfm25 check-maple check-ling clean

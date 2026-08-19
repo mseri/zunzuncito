@@ -1,18 +1,20 @@
 # zunzuncito — colibrì-style MoE engines for a small-RAM machine
 
-Three engines share this repo, along with the q4_0/q8_0 kernels (`q40.h`), the ternary
+Four engines share this repo, along with the q4_0/q8_0 kernels (`q40.h`), the ternary
 kernels (`tq2.h`), the KVarN KV cache (`kvarn.h`), the OpenAI server, and one idea:
 stream the routed experts from disk under an expert-granular cache instead of leaving
 it to the OS page cache.
 
 | binary | model | notes |
 |--------|-------|-------|
-| `gemma4` | Gemma-4 26B-A4B | 30 attention layers, 128 experts/layer, MTP + DFlash speculation |
-| `lfm25`  | [LFM2.5-8B-A1B](https://huggingface.co/LiquidAI/LFM2.5-8B-A1B) | hybrid 18 short-conv + 6 attention layers, 32 tiny experts/layer, apex-quant mixed precision |
+| `gemma4` | Gemma-4 26B-A4B | 30 attention layers, 128 experts/layer, MTP + DFlash speculation, optional FlashHead |
+| `lfm25`  | [LFM2.5-8B-A1B](https://huggingface.co/LiquidAI/LFM2.5-8B-A1B) | hybrid 18 short-conv + 6 attention layers, 32 tiny experts/layer, apex-quant mixed precision, optional FlashHead |
 | `maple`  | [Maple-preview 20B-A1B](https://github.com/deepgrove-ai/mlx-lm-deepgrove) | ternary throughout, 256 experts/layer, sliding + full attention, FlashHead |
+| `ling`   | [Ling-3.0-tiny 7.9B-A1.3B](https://huggingface.co/inclusionAI/Ling-3.0-tiny) | 3:1 KDA/MLA hybrid, 128 experts/layer + a shared one, absorbed MLA cache, optional FlashHead |
 
-Most of this README is about `gemma4`; see [LFM2.5-8B-A1B](#lfm25--lfm25-8b-a1b) and
-[Maple](#maple--maple-preview-20b-a1b) for the other two.
+Most of this README is about `gemma4`; see [LFM2.5-8B-A1B](#lfm25--lfm25-8b-a1b),
+[Maple](#maple--maple-preview-20b-a1b) and [Ling](#ling--ling-30-tiny-79b-a13b) for the
+other three.
 
 ## gemma4 — Gemma-4 26B-A4B
 
@@ -107,6 +109,11 @@ The minimum viable budget is 2.70 GB (the floor is `topk` = 8 slots/layer).
 The converter needs the full checkpoint readable, but it streams it, so it needs very
 little RAM — only disk space. Expect it to take a while, since it re-quantises every
 tensor.
+
+It also builds a [FlashHead](#flashhead) unless you pass `--no-flash`. That is a
+k-means over the embedding table and the one step that is not streaming: it holds the
+head in RAM (2.8 GiB at Gemma-4's dimensions) for the duration. `--flash-iters` and
+`--flash-probes` tune it. The engine ignores the result unless run with `--flash`.
 
 ## Run
 
@@ -221,6 +228,40 @@ NVMe. Metal could still help for:
 - prefill, which is batched and genuinely compute-bound;
 - a 16 GB budget, where the whole container is resident and there is no disk in the
   loop, so unified memory bandwidth may beat the CPU bandwidth.
+
+### FlashHead
+
+Gemma-4 ties the lm_head to the embedding table: 262144 x 2816, which at q4_0 is
+**415 MiB read for a single matvec per decode step**, more than the attention weights
+and the routed experts of that step put together. Of the three engines this is where
+the idea should pay best.
+
+`--flash` cuts that down. The converter groups the head rows into 8192 clusters of 32
+(balanced spherical k-means, `tools/flashhead.py`), decode scores the 13 MiB of
+centroids, and exact logits are computed only for the 883 best clusters: 28256 rows,
+about 58 MiB, 10.8% of the vocabulary. Everything else is -inf, so greedy decoding is
+exact whenever the true argmax lies in a probed cluster.
+
+It is off by default, unlike `maple`'s, because there the clustering ships in the
+checkpoint and here it is built post-hoc from the embedding table.
+
+Two Gemma-4 specifics. The softcap is applied to the probed logits only:
+`tanh(-inf/30)*30` is -30, not -inf, so capping the whole vector afterwards would turn
+every pruned token into a perfectly samplable one at the floor of the distribution.
+And `--flash` is refused under `--mtp` and `--dflash`: the draft verifier needs real
+logits for tokens the head would prune, or acceptance stops measuring the drafter.
+
+`--flash-check` runs the exact head alongside on the same row and reports argmax
+agreement plus `max |probed - exact|`, which must be 0. Use it before trusting the
+approximation on a prompt set you care about. On LFM2.5 the same construction agrees
+100/100 on greedy decoding, but that is a different vocabulary and a different
+embedding geometry, and the decode speedup there was inside the noise. I do not have a
+Gemma-4 checkpoint on this machine, so the byte counts above are arithmetic and the
+tok/s is unmeasured.
+
+`--probes N` overrides the cluster count. An already-converted container can be
+upgraded in place with `python3 tools/add_flashhead.py ./g4 --src /path/to/checkpoint`
+instead of re-converting.
 
 ## KV-cache compression (KVarN)
 
@@ -510,6 +551,9 @@ python3 tools/convert_lfm_tokenizer.py /path/to/LFM2.5-8B-A1B/tokenizer.json ./l
 ./lfm25 ./lfm-ct "explain MoE routing"
 ```
 
+The converter also builds a [FlashHead](#flashhead-1) unless given `--no-flash`; the
+engine ignores it unless run with `--flash`.
+
 At `--ram 8 --ctx 4096 --expert-edge 2` that gives 606 MiB dense resident, 4.72 GiB
 of experts, 96 MiB KV and 29 of 32 slots/layer. Measured on an Intel Mac at 8 threads:
 ~24 tok/s prefill, ~16 tok/s decode, ~90% expert-cache hit.
@@ -524,6 +568,60 @@ template has no thinking toggle, the model decides for itself.
 
 The tokenizer has its own container (`lfmtok.h`, magic `LFTK`) rather than reusing
 `g4tok.h`.
+
+### FlashHead
+
+The same approximation Maple uses, built here instead of read out of the checkpoint.
+The head is tied to the embedding table, 128000 x 2048, which at q4_0 is 140 MiB read
+per decode step for a single matvec. The converter clusters those rows into 4000
+groups of 32 and decode scores the centroids first, computing exact logits only for
+the 431 best clusters (10.8% of the vocabulary). Everything else is -inf.
+
+It is off by default; `--flash` turns it on. `maple` differs because there the
+clustering is the checkpoint's own and the model was released with it enabled. Here
+`tools/flashhead.py` runs balanced spherical k-means over the embedding table after
+the fact, so the exact head stays the default.
+
+Measured on an M1 (8 GB, 4 threads), 100 greedy tokens, interleaved run-by-run,
+best of 4 pairs:
+
+| `--ram` | head | decode | argmax agreement |
+|---------|------|--------|------------------|
+| 6 | exact | 14.2 tok/s | -- |
+| 6 | flash, 431 probes | 14.9 tok/s | 100/100 |
+| 4 | exact | 12.0 tok/s | -- |
+| 4 | flash, 431 probes | 12.3 tok/s | 100/100 |
+
+So: correct, and worth almost nothing on this machine. The reason is the byte
+accounting rather than the head. At `--ram 4` a decode step is dominated by streaming
+~150 MiB of experts off disk at a 77% hit rate, and 140 MiB of *resident* head is a
+small share of a 100 ms step; Maple gets +15% from the same idea because its step is
+6 ms and the head is a quarter of it. Run-to-run drift on this machine is larger than
+the effect, which is why the runs are interleaved and why the table is a best of four.
+
+What the approximation costs is agreement, and that is measurable. `--flash-check`
+runs the exact head alongside on the same row and reports how often the two pick the
+same token, plus `max |probed - exact|`, which must be 0: a probed logit comes out of
+the same kernel and is not approximated at all, only the candidate set is.
+
+| probes | vocabulary scored | argmax agreement |
+|--------|-------------------|------------------|
+| 431 (default) | 10.8% | 100/100 |
+| 128 | 3.2% | 100/100 |
+| 64 | 1.6% | 99/100 |
+
+`--probes N` overrides the count. Control tokens (EOS and the chat template's markers,
+120 ids for LFM2.5) are always scored, since a token at -inf cannot be sampled and a
+model that cannot emit EOS does not stop.
+
+An existing container can be upgraded without re-converting:
+
+```sh
+python3 tools/add_flashhead.py ./lfm-ct --src /path/to/LFM2.5-8B-A1B
+```
+
+That clusters the container's own (dequantised) head and appends 4.9 MiB to
+`dense.bin`, ~50 s. `--src` is read only for the forced control-token ids.
 
 ### Checking it
 
@@ -713,6 +811,189 @@ sliding-window boundary were read wrongly, both would be wrong together.
 `tools/maple_mlx_check.py` closes that gap by diffing greedy generation against the
 actual mlx-lm reference on the real checkpoint. It needs `mlx-lm` and a Metal GPU, so
 it is not part of `make check-maple`; run it by hand after any architecture change.
+
+## ling — Ling-3.0-tiny 7.9B-A1.3B
+
+`ling` runs [inclusionAI/Ling-3.0-tiny](https://huggingface.co/inclusionAI/Ling-3.0-tiny)
+(7.9 B total, 1.3 B active). It is the smallest model here and the one whose context is
+cheapest, and both come from the same place: it is a 3:1 hybrid of two attention
+mechanisms, neither of which is ordinary softmax attention over a per-head KV cache.
+
+```
+layers 0..23,  MLA where (idx+1) % 4 == 0     →  3, 7, 11, 15, 19, 23
+               KDA everywhere else            →  the other 18
+layer 0        dense SwiGLU MLP (4608)
+layers 1..23   128 routed experts (512) + 1 always-on shared expert (512), top-8
+```
+
+**The 18 KDA layers hold no cache at all.** Kimi Delta Attention is linear attention:
+each layer carries a `16 x 128 x 128` recurrent state, 1 MiB, and that is its size at
+position 1 and at position 131072 alike. 19.3 MiB for the whole model, whatever the
+context. Like `lfm25`'s short convolutions it is a recurrence rather than a cache, so it
+only moves forwards: prompt-prefix reuse (chat, server) is taken only when the new
+prompt strictly extends what was already absorbed, and anything else is reprocessed from
+scratch.
+
+**The 6 MLA layers are run absorbed.** Multi-head Latent Attention projects the input
+down to a 512-wide latent, and the textbook forward pass expands that back out into
+per-head keys and values before attending — 16 heads x (192 + 128) floats, 20 KiB per
+position per layer. The converter instead splits `kv_b_proj` per head, transposes the
+key half, and the engine folds the two halves into the ends of the attention:
+
+```
+score_t = (W_k[h]^T q_nope[h]) . c_t  +  q_rot[h] . k_rot_t
+out[h]  = W_v[h] (sum_t a_t c_t)
+```
+
+so the cache holds the latent itself — 512 + 64 floats, 2.3 KiB per position per layer.
+Both folds cost one `kv_b_proj`'s worth of arithmetic per token, and in exchange the
+per-cached-position work drops from a 512x256 expansion to a 576-wide dot. Over the
+whole model the context costs **13.8 KiB a token instead of 120 KiB**: 108 MiB at
+8 K context, 27 MiB with KVarN on, against ~960 MiB unabsorbed.
+
+The engine's `--kv` applies KVarN to the latent, with one codec rather than two: in
+absorbed form the latent *is* simultaneously the key (what the folded query dots
+against) and the value (what the attention weights average), so it gets the more
+accurate of the two bit budgets rather than being split down the middle. The 64-wide
+RoPE key stays f32 — it is a ninth of the bytes and contributes to the score only.
+
+Two details of KDA are worth naming because both are easy to get plausibly wrong, and
+wrong in a way that still generates fluent text. The decay uses fla's *bounded* branch,
+`g = lower_bound * sigmoid(exp(A_log) * (f_proj(x) + dt_bias))` with `lower_bound = -5`,
+not the `-exp(A_log) * softplus(...)` the same kernel uses when no bound is supplied.
+And `FusedRMSNormGated` applies its gate *after* the normalisation, not before.
+
+No MTP: this checkpoint declares `num_nextn_predict_layers` 0 and ships no MTP tensors.
+
+### Grouped routing, and the shared expert
+
+The router is `noaux_tc`, which is not a plain top-k:
+
+1. `scores = sigmoid(router . x)`, in f32 — the checkpoint sets `router_dtype` fp32
+   because near-ties at top-8 flip a few percent of picks in bf16, over 23 layers.
+2. the 128 experts are cut into 8 contiguous groups; a group is ranked by the **sum of
+   its top two** biased scores, and only the best 4 groups survive. An expert with the
+   second highest score overall does not fire if its group's other members are weak.
+3. top-8 among the survivors.
+
+`expert_bias` selects but never weights: the weight applied is the *unbiased* sigmoid,
+renormalised over the 8 kept and scaled by `routed_scaling_factor` 2.5. It is a
+load-balancing nudge, and letting it into the weight would rescale every expert's
+contribution by an amount unrelated to the input.
+
+The shared expert is the one thing this architecture gives the streaming machinery that
+the other three do not have. `gemma4` hides expert reads behind its dense MLP; `lfm25`
+and `maple` have nothing beside the MoE and are left with chunk pipelining alone. Here
+there is an always-on 512-wide expert reading the same normed hidden the router did, so
+`layer_fwd` runs it *between* submitting the routed reads and applying them.
+
+### Mixed precision
+
+The source is fp8: `e4m3` weights with `ue8m0` block scales over `[128,128]` tiles, plus
+a `modules_to_not_convert` list that left the MLA LoRAs, `kv_b_proj`, `lm_head` and the
+embeddings in bf16. There is no way to avoid a round trip — q4_0/q8_0 are per-32-element
+*row* blocks and fp8's tiles are 128x128 across both axes — so the converter dequantises
+to f32 and requantises. (Point it at the bf16 checkpoint instead and it just works: it
+branches on whether a `_scale_inv` companion exists. That is the better container, since
+q8_0 then quantises the original weights rather than an already-lossy fp8 copy.)
+
+| tensors | format |
+|---------|--------|
+| KDA/MLA projections, shared experts, dense MLP, embeddings, lm_head | q8_0 |
+| routed experts | q4_0 |
+| norms, `A_log`, `dt_bias`, `b_proj`, MLA `g_proj`, router, expert bias, conv taps | f32 |
+
+The always-on floor is q8_0 rather than q4_0 for a reason specific to this model: the
+KDA recurrence carries a 128x128 state across the whole sequence, so projection error
+compounds there in a way it does not inside a softmax layer. `--expert-edge N` and
+`--embed-q4` move off the defaults.
+
+### Convert and run
+
+```sh
+.venv/bin/python tools/convert_ling.py ./ling-tiny-fp8 ./ling-ct --ram 8 --ctx 8192
+./ling ./ling-ct --chat
+```
+
+The conversion takes a few minutes, most of it the FlashHead clustering, and produces:
+
+```
+dense resident :    980.8 MiB
+latent kv      :    108.0 MiB   (ctx 8192, 6 MLA layers, f32; 27 MiB with --kv on)
+kda state      :     19.3 MiB   (context-independent)
+experts        :  3.64 GiB total, 1.27 MiB each, 23 layers x 128
+flash head     :  4912 clusters x 32, probe 530 -> 16960/157184 rows scored (10.8%)
+```
+
+Thinking is **on** by default, which is what the chat template does when the caller says
+nothing; `--nothink` pre-closes the think block. The server takes the same switch as
+`enable_thinking` in the request body. Roles are literal `<role>HUMAN</role>` text rather
+than special tokens, and the turn ends at `<|role_end|>`.
+
+The tokenizer needed no new code. It is a byte-level BPE whose split regex is a
+notational variant of the one `lfmtok.h` already hand-codes — the contractions factored
+into one group, possessive quantifiers, `\s*[\r\n]` for `\s*[\r\n]+` — none of which
+changes what is matched, so `convert_lfm_tokenizer.py` just learned to accept the second
+spelling.
+
+On an Intel Mac with the container resident: ~15 tok/s prefill, ~11 tok/s decode.
+
+### FlashHead
+
+Available and correct, and on this machine it is a wash: 11.28 tok/s with it against
+11.27 without. Unlike `gemma4` and `lfm25` it clusters a real `lm_head` rather than a
+tied embedding table — this checkpoint does not tie them — so the clustering sees the
+matrix it is actually approximating, and greedy decoding agreed with the exact head on
+99/100 tokens at the default 530 probes (98/100 at 64).
+
+The reason it does not pay here is that the head is 157184 x 1536 and lives in
+`dense.bin`, which is always fully resident: the exact head is a straight 245 MiB
+sequential read at full memory bandwidth, and the FlashHead trades it for a 12 MiB
+centroid matvec plus ~17 000 *scattered* row reads. The scatter costs about what the
+bytes save. It should pay on a machine where memory bandwidth binds harder than latency.
+
+### Checking it
+
+```sh
+make check-ling PYTHON=.venv/bin/python
+```
+
+```
+numpy oracle          ──►  ling.c             1.4e-6   (exact-activation build)
+routing rule          ──►  numpy oracle       168/168 picks identical
+batch prefill         ──►  sequential         both match the oracle
+expert pinning        ──►  unpinned           bit-identical
+HF tokenizer          ──►  lfmtok.h           475/475 exact (incl. 400 fuzzed)
+```
+
+`--check` reports the routing separately from the arithmetic, because grouped top-k is a
+*discrete* function of the hidden state. On exact activations the engine sees the very
+numbers the oracle saw, so every pick must match and a disagreement is asserted as a bug.
+On int8 activations the hidden has moved by ~1%, and near a decision boundary either
+answer is defensible — but a flipped pick puts a different expert in the sum and moves
+the logits by far more than the int8 arithmetic alone would. So `ling --check` counts the
+disagreements and then *remeasures* with the oracle's picks pinned, and the tolerance it
+asserts is about the arithmetic only. It also reports argmax agreement two ways: exact,
+and "within the row's own error", since on a random fixture whose 256 logits sit in a
+band narrower than the quantisation error exact agreement is not something the int8 build
+can promise.
+
+The int8 tolerance is looser here than in the other three (1.2e-1 against 3e-2) and the
+reason is depth times chain length, not this engine. Each layer runs five or six chained
+int8 matmuls against two or four in `lfm25`, and the fixture is 64 wide. Measured, the
+relative error grows smoothly with depth — `.019 .026 .035 .041 .052 .057 .060 .082` for
+one through eight layers — with no step anywhere, which is what says accumulation rather
+than a bug.
+
+As with `maple`, the oracle is a second transcription of the same reading of
+`modeling_bailing_moe_v3.py` and of fla's KDA kernel, so it cannot catch a systematic
+misunderstanding: if the decay branch or the gate order were read wrongly, both would be
+wrong together. `tools/ling_hf_check.py` closes that gap by diffing greedy generation
+against HF transformers on the real checkpoint. It needs `torch`, `transformers` and
+`fla-core`, so it is not part of `make check-ling`; run it by hand after any architecture
+change. **I have not been able to run it** — there is no torch on the machine this was
+written on — so the architecture is validated by construction and by the model
+generating sensible text, not by a reference implementation.
 
 ## Not implemented yet
 
