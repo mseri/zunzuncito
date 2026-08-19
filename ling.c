@@ -711,10 +711,23 @@ static void route_row(M *m, int li, int pos, const float *xn, int *idx, float *w
     const float *RP = L->router.f;
     const float *BI = L->expert_bias.f;
 
+    /* Eight accumulators, for the reason head_dot has them, but double rather than
+     * float: the width is about the dependency chain, the type is about step 1 above.
+     * Reassociating within double moves a score by ~1e-16 relative, five orders under
+     * the f32 it is rounded to before anything compares it.
+     *
+     * Parallel over experts because this is n_experts x hidden of f32 per layer over
+     * 23 layers, and because it sits in front of moe_submit_chunk: time spent here is
+     * time the expert reads have not started. */
+    #pragma omp parallel for schedule(static)
     for (int e = 0; e < E; e++) {
         const float *r = RP + (size_t)e * D;
-        double v = 0;
-        for (int i = 0; i < D; i++) v += (double)r[i] * xn[i];
+        double s[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        int i = 0;
+        for (; i + 8 <= D; i += 8)
+            for (int k = 0; k < 8; k++) s[k] += (double)r[i + k] * xn[i + k];
+        for (; i < D; i++) s[0] += (double)r[i] * xn[i];
+        double v = ((s[0] + s[1]) + (s[2] + s[3])) + ((s[4] + s[5]) + (s[6] + s[7]));
         b->rwt[e] = 1.0f / (1.0f + expf(-(float)v));
         b->rsel[e] = b->rwt[e] + BI[e];
     }
@@ -1379,7 +1392,7 @@ static void kda_fwd(M *m, int li, const float *Xn, float *OUT, int S, Buf *b) {
 
         #pragma omp parallel for schedule(static)
         for (int h = 0; h < H; h++) {
-            float qh[512], kh[512], eg[512], sk[512], u[512], oh[512];
+            float qh[512], kh[512], eg[512], oh[512];
             float *Sh = st + (size_t)h * HD * HD;
             const float *dtb = L->dt_bias.f + (size_t)h * HD;
             float A = expf(L->A_log.f[h]);
@@ -1399,19 +1412,19 @@ static void kda_fwd(M *m, int li, const float *Xn, float *OUT, int S, Buf *b) {
                 eg[d] = expf(LB * sigmoidf_(A * (fr[(size_t)h * HD + d] + dtb[d])));
             }
 
-            /* pass 1: decay the state and form S k */
+            /* Decay, form S k, apply the delta rule, read out S q -- one row at a time.
+             * The textbook form is two sweeps of the state, the first producing all of
+             * S k and the second consuming it, but nothing crosses rows: S k's entry
+             * for row v uses only row v, u[v] only that entry, and the rank-1 update
+             * to row v only u[v]. Fused, the 512-byte row is read and written once
+             * instead of twice, and the state is 1 MiB a layer across the 18 KDA
+             * layers -- the largest resident read in a decode step after the experts.
+             * Same operations in the same order, so --check does not move. */
             for (int vdim = 0; vdim < HD; vdim++) {
                 float *row = Sh + (size_t)vdim * HD;
-                float acc = 0;
-                for (int d = 0; d < HD; d++) { row[d] *= eg[d]; acc += row[d] * kh[d]; }
-                sk[vdim] = acc;
-            }
-            for (int vdim = 0; vdim < HD; vdim++)
-                u[vdim] = beta * (vr[(size_t)h * HD + vdim] - sk[vdim]);
-            /* pass 2: rank-1 update, and read out S q in the same sweep */
-            for (int vdim = 0; vdim < HD; vdim++) {
-                float *row = Sh + (size_t)vdim * HD;
-                float uu = u[vdim], acc = 0;
+                float sk = 0;
+                for (int d = 0; d < HD; d++) { row[d] *= eg[d]; sk += row[d] * kh[d]; }
+                float uu = beta * (vr[(size_t)h * HD + vdim] - sk), acc = 0;
                 for (int d = 0; d < HD; d++) { row[d] += uu * kh[d]; acc += row[d] * qh[d]; }
                 oh[vdim] = acc;
             }

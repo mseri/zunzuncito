@@ -936,7 +936,18 @@ into one group, possessive quantifiers, `\s*[\r\n]` for `\s*[\r\n]+` — none of
 changes what is matched, so `convert_lfm_tokenizer.py` just learned to accept the second
 spelling.
 
-On an Intel Mac with the container resident: ~15 tok/s prefill, ~11 tok/s decode.
+On an Intel Mac with the container resident: ~17 tok/s prefill, ~12 tok/s decode.
+
+About a token a second of that is recent, from two places, neither of them new
+arithmetic. The KDA update used to sweep its `128x128` state twice per head, once to
+decay it and form `S k` and once to apply the delta rule, but nothing crosses rows
+between the sweeps, so they fuse: the state, 1 MiB a layer in 18 of the 24 layers, is
+read and written once instead of twice. And the router accumulated `n_experts x hidden`
+of f32 into a single `double`, a serial chain of adds on one thread, sitting in front of
+the expert reads it delays. Eight accumulators (still `double` — the width is about the
+dependency chain, the type is about `router_dtype`) and an OpenMP loop took that from
+4.5 ms a token to under half of one. Greedy generation is identical token for token
+afterwards, and the expert-cache read count does not move.
 
 ### FlashHead
 
