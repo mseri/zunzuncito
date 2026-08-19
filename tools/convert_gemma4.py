@@ -155,6 +155,17 @@ class Dense:
 
 
 # RAM planner
+# The four KVarN configurations, mirroring kvarn.h's kvarn_presets. A preset is one
+# calibrated recipe; there is no per-parameter dial.
+KVARN_PRESETS = {
+    "kvarn_k4v2_g128": dict(kbits=4, vbits=2, group=128),
+    "kvarn_k4v4_g128": dict(kbits=4, vbits=4, group=128),
+    "kvarn_k4v2_g64":  dict(kbits=4, vbits=2, group=64),
+    "kvarn_k4v4_g64":  dict(kbits=4, vbits=4, group=64),
+}
+KVARN_RWIN = 128            # f32 residual window, in positions
+
+
 def plan(cfg, dense_bytes, ctx, ram_gb, kv=None):
     """slots/layer for the per-layer LRU expert cache under a RAM budget.
 
@@ -171,10 +182,16 @@ def plan(cfg, dense_bytes, ctx, ram_gb, kv=None):
     # under-reported their KV by 2x.
     # All KV GROWTH lives in the global layers: sliding layers are permanently capped
     # at `sliding_window` positions, so they cost the same at 4K as at 256K ctx.
-    # kv = None -> f32. Otherwise dict(kbits, vbits, rwin, protect, pbits): the f32
-    # residual window plus a TurboQuant-packed store for everything older.
-    def vecb(d, bits):
-        return (d * bits + 7) // 8 + 4          # payload + f32 norm
+    # kv = None -> f32. Otherwise one of KVARN_PRESETS above: the f32 residual
+    # window plus a KVarN-packed store for everything older, at the preset's own bit
+    # widths on every layer. KVarN quantises a tile of `group` tokens at a time, so
+    # the store is counted in whole tiles and each one carries its own scale planes:
+    # 2*d + group fp16 halves for K ([d, group], per-channel rows) and 2*group + d
+    # for V ([group, d], per-token rows).
+    # Mirrors kvarn_tile_bytes, kvarn_window and kvarn_ntiles in kvarn.h.
+    def tile_bytes(d, bits, g, is_k):
+        r, c = (d, g) if is_k else (g, d)
+        return r * c * bits // 8 + (2 * r + c) * 2
     kvbytes = 0
     L = cfg["n_layers"]
     for li, t in enumerate(cfg["layer_types"]):
@@ -184,12 +201,12 @@ def plan(cfg, dense_bytes, ctx, ram_gb, kv=None):
         if not kv or kv["kbits"] <= 0:
             kvbytes += 2 * cap * nkv * hd * 4
             continue
-        prot = li < kv["protect"] or li >= L - kv["protect"]
-        kb = kv["pbits"] if prot else kv["kbits"]
-        vb = kv["pbits"] if prot else kv["vbits"]
-        W = min(kv["rwin"], cap)
-        kvbytes += 2 * W * nkv * hd * 4                       # f32 residual window
-        kvbytes += cap * nkv * (vecb(hd, kb) + vecb(hd, vb))  # packed store
+        g, kb, vb = kv["group"], kv["kbits"], kv["vbits"]
+        W = min(-(-KVARN_RWIN // g) * g, cap)   # rwin rounded up to whole tiles
+        ntile = cap // g + 2                    # a live span of `cap` touches at most this
+        kvbytes += 2 * W * nkv * hd * 4         # f32 residual window
+        kvbytes += ntile * nkv * (tile_bytes(hd, kb, g, True)
+                                  + tile_bytes(hd, vb, g, False))
     kv = kvbytes
 
     scratch = 192 << 20

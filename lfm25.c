@@ -42,7 +42,7 @@
 #endif
 #include "q40.h"
 #include "lfmtok.h"
-#include "kvq.h"
+#include "kvarn.h"
 #include "gpu.h"
 #include "openai_json.h"
 #include "openai_http.h"
@@ -104,13 +104,14 @@ typedef struct {
 
     /* KV, attention layers only (NULL on conv layers). Every attention layer is
      * full-context, LFM2.5 having no sliding window, so position t lives at index
-     * t and there is no ring aliasing. With --kvq the older positions are
-     * TurboQuant-compressed and the most recent `rwin` stay f32. */
+     * t and there is no ring aliasing. With --kv the older positions are
+     * KVarN-compressed a tile at a time and the most recent `rwin` stay f32. */
     float **kv_k, **kv_v;
     int **ring_pos;
     uint8_t **pk, **pv;
-    Kvq *qk, *qv;
-    int rwin;
+    Kvarn *qk, *qv;
+    int rwin;                               /* f32 ring, in positions: a whole number of tiles */
+    int tile;                               /* KVarN tile width, in tokens */
 
     /* Conv recurrent state, [n_layers][(conv_L-1) * hidden], oldest position first.
      * conv_pos is how many positions have been absorbed; it is why prefix reuse is
@@ -328,6 +329,25 @@ static void manifest(M *m, const char *dir) {
 }
 
 /* kernels */
+/* q . k over one head.
+ *
+ * Eight accumulators rather than one. A single running sum makes this a serial
+ * chain of float adds, four cycles of latency each, which bounds the loop at four
+ * cycles an element however wide the vector unit is: 561 ns at head_dim 512 against
+ * 52 with the chain split. There is one of these per cached position per head, so
+ * at long context it is the largest single cost in a decode. Eight is an AVX
+ * vector's width and enough chains to cover the latency, and the compiler folds the
+ * inner loop into one FMA. Reordering the sum moves the result by about 1e-6
+ * relative, well under both the q4_0 weight error and the KV quantiser's. */
+static inline float head_dot(const float *a, const float *b, int n) {
+    float s[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    int i = 0;
+    for (; i + 8 <= n; i += 8)
+        for (int k = 0; k < 8; k++) s[k] += a[i + k] * b[i + k];
+    for (; i < n; i++) s[0] += a[i] * b[i];
+    return ((s[0] + s[1]) + (s[2] + s[3])) + ((s[4] + s[5]) + (s[6] + s[7]));
+}
+
 static void rmsnorm(float *o, const float *x, const float *w, int D, float eps) {
     double s = 0;
     for (int i = 0; i < D; i++) s += (double)x[i] * x[i];
@@ -783,33 +803,50 @@ static void moe_finish(M *m, int li, const float *X, float *out, int S, Buf *b) 
 }
 
 /* KV
- * With --kvq the f32 ring holds the most recent `rwin` positions and the occupant
- * about to be overwritten is TurboQuant-encoded on its way out, so recent tokens
- * always attend at full precision -- 3-4 bit compression without a residual window
- * produces garbage. Without --kvq the ring IS the whole cache. */
+ * With --kv the f32 ring holds at least the most recent `rwin` positions and older
+ * ones are KVarN-encoded on their way out, so recent tokens always attend at full
+ * precision -- 3-4 bit compression without a residual window produces garbage.
+ * Without --kv the ring IS the whole cache.
+ *
+ * KVarN quantises a whole tile of `tile` consecutive tokens at once, so eviction is
+ * not per position. The ring is a whole number of tiles (see kvarn_window), tiles
+ * are aligned to absolute position, and the tile whose first slot is about to be
+ * overwritten is sealed just before that write: exactly once, at the last moment
+ * all of its tokens are still resident. */
 static void kv_write(M *m, int li, int pos, int nkv, int hd, int cap,
                      const float *k, const float *v) {
     int quant = m->pk[li] != NULL;
     int W = quant ? (m->rwin < cap ? m->rwin : cap) : cap;
+    int g = m->tile;
     size_t vec = (size_t)nkv * hd;
     int slot = pos % W;
 
-    if (quant) {
-        /* Evict whatever the slot actually holds rather than assuming pos-W: on a
-         * rewritten position that would encode the wrong vector into the packed
-         * store, unrecoverably. */
-        int old = m->ring_pos[li][slot];
-        if (old >= 0 && old != pos) {
-            const float *ok = m->kv_k[li] + (size_t)slot * vec;
-            const float *ov = m->kv_v[li] + (size_t)slot * vec;
+    /* W == cap means the ring is the whole cache and nothing ever falls out of it.
+     * That is the only case where W need not be a multiple of the tile, so it is
+     * also the case where no sealing may be attempted. */
+    if (quant && W < cap && pos >= W && pos % g == 0) {
+        int base = pos - W;                  /* first position of the tile going out */
+        int ready = 1;
+        /* Seal only a tile that is complete and holds the positions it should. A
+         * rewritten position (prefix reuse, or a redone forward) would otherwise
+         * bake the wrong vector into the store, unrecoverably. */
+        for (int i = 0; i < g; i++)
+            if (m->ring_pos[li][(base + i) % W] != base + i) { ready = 0; break; }
+        if (ready) {
+            /* base is a multiple of both W and the tile, so the tile's g positions
+             * sit in g contiguous ring slots and each head is a strided walk. */
+            int ts = (base / g) % kvarn_ntiles(cap, g);
+            size_t off = (size_t)(base % W) * vec;
             for (int h = 0; h < nkv; h++) {
-                size_t idx = (size_t)old * nkv + h;
-                kvq_encode(&m->qk[li], ok + (size_t)h * hd, m->pk[li] + idx * m->qk[li].bytes);
-                kvq_encode(&m->qv[li], ov + (size_t)h * hd, m->pv[li] + idx * m->qv[li].bytes);
+                size_t idx = (size_t)ts * nkv + h;
+                kvarn_encode_tile(&m->qk[li], m->kv_k[li] + off + (size_t)h * hd,
+                                  vec, g, m->pk[li] + idx * m->qk[li].bytes);
+                kvarn_encode_tile(&m->qv[li], m->kv_v[li] + off + (size_t)h * hd,
+                                  vec, g, m->pv[li] + idx * m->qv[li].bytes);
             }
         }
-        m->ring_pos[li][slot] = pos;
     }
+    if (quant) m->ring_pos[li][slot] = pos;
     memcpy(m->kv_k[li] + (size_t)slot * vec, k, sizeof(float) * vec);
     memcpy(m->kv_v[li] + (size_t)slot * vec, v, sizeof(float) * vec);
 }
@@ -862,6 +899,7 @@ static void attn_fwd(M *m, int li, const float *Xn, float *OUT, int S,
     int cap = c->ctx;
     int quant = m->pk[li] != NULL;
     int Wr = quant ? (m->rwin < cap ? m->rwin : cap) : cap;
+    int g = m->tile, ntile = kvarn_ntiles(cap, g);
     size_t vec = (size_t)nkv * hd;
     float scale = 1.0f / sqrtf((float)hd);
 
@@ -886,6 +924,13 @@ static void attn_fwd(M *m, int li, const float *Xn, float *OUT, int S,
         rope(k, nkv, hd, pos, m->inv_freq);
         /* fold the attention scale into q once rather than into every score */
         for (int i = 0; i < nh * hd; i++) q[i] *= scale;
+        /* Meet the cache in its own frame: on a compressed layer everything the
+         * attention loop below reads is Hadamard-rotated, so rotating q once here
+         * and the output once at the end replaces a transform per cached position.
+         * K and V still go into the ring unrotated, which is the model's frame and
+         * what the encoder expects. */
+        if (quant)
+            for (int i = 0; i < nh; i++) kvarn_rot(q + (size_t)i * hd, hd);
         kv_write(m, li, pos, nkv, hd, cap, k, v);
     }
 
@@ -901,26 +946,38 @@ static void attn_fwd(M *m, int li, const float *Xn, float *OUT, int S,
         for (int kh = 0; kh < nkv; kh++) {
             float kbuf[512], vbuf[512];
             float mx[64], z[64];
+            KvarnPlanes pk, pv;
+            pk.rec = pv.rec = NULL;
             for (int r = 0; r < rep; r++) {
                 mx[r] = -INFINITY; z[r] = 0.0f;
                 memset(orow + (size_t)(kh * rep + r) * hd, 0, sizeof(float) * hd);
             }
             for (int t = 0; t <= pos; t++) {
                 const float *kk, *vv;
-                if (!quant || m->ring_pos[li][t % Wr] == t) {
+                if (!quant) {
                     kk = m->kv_k[li] + (size_t)(t % Wr) * vec + (size_t)kh * hd;
                     vv = m->kv_v[li] + (size_t)(t % Wr) * vec + (size_t)kh * hd;
+                } else if (m->ring_pos[li][t % Wr] == t) {
+                    /* the ring's few positions join the rotated frame */
+                    memcpy(kbuf, m->kv_k[li] + (size_t)(t % Wr) * vec + (size_t)kh * hd,
+                           sizeof(float) * hd);
+                    memcpy(vbuf, m->kv_v[li] + (size_t)(t % Wr) * vec + (size_t)kh * hd,
+                           sizeof(float) * hd);
+                    kvarn_rot(kbuf, hd);
+                    kvarn_rot(vbuf, hd);
+                    kk = kbuf; vv = vbuf;
                 } else {
-                    size_t idx = (size_t)t * nkv + kh;
-                    kvq_decode(&m->qk[li], m->pk[li] + idx * m->qk[li].bytes, kbuf);
-                    kvq_decode(&m->qv[li], m->pv[li] + idx * m->qv[li].bytes, vbuf);
+                    size_t idx = (size_t)((t / g) % ntile) * nkv + kh;
+                    kvarn_decode_raw(&m->qk[li], m->pk[li] + idx * m->qk[li].bytes,
+                                     t % g, &pk, kbuf);
+                    kvarn_decode_raw(&m->qv[li], m->pv[li] + idx * m->qv[li].bytes,
+                                     t % g, &pv, vbuf);
                     kk = kbuf; vv = vbuf;
                 }
                 for (int r = 0; r < rep; r++) {
                     const float *qq = qrow + (size_t)(kh * rep + r) * hd;
                     float *ov = orow + (size_t)(kh * rep + r) * hd;
-                    float score = 0.0f;
-                    for (int d = 0; d < hd; d++) score += qq[d] * kk[d];
+                    float score = head_dot(qq, kk, hd);
                     float nm = score > mx[r] ? score : mx[r];
                     float a = expf(mx[r] - nm), w = expf(score - nm), nz = a * z[r] + w;
                     float old = z[r] ? a * z[r] / nz : 0.0f, add = w / nz;
@@ -928,6 +985,10 @@ static void attn_fwd(M *m, int li, const float *Xn, float *OUT, int S,
                     mx[r] = nm; z[r] = nz;
                 }
             }
+            /* one transform per head brings the whole weighted sum back */
+            if (quant)
+                for (int r = 0; r < rep; r++)
+                    kvarn_rot(orow + (size_t)(kh * rep + r) * hd, hd);
         }
     }
     matmul(OUT, &L->o_proj, b->o, S, b->mxq, b->msx);
@@ -1115,15 +1176,18 @@ static void pin_save(M *m) {
 
 /* init */
 static void init(M *m, const char *dir, int n_io, int ctx_override, double ram_gb,
-                 int kb, int vb, int kv_protect, int rwin, int kv_pbits) {
-    m->rwin = rwin > 0 ? rwin : 128;
+                 int kb, int vb, int rwin, int tile) {
+    m->tile = tile > 0 ? tile : 128;
+    /* KVARN_RWIN is a floor, not the ring size: KVarN seals whole tiles, so the
+     * ring is rounded up to a whole number of them (kvarn_window). */
+    m->rwin = kvarn_window(rwin > 0 ? rwin : 128, m->tile);
     manifest(m, dir);
     Cfg *c = &m->c;
 
     /* --ctx overrides what the container was converted with, and may go up: the
      * container's ctx only fixed slots_per_layer, and the weights do not care.
      * Whether that overshoots the conversion's budget depends on bytes rather than
-     * on the context number -- with --kvq a longer context can cost less -- so the
+     * on the context number -- with --kv a longer context can cost less -- so the
      * comparison happens below, once the real KV size is known. */
     int ctx_planned = c->ctx;
     if (ctx_override > 0) c->ctx = ctx_override;
@@ -1139,8 +1203,8 @@ static void init(M *m, const char *dir, int n_io, int ctx_override, double ram_g
     m->ring_pos = calloc(c->n_layers, sizeof(int *));
     m->pk = calloc(c->n_layers, sizeof(uint8_t *));
     m->pv = calloc(c->n_layers, sizeof(uint8_t *));
-    m->qk = calloc(c->n_layers, sizeof(Kvq));
-    m->qv = calloc(c->n_layers, sizeof(Kvq));
+    m->qk = calloc(c->n_layers, sizeof(Kvarn));
+    m->qv = calloc(c->n_layers, sizeof(Kvarn));
     m->conv_state = calloc(c->n_layers, sizeof(float *));
 
     size_t kvb = 0, cvb = 0;
@@ -1155,11 +1219,6 @@ static void init(M *m, const char *dir, int n_io, int ctx_override, double ram_g
             continue;
         }
         int hd = c->head_dim, nkv = c->n_kv_heads, cap = c->ctx;
-        /* Protected layers get more bits, not f32: pinning a full-context layer to
-         * f32 undoes most of the saving. */
-        int prot = (l < kv_protect) || (l >= c->n_layers - kv_protect);
-        int lkb = prot ? kv_pbits : kb;
-        int lvb = prot ? kv_pbits : vb;
 
         int W = quant ? (m->rwin < cap ? m->rwin : cap) : cap;
         m->kv_k[l] = xmalloc(sizeof(float) * (size_t)W * nkv * hd);
@@ -1169,23 +1228,27 @@ static void init(M *m, const char *dir, int n_io, int ctx_override, double ram_g
         kvb += 2 * sizeof(float) * (size_t)W * nkv * hd;
 
         if (quant) {
-            /* one codec per (layer, K/V): the sign flips are regenerated from the
-             * seed, never stored, so the decoder reproduces the rotation exactly. */
-            kvq_init(&m->qk[l], hd, lkb, 0x9e3779b97f4a7c15ULL ^ (uint64_t)(l * 2 + 1));
-            kvq_init(&m->qv[l], hd, lvb, 0x9e3779b97f4a7c15ULL ^ (uint64_t)(l * 2 + 2));
-            m->pk[l] = xmalloc(m->qk[l].bytes * (size_t)cap * nkv);
-            m->pv[l] = xmalloc(m->qv[l].bytes * (size_t)cap * nkv);
-            kvb += (m->qk[l].bytes + m->qv[l].bytes) * (size_t)cap * nkv;
+            /* One codec per (layer, K/V). The last argument is which way up the
+             * tile is balanced, which kvarn.h's header explains; note that it is
+             * not how the codes end up stored. Nothing here is seeded, so an
+             * encoder and a decoder built from the same config agree without
+             * sharing any state. */
+            kvarn_init(&m->qk[l], hd, kb, m->tile, 1);
+            kvarn_init(&m->qv[l], hd, vb, m->tile, 0);
+            size_t nt = (size_t)kvarn_ntiles(cap, m->tile) * nkv;
+            m->pk[l] = xmalloc(m->qk[l].bytes * nt);
+            m->pv[l] = xmalloc(m->qv[l].bytes * nt);
+            kvb += (m->qk[l].bytes + m->qv[l].bytes) * nt;
         }
     }
     fprintf(stderr, "kv: %.0f MiB for ctx %d", kvb / 1048576.0, c->ctx);
-    if (quant) fprintf(stderr, " (K%d/V%d, rwin %d, %d protected layers at %d bits)",
-                       kb, vb, m->rwin, kv_protect, kv_pbits);
-    else       fprintf(stderr, " (f32; --kvq would cut this a lot)");
+    if (quant) fprintf(stderr, " (KVarN K%d/V%d, tile %d, f32 ring %d)",
+                       kb, vb, m->tile, m->rwin);
+    else       fprintf(stderr, " (f32, by --kv off)");
     fprintf(stderr, ";  conv state: %.0f KiB\n", cvb / 1024.0);
 
     /* Compare against what the conversion budgeted (an f32 KV at the container's own
-     * ctx). Only an actual overshoot warrants a warning -- --kvq routinely buys a
+     * ctx). Only an actual overshoot warrants a warning -- --kv routinely buys a
      * longer context for fewer bytes than the plan assumed. */
     {
         size_t planned = 0;
@@ -1200,7 +1263,7 @@ static void init(M *m, const char *dir, int n_io, int ctx_override, double ram_g
                     "plan budgeted (%.0f MiB for ctx %d, f32), so total RAM will "
                     "exceed the conversion's --ram%s\n",
                     (kvb - planned) / 1048576.0, planned / 1048576.0, ctx_planned,
-                    quant ? "" : "; --kvq would cut it a lot");
+                    quant ? "" : "; dropping --kv off would cut it a lot");
     }
 
     /* expert-cache plan
@@ -1231,7 +1294,7 @@ static void init(M *m, const char *dir, int n_io, int ctx_override, double ram_g
                 fprintf(stderr, "--ram %g GB leaves room for %lld experts per layer, "
                         "below topk=%d: this model needs %.2f GB at this context%s\n",
                         ram_gb, (long long)per, c->topk, min_gb,
-                        quant ? "" : " (--kvq would lower it)");
+                        quant ? "" : " (dropping --kv off would lower it)");
                 exit(1);
             }
             c->slots_per_layer = (int)per;
@@ -1749,9 +1812,10 @@ static void usage(const char *prog, FILE *out) {
         "         [--ram F]               re-plan the expert cache for an F GB budget\n"
         "         [--pin N] [--io N] [--threads N] [--batch N] [--nobatch]\n"
         "         [--serve] [--port N]    OpenAI-compatible local server (default 8484)\n"
-        "         [--kv off|k6v4|k4v2]    KV-cache compression preset\n"
-        "         [--kvq] [--kbits N] [--vbits N] [--rwin N] [--protect N] [--pbits N]\n"
-        "                                 override individual TurboQuant settings\n"
+        "         [--kv PRESET]           KVarN KV-cache compression; PRESET is one\n"
+        "                                 of off | kvarn_k4v2_g128 | kvarn_k4v4_g128 |\n"
+        "                                 kvarn_k4v2_g64 | kvarn_k4v4_g64\n"
+        "                                 (default kvarn_k4v2_g128)\n"
         "         [--metal]               offload the matmuls to the GPU (off by\n"
         "                                 default: usually slower here, see matvec)\n"
         "         [--check]               diff against the numpy oracle's logits\n"
@@ -1768,7 +1832,11 @@ int main(int argc, char **argv) {
     const char *dir = argv[1];
     const char *prompt = NULL, *sys = NULL;
     int think = 0, raw = 0, chat_mode = 0;
-    int kvq_on = 0, kb = 6, vb = 4, rwin = 128, kv_protect = 2, kv_pbits = 8;
+    /* KVarN is ON by default, at upstream's shipped preset, and a preset is all
+     * there is: no per-parameter overrides, because the bit widths and the tile are
+     * one calibrated recipe upstream measured together. --kv off gives f32 KV. */
+    const KvarnPreset *kvp = kvarn_preset(KVARN_DEFAULT);
+    int kv_set = 0;
     int check = 0, n_io = 8, max_tokens = 0, nobatch = 0, npin = 0, nthreads = 2;
     int batch = 128, ctx_override = 0;
     double ram_gb = 0;                   /* 0 = keep the container's own plan */
@@ -1798,31 +1866,19 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--chat")) chat_mode = 1;
         else if (!strcmp(argv[i], "--think")) think = 1;
         else if (!strcmp(argv[i], "--raw")) raw = 1;
-        else if (!strcmp(argv[i], "--kvq")) kvq_on = 1;
         else if (!strcmp(argv[i], "--kv") && i + 1 < argc) {
-            /* The bits alone do not define a config: the residual window and the
-             * protected-layer count matter as much, and a half-set K4/V2 (rwin=0) is
-             * exactly the configuration upstream measured as broken. */
             const char *v = argv[++i];
-            if (!strcmp(v, "off")) { kvq_on = 0; }
-            else if (!strcmp(v, "k6v4")) {
-                kvq_on = 1; kb = 6; vb = 4; rwin = 128; kv_protect = 2; kv_pbits = 8;
-            } else if (!strcmp(v, "k4v2")) {
-                kvq_on = 1; kb = 4; vb = 2; rwin = 128; kv_protect = 4; kv_pbits = 8;
-            } else {
-                fprintf(stderr, "--kv: expected off | k6v4 | k4v2 (got %s)\n", v);
+            kv_set = 1;
+            if (!strcmp(v, "off")) kvp = NULL;
+            else if (!(kvp = kvarn_preset(v))) {
+                fprintf(stderr, "--kv: expected %s (got %s)\n", kvarn_preset_list(), v);
                 return 1;
             }
         }
-        else if (!strcmp(argv[i], "--kbits") && i + 1 < argc) { kb = atoi(argv[++i]); kvq_on = 1; }
-        else if (!strcmp(argv[i], "--vbits") && i + 1 < argc) { vb = atoi(argv[++i]); kvq_on = 1; }
-        else if (!strcmp(argv[i], "--rwin") && i + 1 < argc) rwin = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--protect") && i + 1 < argc) kv_protect = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--pbits") && i + 1 < argc) kv_pbits = atoi(argv[++i]);
         /* end of flags: whatever follows is the prompt, even if it starts with '-' */
         else if (!strcmp(argv[i], "--")) { if (i + 1 < argc && !prompt) prompt = argv[++i]; }
-        /* Any leading dash, not just a double one. A single-dash typo (-kvq for
-         * --kvq) must not fall through to the positional branch: it would silently
+        /* Any leading dash, not just a double one. A single-dash typo (-kv for
+         * --kv) must not fall through to the positional branch: it would silently
          * become the prompt and change what the model generates. */
         else if (argv[i][0] == '-') {
             fprintf(stderr, "unknown flag: %s\n\n", argv[i]);
@@ -1831,7 +1887,12 @@ int main(int argc, char **argv) {
         }
         else if (!prompt) prompt = argv[i];   /* first non-flag positional is the prompt */
     }
-    if (!kvq_on) kb = vb = 0;
+    /* --check diffs the forward pass against a stored oracle to ~1e-4, which is
+     * tighter than any KV quantiser reproduces, so it defaults to f32 KV whatever
+     * the engine default is. Pass --kv explicitly to measure the codec instead. */
+    if (check && !kv_set) kvp = NULL;
+    /* kb == 0 is how the rest of the engine spells "f32 KV". */
+    int kb = kvp ? kvp->kbits : 0, vb = kvp ? kvp->vbits : 0;
     if (penalty < 0.5f || penalty > 2.0f) { fprintf(stderr, "--penalty must be in 0.5..2\n\n"); usage(argv[0], stderr); return 1; }
     if (chat_mode && check) { fprintf(stderr, "--chat cannot be used with --check\n\n"); usage(argv[0], stderr); return 1; }
     if (chat_mode && serve_mode) { fprintf(stderr, "--chat cannot be used with --serve\n\n"); usage(argv[0], stderr); return 1; }
@@ -1849,7 +1910,8 @@ int main(int argc, char **argv) {
 
     M m; memset(&m, 0, sizeof m);
     double t0 = now();
-    init(&m, dir, n_io, ctx_override, ram_gb, kb, vb, kv_protect, rwin, kv_pbits);
+    init(&m, dir, n_io, ctx_override, ram_gb, kb, vb, KVARN_RWIN,
+         kvp ? kvp->group : 128);
     Cfg *c = &m.c;
     pin_load(&m, npin);
     /* Prefill batch size: bigger reuses each streamed weight row over more rows, but

@@ -77,19 +77,19 @@ all: gemma4 lfm25 maple
 metal.o: metal.mm gpu.h
 	$(CC) $(OPT) $(METAL_CFLAGS) -I. -fno-objc-arc -c metal.mm -o $@
 
-gemma4: gemma4.c q40.h g4tok.h kvq.h gpu.h openai_http.h openai_json.h $(METAL_OBJ)
+gemma4: gemma4.c q40.h g4tok.h kvarn.h gpu.h openai_http.h openai_json.h $(METAL_OBJ)
 	$(CC) $(CFLAGS) gemma4.c $(METAL_OBJ) -o $@ $(LDFLAGS)
 
 # COLI_F32ACT keeps activations in f32 (weights stay q4_0). Slower; used only to
 # separate the int8-activation approximation from an actual bug when validating.
-gemma4-exact: gemma4.c q40.h g4tok.h kvq.h gpu.h $(METAL_OBJ)
+gemma4-exact: gemma4.c q40.h g4tok.h kvarn.h gpu.h $(METAL_OBJ)
 	$(CC) $(CFLAGS) -DCOLI_F32ACT gemma4.c $(METAL_OBJ) -o $@ $(LDFLAGS)
 
 # LFM2.5-8B-A1B. Metal is compiled in (the backend has a q8_0 kernel alongside the
 # q4_0 one, which lfm25's apex gradient needs) but stays OFF unless you pass --metal:
 # at 1.5 B active params over ~5.9 MiB experts, dispatch latency usually beats the
 # arithmetic saved. See the comment on g_use_gpu in lfm25.c.
-LFM_DEPS = lfm25.c q40.h lfmtok.h kvq.h gpu.h openai_http.h openai_json.h
+LFM_DEPS = lfm25.c q40.h lfmtok.h kvarn.h gpu.h openai_http.h openai_json.h
 LFM_CFLAGS = $(OPT) $(WARN) $(ARCHFLAGS) $(OMPFLAGS) $(METAL_CFLAGS) -I.
 LFM_LDFLAGS = -lm -lpthread $(OMPLIBS) $(METAL_LDFLAGS)
 
@@ -104,7 +104,7 @@ lfm25-exact: $(LFM_DEPS) $(METAL_OBJ)
 # Maple. Metal is compiled in (the backend has tq2 and q4a kernels for this model's
 # two formats) but stays off unless you pass --metal; see g_use_gpu in maple.c for
 # why, and for where it does pay.
-MAPLE_DEPS = maple.c q40.h tq2.h gpu.h lfmtok.h kvq.h openai_http.h openai_json.h
+MAPLE_DEPS = maple.c q40.h tq2.h gpu.h lfmtok.h kvarn.h openai_http.h openai_json.h
 MAPLE_CFLAGS = $(OPT) $(WARN) $(ARCHFLAGS) $(OMPFLAGS) $(METAL_CFLAGS) -I.
 MAPLE_LDFLAGS = -lm -lpthread $(OMPLIBS) $(METAL_LDFLAGS)
 
@@ -125,8 +125,8 @@ test_lfmtok: tests/test_lfmtok.c lfmtok.h
 test_q40: tests/test_q40.c q40.h
 	$(CC) $(OPT) $(ARCHFLAGS) -I. tests/test_q40.c -o $@ -lm
 
-test_kvq: tests/test_kvq.c kvq.h
-	$(CC) $(OPT) $(ARCHFLAGS) -I. tests/test_kvq.c -o $@ -lm
+test_kvarn: tests/test_kvarn.c kvarn.h q40.h
+	$(CC) $(OPT) $(ARCHFLAGS) -I. tests/test_kvarn.c -o $@ -lm
 
 # Simulates the Metal shader lane-for-lane on the CPU and diffs it against the
 # reference. Validates the shader LOGIC (nibble order, the unaligned fp16 scale, the
@@ -135,9 +135,9 @@ test_metal_sim: tests/test_metal_sim.c q40.h tq2.h
 	$(CC) $(OPT) $(ARCHFLAGS) -I. tests/test_metal_sim.c -o $@ -lm
 
 # Full regression. Needs python3 + torch + transformers (for the fixture only).
-check: gemma4 gemma4-exact test_q40 test_kvq test_metal_sim
+check: gemma4 gemma4-exact test_q40 test_kvarn test_metal_sim
 	./test_q40
-	./test_kvq
+	./test_kvarn
 	./test_metal_sim
 	python3 tools/convert_gemma4.py --fixture --ram 8 --ctx 64 /tmp/g4fix
 	python3 tools/gemma4_check.py /tmp/g4fix
@@ -192,6 +192,6 @@ check-maple: maple maple-exact test_tq2 test_lfmtok
 
 clean:
 	rm -f gemma4 gemma4-exact lfm25 lfm25-exact maple maple-exact \
-	      test_q40 test_kvq test_metal_sim test_lfmtok test_tq2 metal.o
+	      test_q40 test_kvarn test_metal_sim test_lfmtok test_tq2 metal.o
 
 .PHONY: all check check-lfm25 check-maple clean

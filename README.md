@@ -1,7 +1,7 @@
 # zunzuncito — colibrì-style MoE engines for a small-RAM machine
 
 Three engines share this repo, along with the q4_0/q8_0 kernels (`q40.h`), the ternary
-kernels (`tq2.h`), the TurboQuant KV cache (`kvq.h`), the OpenAI server, and one idea:
+kernels (`tq2.h`), the KVarN KV cache (`kvarn.h`), the OpenAI server, and one idea:
 stream the routed experts from disk under an expert-granular cache instead of leaving
 it to the OS page cache.
 
@@ -45,7 +45,7 @@ useless.
 All of this is only worth it if you have 4–8 GB of RAM. With 16 GB you are better off
 with llama.cpp — though I get comparable performance by tuning the IO threads (`--io`)
 and the compute threads (`--threads`), see below, and I keep a lot more RAM free at
-high context (TurboQuant for the KV works quite well).
+high context (KVarN for the KV works quite well).
 
 This is the pure-text model: vision is not implemented at all, and the CLI does not
 implement tool calling.
@@ -222,45 +222,162 @@ NVMe. Metal could still help for:
 - a 16 GB budget, where the whole container is resident and there is no disk in the
   loop, so unified memory bandwidth may beat the CPU bandwidth.
 
-## KV-cache compression (TurboQuant V3)
+## KV-cache compression (KVarN)
 
-Optional, off by default, and it's what buys you context length. Gemma-4's 25 sliding
-layers cap their KV at 1024 positions, so they cost a fixed 400 MiB whatever the
-context; all the growth is in the 5 global layers, and on a constrained system you
-feel it.
+On by default at upstream's shipped preset, and it's what buys you context length.
+`--kv off` gets you back to an f32 cache. Gemma-4's 25 sliding layers cap their KV at
+1024 positions, so they cost a fixed 400 MiB whatever the context; all the growth is
+in the 5 global layers, and on a constrained system you feel it.
 
-`--kvq` enables TurboQuant V3 (random rotation + Lloyd-Max, MSE-only, no QJL),
-asymmetric K/V bits, high-bit protected layers, and an f32 residual window.
+`--kv PRESET` enables [KVarN](https://github.com/huawei-csl/KVarN) (Hadamard rotation
++ log-domain Sinkhorn variance normalisation + asymmetric RTN). One flag, one of
+upstream's four `--kv-cache-dtype` values, and nothing inside a preset is separately
+settable. The bit widths and the tile are one calibrated recipe; taking them apart
+gets you a configuration nobody measured.
 
-The slots/layer distribution at a 4 GB budget (0 = will not run):
+The point of the Sinkhorn step is outliers. A handful of KV channels carry an order of
+magnitude more variance than the rest, in every layer, and a per-vector quantiser has
+to set its scale by them. The rotation smears that energy across all coordinates
+rather than removing it, so the bulk of the vector gets a fraction of the codebook.
+KVarN quantises a *tile* of 128 consecutive tokens instead, and before rounding it
+drives that tile towards equal variance along both axes by alternating column-wise and
+row-wise std normalisation in log space. A hot channel is divided down by its own row
+scale, a hot token by its own column scale, both scales are kept, and what reaches the
+rounder has no outlier left to waste resolution on. `kvarn.h` has the details.
 
-| ctx  | f32 KV      | K6/V4 p2      | K4/V2 p4      |
-|------|-------------|---------------|---------------|
-| 4K   | 560M → 21   | 152M → 25     | 132M → 25     |
-| 32K  | 1680M → 9   | 350M → **23** | 274M → 24     |
-| 128K | 5520M → **0** | 1030M → **16** | 762M → 19   |
-| 256K | 10640M → **0** | 1936M → **0** | 1412M → **12** |
-
-At 4K it buys you almost nothing. At 32K it triples the expert cache.
-At 128K+ it makes the difference between running and not running.
-
-### Which preset
+### The presets
 
 ```sh
-./gemma4 ./g4 --kv off      # f32 KV (default)
-./gemma4 ./g4 --kv k6v4     # K6/V4, rwin 128, 2 protected layers @ 8 bits
-./gemma4 ./g4 --kv k4v2     # K4/V2, rwin 128, 4 protected layers @ 8 bits
+./gemma4 ./g4                         # kvarn_k4v2_g128, the default
+./gemma4 ./g4 --kv kvarn_k4v4_g128    # 4-bit values, ~25% more KV
+./gemma4 ./g4 --kv kvarn_k4v2_g64     # 64-token tiles
+./gemma4 ./g4 --kv kvarn_k4v4_g64
+./gemma4 ./g4 --kv off                # f32 KV
 ```
 
-Pick k6v4 unless you need more than 128K context, in which case k4v2 costs you some
-quality. K6's fidelity is very high (0.9997 cos / 94% top-1, against K4's 0.995 / 81%)
-and you can check both with `./test_kvq`.
+`--check` is the exception: it diffs the forward pass against a stored oracle to
+~1e-4, which is tighter than any KV quantiser reproduces, so it uses an f32 cache
+unless `--kv` is given explicitly.
 
-To explore further, set `--kbits`, `--vbits`, `--pbits`, `--protect` and `--rwin` by
-hand. `--protect N` protects the first and last N layers at `--pbits` (default 8)
-rather than f32: Gemma-4's last layer is global, so protecting it with f32 would cost
-1.07 GiB at 128K and undo most of the saving. The residual window `--rwin` isn't
-optional at low bit-widths; 3-4 bit compression without one just gives you garbage.
+Every preset is K4: KVarN spends its bits on keys, because a key error moves every
+attention score while a value error is averaged out by the softmax weights. 128 is
+upstream's design point and the default; 64 gives finer granularity for a little
+more scale overhead per token, and on the fixture is marginally the more accurate
+of the two.
+
+KV bytes at each context, all four presets, exact (`tools/convert_gemma4.py`'s planner
+and the engine's own sizing agree to the byte):
+
+| ctx  | f32 KV | k4v2_g128 | k4v4_g128 | k4v2_g64 | k4v4_g64 |
+|------|--------|-----------|-----------|----------|----------|
+| 4K   | 560M   | 123M      | 144M      | 121M     | 141M     |
+| 32K  | 1680M  | 237M      | 293M      | 241M     | 295M     |
+| 128K | 5520M  | 625M      | 801M      | 652M     | 826M     |
+| 256K | 10640M | 1142M     | 1478M     | 1199M    | 1534M    |
+
+At 4K it buys you almost nothing. At 32K it triples the expert cache.
+At 128K+ it makes the difference between running and not running: 256K of KV drops
+from 10.4 GiB to 1.1 GiB.
+
+Every layer runs the preset's own widths. There is no protected-layer carve-out, on
+the grounds that a per-layer override would mean asking for `kvarn_k4v2_g128` and
+getting something else.
+
+What KVarN spends, against a per-vector codec, is scale bytes: one fp16 scale per
+channel and one per token per tile (2·d + group halves for K, 2·group + d for V)
+where TurboQuant carried a single f32 norm per vector. At d=512 and group 128 that is
+18 bytes per token rather than 4. A per-channel scale is what the variance
+normalisation needs, so this is the method's cost rather than an implementation tax,
+and it shrinks as a fraction of the store as the context grows.
+
+Below 4 bits the per-row RTN range comes from the [q, 1-q] percentiles rather than
+from the row's extremes, and the few values outside get clamped. This is upstream's
+`KVARN_RTN_QUANTILE`, at its q=0.005. With four levels to spend, one loud coordinate
+across the full min..max costs the other 127 samples most of their resolution, and
+after the balancing there is usually exactly one left: Sinkhorn equalises variance,
+not kurtosis. It is worth 6% of the round-trip error at 2 bits and 5% at 3, and it
+is why the shipped preset's 2-bit values hold up. At 4 bits and above the extremes
+are worth keeping exactly, so min/max stands.
+
+`./test_kvarn` reports what the codec costs on synthetic outlier-heavy KV: at K4 the
+attention scores keep 0.995 cosine against f32, at K8 0.99998, at K2 0.90. Treat those
+as regression tripwires rather than accuracy claims. Upstream makes the same point
+from the other side: a high score similarity does not by itself prove generation
+works.
+
+The residual window is this engine's own addition, fixed at 128 positions and not
+exposed. It exists because a tile cannot be sealed until all of its tokens exist, so
+the newest ones need somewhere to live. It is rounded up to
+whole tiles, and with speculation on (`--mtp`, `--draft`, `--dflash`) gemma4 widens it
+by one tile plus the draft length, since a sealed tile is final and a rejected draft
+must never be baked into one.
+
+### Making it fast
+
+A compressed cache only pays if reading it is cheaper than reading the f32 one it
+replaces, so most of the work here went into the read path rather than into the
+codec's arithmetic. Decoding one d=512 key costs 385 ns and encoding a 128-token
+tile costs 1817 us. Four decisions account for almost all of that.
+
+The largest single factor is that the code plane is stored token-major even for K,
+which the quantiser balances channels-major. Storing it the way it was quantised
+turns reading one token into a 64-byte-stride gather, 512 cache lines to rebuild a
+single vector. Transposing on the way in costs one blocked pass per 128 tokens and
+buys a contiguous read on every attention step afterwards.
+
+Attention then stays in the rotated frame. H is orthonormal and symmetric, so
+`q.k = (Hq).(Hk)` and `sum_t w_t v_t = H(sum_t w_t Hv_t)`: rotate the query once per
+token, transform the accumulated output once, and the inverse Hadamard leaves the
+per-position path entirely. The positions still in the f32 ring get rotated on the
+way in to join it.
+
+The transform itself is vectorised. From len=8 up a stage is a plain add and
+subtract of two vectors; the three stages below that live inside a single register
+and are one shuffle plus one multiply-add against a sign pattern. It comes out
+bit-identical to the scalar version, which `tests/test_kvarn.c` checks.
+
+Two loops were bounded by float-add latency rather than by throughput. The Sinkhorn's
+row standard deviation and the attention dot product each accumulated into one
+running sum, and at four cycles per add that bounds a loop at four cycles an element
+however wide the vector unit is: 561 ns for a head_dim 512 dot against 52 once the
+chain is split eight ways. The Sinkhorn also reduced down columns with a
+`for c { for r }` loop, which takes a cache miss per element where C accumulators
+take none, and it ran the reference's eight sweeps per iteration where two carry the
+same arithmetic in the same summation order.
+
+A tile's per-channel scale plane is converted once per tile rather than once per
+position. It is the same for all `group` of the tile's tokens, so rebuilding it per
+position did `group` times the work the tile needed and touched a second region of
+the record tens of KiB from the codes on every read. Sequential decode went from
+111 ns to 68 at d=512. This one mattered far more than the microbenchmark suggested:
+on an Intel MacBook Pro it was the difference between maple running at 12 tok/s and
+at 29, and it only bit the 128-token tile, where that second region sits twice as
+far from the codes. On a Xeon with a 1 MiB L2 the same change is worth a few percent
+and both tile sizes behave identically, which is a decent argument against trusting
+one machine's cache behaviour.
+
+The dot split (`head_dot`) is not really a KV change. The attention dot is there
+either way, so `--kv off` gets the same speedup from it.
+
+On one kv head's attention over T cached positions:
+
+| d / T / q heads | plain dot, model frame | rotated frame | `head_dot` | both |
+|---|---|---|---|---|
+| 512 / 4096 / 8   | 53.5 ms | 46.0 | 33.6 | **27.2 (1.97x)** |
+| 512 / 16384 / 8  | 220.1 ms | 191.7 | 144.2 | **116.1 (1.90x)** |
+| 256 / 1024 / 4   | 2.05 ms | 1.76 | 0.91 | **0.60 (3.38x)** |
+| 128 / 4096 / 4   | 4.21 ms | 3.46 | 1.89 | **1.22 (3.44x)** |
+
+The rotated frame is worth 1.16x on its own and 1.5x once the dot stops being the
+bottleneck, so the two compound. Both reorder float summations, which moves logits
+by around 1e-6 relative. That is well under q4_0's own weight error, and `--check`'s
+1e-4 tolerance against the numpy oracle is tight enough to still be a real test of
+them rather than a rubber stamp.
+
+One thing that did not work: fusing the Sinkhorn's two remaining sweeps into one is
+about 10% slower. A tile is 256 KiB and lives in L2, so nothing was bandwidth-bound
+to begin with, and making each row wait on its own standard deviation drains the
+pipeline.
 
 ## Context length
 
@@ -270,18 +387,19 @@ it is allowed too, with a warning: the container's `ctx` only fixed `slots_per_l
 the weights do not care, but the total will exceed the RAM budget the conversion
 planned for.
 
-The startup line reports what you actually got, and it accounts for `--kvq`:
+The startup line reports what you actually got, and it accounts for `--kv`:
 
 ```
-kv:  567 MiB for ctx 4096  (f32; --kvq would cut this a lot)   # gemma4, container default
-kv: 1047 MiB for ctx 16384 (f32; --kvq would cut this a lot)   # gemma4 --ctx 16384
+kv:  123 MiB for ctx 4096  (KVarN K4/V2, tile 128, f32 ring 128)   # gemma4 default
+kv:  172 MiB for ctx 16384 (KVarN K4/V2, tile 128, f32 ring 128)   # gemma4 --ctx 16384
+kv:  567 MiB for ctx 4096  (f32, by --kv off)
+kv: 1047 MiB for ctx 16384 (f32, by --kv off)
    warning: that is 480 MiB more KV than the container's plan budgeted ...
-kv:  238 MiB for ctx 16384 (K6/V4, rwin 128, 2 protected layers at 8 bits)
 ```
 
 The warning is about bytes rather than the context number: it fires only when the KV
 you are actually allocating exceeds what the conversion budgeted (an f32 KV at the
-container's own `ctx`). With `--kvq` a 4x longer context often costs less than the
+container's own `ctx`). With `--kv` a 4x longer context often costs less than the
 plan assumed, as in the 4x-context-for-a-third-of-the-RAM row above, and stays quiet.
 
 Under `--serve` this is the server's context window, advertised as `context_length`
@@ -303,18 +421,18 @@ resident dense blob and the KV it just allocated, instead of the estimates the
 conversion had to work from:
 
 ```
-$ ./lfm25 ./lfm-ct --ram 4 --kvq
-kv: 20 MiB for ctx 4096 (K6/V4, rwin 128, 2 protected layers at 8 bits)
-ram: 4 GB budget -> 13 slots/layer (dense 606 MiB + kv 20 MiB + cache 3191 MiB)
+$ ./lfm25 ./lfm-ct --ram 4
+kv: 14 MiB for ctx 4096 (KVarN K4/V2, tile 128, f32 ring 128)
+ram: 4 GB budget -> 13 slots/layer (dense 606 MiB + kv 14 MiB + cache 3191 MiB)
 ```
 
-It composes with `--ctx` and `--kvq`, in that order: the KV is sized first and the
+It composes with `--ctx` and `--kv`, in that order: the KV is sized first and the
 cache gets what is left, so a longer context costs slots. Below `topk` slots per layer
 the cache would thrash inside a single forward, so rather than run unusably slow it
 exits and tells you the minimum budget for the current context:
 
 ```
-$ ./gemma4 ./g4 --ram 2 --kvq
+$ ./gemma4 ./g4 --ram 2
 --ram 2 GB leaves room for 3 experts per layer, below topk=8: this model needs 2.38 GB
 ```
 
@@ -345,7 +463,7 @@ gemma4_oracle.py         ──►  gemma4.c           2.6e-7   (exact-activatio
 batch-union prefill      ──►  sequential         bit-identical
 Python converter         ──►  C q40 kernel       bit-identical
 HF tokenizer             ──►  g4tok.h            416/416 exact (incl. 400 fuzzed)
-TurboQuant paper bounds  ──►  kvq.h              MSE within bounds at 1/2/3/4-bit
+KVarN (huawei-csl)       ──►  kvarn.h            round-trip + attention cosine, 2..8-bit
 chat_template.jinja      ──►  chat_prompt()      5/5 exact
 ```
 
@@ -398,7 +516,7 @@ of experts, 96 MiB KV and 29 of 32 slots/layer. Measured on an Intel Mac at 8 th
 
 Flags mirror `gemma4` where they mean the same thing (`--chat`, `--serve`, `--system`,
 `--raw`, `--temp/--topp/--topk`, `--pin`, `--io`, `--threads`, `--ctx`, `--ram`,
-`--kv`/`--kvq` and the individual TurboQuant knobs). Sampling defaults are LFM2.5's
+`--kv`). Sampling defaults are LFM2.5's
 own: temp 0.2, top_k 80. `--batch N` (default 128) sets the prefill batch, which is
 what gives each streamed weight row its reuse, so lowering it saves scratch and costs
 prefill speed. `--think` forces a reasoning block by pre-filling `<think>`; the chat
@@ -481,7 +599,7 @@ one, RoPE on the sliding layers only and NoPE on the full ones, partial rotary o
 the first half of each head, and qk-norm. The sliding layers cap their KV at 512
 positions however long the context is, so the KV costs a quarter of what 24 layers
 suggests: 132 MiB at ctx 4096, since only the 6 full layers store 4096 deep.
-`--kvq` therefore applies to the full-attention layers only; compressing a layer that
+`--kv` therefore applies to the full-attention layers only; compressing a layer that
 is already bounded buys nothing and costs accuracy.
 
 One consequence worth stating because getting it wrong does not crash: a prefill batch
