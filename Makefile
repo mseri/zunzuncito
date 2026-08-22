@@ -165,6 +165,16 @@ check: gemma4 gemma4-exact test_q40 test_kvarn test_metal_sim
 
 # lfm25 regression: the tokenizer against HF (or the in-file reference), and the
 # engine against a numpy oracle run on the DEQUANTISED container weights.
+#
+# DSpark is deliberately NOT here: the fixture carries no drafter, and what is worth
+# checking needs the real 5 GB container. Run it by hand after touching the conv
+# snapshot or the KVarN confirm logic, the two things speculation can silently
+# corrupt. There is no exact-match assertion to make -- the verify is batched and
+# decode is not, so greedy flips on near-ties -- but these two must diverge from the
+# baseline at the SAME token, since a rewind bug would depend on the block size:
+#   ./lfm25 ./lfm-ct --kv off --temp 0 --max_tokens 96 PROMPT
+#   ./lfm25 ./lfm-ct --kv off --temp 0 --max_tokens 96 --dspark --ndraft 2 PROMPT
+#   ./lfm25 ./lfm-ct --kv off --temp 0 --max_tokens 96 --dspark PROMPT
 # PYTHON is overridable: these need numpy, and lfmtok_check wants `tokenizers` for
 # an authoritative comparison (it falls back to a bundled reference without it).
 #   make check-lfm25 PYTHON=.venv/bin/python

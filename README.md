@@ -8,7 +8,7 @@ it to the OS page cache.
 | binary | model | notes |
 |--------|-------|-------|
 | `gemma4` | Gemma-4 26B-A4B | 30 attention layers, 128 experts/layer, MTP + DFlash speculation, optional FlashHead |
-| `lfm25`  | [LFM2.5-8B-A1B](https://huggingface.co/LiquidAI/LFM2.5-8B-A1B) | hybrid 18 short-conv + 6 attention layers, 32 tiny experts/layer, apex-quant mixed precision, optional FlashHead |
+| `lfm25`  | [LFM2.5-8B-A1B](https://huggingface.co/LiquidAI/LFM2.5-8B-A1B) | hybrid 18 short-conv + 6 attention layers, 32 tiny experts/layer, apex-quant mixed precision, DSpark speculation, optional FlashHead |
 | `maple`  | [Maple-preview 20B-A1B](https://github.com/deepgrove-ai/mlx-lm-deepgrove) | ternary throughout, 256 experts/layer, sliding + full attention, FlashHead |
 | `ling`   | [Ling-3.0-tiny 7.9B-A1.3B](https://huggingface.co/inclusionAI/Ling-3.0-tiny) | 3:1 KDA/MLA hybrid, 128 experts/layer + a shared one, absorbed MLA cache, optional FlashHead |
 
@@ -523,7 +523,9 @@ unlike a KV cache cannot be rewound: prompt-prefix reuse (chat, server) is only 
 when the new prompt strictly extends what was already absorbed, and anything else is
 reprocessed from scratch.
 
-No MTP, no DFlash (this model ships neither). No Metal.
+No MTP. Optional [DSpark](#dspark) block-parallel speculation, which is where the
+un-rewindable conv state stops being a prefix-reuse detail and becomes the central
+problem.
 
 ### Mixed precision (apex-quant, ported)
 
@@ -568,6 +570,116 @@ template has no thinking toggle, the model decides for itself.
 
 The tokenizer has its own container (`lfmtok.h`, magic `LFTK`) rather than reusing
 `g4tok.h`.
+
+### DSpark
+
+[LFM2.5-8B-A1B-DSpark](https://huggingface.co/LiquidAI/LFM2.5-8B-A1B-DSpark) is a
+328 M-parameter block-parallel drafter for this exact target. It is DFlash's shape —
+five Qwen3-style layers, no embedding table and no lm_head of its own, attending a
+context distilled from five of the target's intermediate hidden states — with two
+extra heads. Convert it into an existing container and pass `--dspark`:
+
+```sh
+python3 tools/convert_lfm25_dspark.py /path/to/LFM2.5-8B-A1B-DSpark ./lfm-ct
+./lfm25 ./lfm-ct --dspark "explain MoE routing"
+```
+
+A step embeds `[last confirmed token, mask, mask, ...]` over `block_size` (9) masked
+positions, runs the drafter once with attention that is bidirectional inside the
+block, and reads a token off every row. **Each row predicts the position after its
+own**, causal-LM style: row 0, the last confirmed token, gives the first proposal,
+and the mask standing at *pos+i* gives the token for *pos+i+1*. So a 9-mask block is
+10 rows and 10 proposals, verified by a single batched target forward whose last row
+is free — a ceiling of 11 tokens per target forward.
+
+Nothing catches that indexing if you get it wrong. Reading row *i+1* for proposal *i*
+still produces fluent, confident drafts (the drafter simply runs a token ahead of
+itself), it just costs about thirty points of first-position acceptance. The symptom
+is a drafted block that is correct but shifted, proposing the continuation that
+belongs one position later, over and over, while the confidence head reports 0.99.
+
+The conv state is the hard part. Speculation writes state for positions that may be
+rejected, and 18 of the 24 layers carry a recurrence that cannot be rewound. The KV
+cache is fine, since it is addressed by absolute position and rejected entries are
+simply overwritten. So `conv_fwd` snapshots the state after every position of the
+block while `snap_on`, and a partial acceptance restores the snapshot at the accepted
+prefix. At block 11 that is 3.2 MiB, allocated once. Getting this wrong does not
+crash; it silently corrupts every subsequent token.
+
+What DSpark adds over DFlash is the markov head. Masking a block destroys the
+dependency between neighbouring positions (position *i* cannot see what *i-1* turned
+out to be, because they are decided in the same pass), and a rank-256 factorisation
+of a bigram table puts a cheap version back: `w1` read as an embedding of the previous
+token, `w2` mapping that back to the vocabulary, added to the logits and resolved
+sequentially across the block. It is worth an order of magnitude (below).
+
+There is also a confidence head, `Linear(2048 + 256 -> 1)` over the row's final hidden
+concatenated with that markov feature. `--dconf F` stops proposing at the first
+position it puts below `F`; off by default, because the reference proposes the whole
+block and an 11-row verify costs barely more than a 4-row one. It is well calibrated:
+on an accepted block it reads 0.85-1.00 and drops to ~0.3 exactly at the position the
+target rejects.
+
+Acceptance is equality with the token the target's own sampler produced, drawn from
+the same RNG stream in order. That is stricter than the usual rejection test at
+`temp > 0` and accepts less often for it, but every emitted token is then literally
+one the target produced rather than one drawn from the right distribution.
+
+It does **not** reproduce the non-speculative run token for token, and cannot: the
+verify is a batched forward where decode is a single-row one, and the two agree only
+to ~1e-6 — the same gap `--check --nobatch` measures — so greedy flips on a near-tie.
+`--kv` widens it further, because `--dspark` widens the KVarN ring (a sealed tile is
+final, so an unconfirmed draft must never reach one) and that changes which positions
+get compressed. Short greedy runs do come out identical; a 96-token one diverged at
+one word and stayed coherent. What says this is the noise floor rather than a botched
+rewind: `--ndraft 2` and `--ndraft 9` diverge from the baseline at the *same*
+token, though their rewind patterns have nothing in common, and both are deterministic
+run to run.
+
+`--flash` is refused under `--dspark`: the accept test would then be rejecting on the
+head's approximate candidate set rather than on the drafter being wrong.
+
+Dials: `--ndraft N` caps proposals below the checkpoint's 10, `--drefine N` adds
+denoising passes, `--dfreeze F` sets the confidence at which a refinement pass hands a
+position back as a real embedding (default 0.9), `--dconf F` trims the block, and
+`--no-markov` drops the bigram head. `LFMDBG=1` adds the per-block-position
+acceptance breakdown to the end-of-run statistics. The converter takes
+`--draft-bits {4,8}` (default 4, 191 MiB resident).
+
+#### What it measures, and the honest gap
+
+Intel Mac, 8 threads, greedy, 64 tokens, `--kv off`, prompt `explain MoE routing`,
+`LFMDBG=1` for the per-position breakdown:
+
+| variant | tok/step | accepted | by block position |
+|---------|---------:|---------:|-------------------|
+| `--dspark` | 3.71 | 27.1% | 88 59 41 24 18 12 12 6 6 6 |
+| `--dspark --no-markov` | 1.89 | 8.9% | 51 20 11 6 0 0 0 0 0 0 |
+| `--dspark --drefine 3` | 3.00 | 20.0% | 82 64 36 9 9 0 0 0 0 0 |
+
+The model card reports a mean of 7.21 tokens per step. We get 3.7, and I have not
+closed that gap. What the ablations establish is that the wiring is right in kind:
+first-position acceptance is 88%, the markov head is worth 3x, swapping which factor
+is the lookup collapses it to 0.2%, interleaved RoPE beats NeoX (27.1% vs 9.7%), and a
+q8_0 drafter is no better than q4_0, so quantisation of the *drafter* is not the
+limiter. Refinement passes hurt, which says this is a one-shot masked predictor rather
+than a diffusion model.
+
+Two candidate explanations for the rest, neither verified. The drafter has to match
+the target's greedy argmax *exactly*, and the target here is q4_0/q8_0 while the
+drafter was trained against a bf16 one — disagreement on near-ties costs acceptance
+directly, and it compounds down the block. And the reference implementation is an
+[sglang PR](https://github.com/sgl-project/sglang/pull/31041) whose target-side and
+kernel halves I have, but not the drafter's own forward, so the markov combination
+rule (a plain logit addition) and the choice of capture point are still inferences
+from tensor shapes. `--no-markov` and `--drefine` exist to keep measuring that.
+
+On this machine `--dspark` is a net slowdown: 3.5 tok/s against 9.5 baseline. At 3.7
+tokens per step it needs a target forward to cost far less than 3.7x a single-row one,
+and here an 11-row verify costs nearly 11x: the batch routes to ~10x as many experts
+per layer, and experts stream from a 5 GiB file. It pays where the target forward is
+latency-bound rather than bandwidth-bound, which is the regime the model card's H100
+and M4 Max numbers are in and this box is not.
 
 ### FlashHead
 

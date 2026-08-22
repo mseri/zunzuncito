@@ -20,7 +20,10 @@
  * Mixed precision, after apex-quant: every tensor carries its own format and matvec
  * dispatches per tensor. tools/convert_lfm25.py decides the gradient.
  *
- * No MTP, no DFlash: this model ships neither.
+ * No MTP. DSpark speculation is optional (--dspark): a 328 M-param block-parallel
+ * drafter that conditions on hidden states pulled out of five of this model's own
+ * layers. It is the one place the conv recurrence has to be undone, and the only way
+ * to undo it is to have kept a copy -- see conv_snap.
  *
  * Build:  cc -O3 -march=native -fopenmp lfm25.c -lm -lpthread -o lfm25
  */
@@ -50,6 +53,9 @@
 #define MAXL 64
 #define MAXTOPK 16
 #define MAXEXPERTS 256
+/* Upper bound on a DSpark block. The shipped drafter uses 9; this bounds the KVarN
+ * ring widening and the verify batch without either having to know the real number. */
+#define DS_MAXBLOCK 64
 
 /* tensor formats, as written by tools/convert_lfm25.py */
 #define FMT_F32 0
@@ -116,11 +122,28 @@ typedef struct {
     int rwin;                               /* f32 ring, in positions: a whole number of tiles */
     int tile;                               /* KVarN tile width, in tokens */
 
+    /* Highest position whose KV is confirmed. Speculation writes KV for positions
+     * that may be rejected, and a sealed KVarN tile is write-once: a rejected draft
+     * baked into one cannot be taken back out. INT_MAX = not speculating. */
+    int kv_conf;
+
     /* Conv recurrent state, [n_layers][(conv_L-1) * hidden], oldest position first.
      * conv_pos is how many positions have been absorbed; it is why prefix reuse is
      * restricted (see forward()). */
     float **conv_state;
     int conv_pos;
+
+    /* Per-position snapshots of that state, [n_layers][snap_cap * (conv_L-1) * hidden],
+     * written by conv_fwd while snap_on.
+     *
+     * Speculation is the only caller. A verify forward advances the recurrence over
+     * the whole proposed block, but only an accepted prefix of it is real, and a
+     * recurrence cannot be rewound -- unlike the KV cache, which is addressed by
+     * absolute position and simply gets overwritten. So the state after each position
+     * of the block is kept, and rejection restores the one at the accepted prefix.
+     * At block 10 and 18 conv layers this is 2.9 MiB, paid once. */
+    float **conv_snap;
+    int snap_cap, snap_on;
 
     /* FlashHead: an approximate lm_head, see flash_logits(). Bound only when the
      * container carries one; use_flash is what the decode path tests. */
@@ -139,6 +162,40 @@ typedef struct {
      * computing them in the rotation loop cost a powf per (head, dim, pos, layer). */
     float *inv_freq;
 
+    /* DSpark block-parallel drafter (Lfm2DSparkDraftModel), --dspark.
+     *
+     * Not a second model in any operational sense: it has no embedding table and no
+     * lm_head of its own, borrowing both from the container, and its attention reads
+     * a context built out of THIS model's intermediate hidden states. What it owns is
+     * 5 Qwen3-style layers, a bigram markov head and a confidence head. */
+    int dspark;                             /* drafter loaded */
+    int ds_L, ds_D, ds_nh, ds_hd, ds_nkv, ds_inter, ds_vocab;
+    int ds_block, ds_mask_id, ds_rank, ds_has_conf, ds_neox;
+    float ds_eps, ds_theta;
+    int ds_ntl, ds_tids[MAXL];              /* which of our layers it reads */
+    const uint8_t *ds_blob;
+    Layer ds_layers[MAXL];
+    W ds_fc, ds_hidden_norm, ds_norm, ds_mk1, ds_mk2, ds_conf_w, ds_conf_b;
+    float *ds_invf;
+    /* Hidden states captured at ds_tids during the last forward, [ntl * cap * D].
+     * The drafter conditions on the whole absorbed prefix, so prefill fills this too
+     * and it is sized by the prefill batch, not by the block. */
+    float *ds_th;
+    int ds_th_cap;                          /* capacity, in rows */
+    /* The drafter's own context cache, one entry per absolute position per draft
+     * layer: [ctx * nkv * hd]. Every confirmed position's projected target hidden
+     * (fc, hidden_norm, k/v_proj, k_norm, rope) is computed once here and reused by
+     * every later draft block, which is what makes a draft step cheap. */
+    float *ds_ck[MAXL], *ds_cv[MAXL];
+    int ds_ctx_len;                         /* positions [0, len) are absorbed */
+    float *dsa_cat, *dsa_h, *dsa_sx;
+    int8_t *dsa_xq;
+    /* Acceptance statistics, per block position as well as in total: how fast
+     * acceptance decays across the block is the thing worth tuning against, and it
+     * separates a weak drafter from a badly-conditioned one. */
+    long long ds_steps, ds_proposed, ds_accepted;
+    long long ds_pos_prop[DS_MAXBLOCK + 1], ds_pos_acc[DS_MAXBLOCK + 1];
+
     /* I/O threads */
     pthread_t *io;
     int n_io;
@@ -155,6 +212,19 @@ typedef struct {
  * enough to amortise a dispatch, and on a machine whose whole container is resident.
  * Every GPU call can decline (returning 0) and the CPU path runs instead. */
 static int g_use_gpu = 0;
+
+/* DSpark iterative refinement. The reference drafts a block in one greedy pass;
+ * since the drafter is ~25x smaller than the target, extra denoising passes are
+ * nearly free relative to the verify. After a pass, positions whose drafted token
+ * clears g_ds_freeze confidence are fed back as real embeddings and the rest are
+ * re-masked. 0 = off, i.e. reference behaviour. */
+static int g_ds_refine = 0;
+static float g_ds_freeze = 0.9f;
+/* Stop proposing at the first position the confidence head puts below this. 0 = off,
+ * i.e. always propose the whole block, which is what the reference does. */
+static float g_ds_conf = 0.0f;
+/* --no-markov: drop the bigram head, to measure what it is worth. */
+static int g_ds_markov = 1;
 
 static double now(void) {
     struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
@@ -859,11 +929,17 @@ static void kv_write(M *m, int li, int pos, int nkv, int hd, int cap,
     if (quant && W < cap && pos >= W && pos % g == 0) {
         int base = pos - W;                  /* first position of the tile going out */
         int ready = 1;
-        /* Seal only a tile that is complete and holds the positions it should. A
-         * rewritten position (prefix reuse, or a redone forward) would otherwise
-         * bake the wrong vector into the store, unrecoverably. */
-        for (int i = 0; i < g; i++)
-            if (m->ring_pos[li][(base + i) % W] != base + i) { ready = 0; break; }
+        /* Seal only a tile that is complete, holds the positions it should, and is
+         * entirely confirmed. A rewritten position (prefix reuse, or a redone
+         * forward) would otherwise bake the wrong vector into the store,
+         * unrecoverably -- and so would a drafted position the target then rejects.
+         * main() widens the ring by a tile plus the block whenever --dspark is on, so
+         * the margin always clears the draft and this bails only if something has
+         * gone genuinely wrong. */
+        for (int i = 0; i < g; i++) {
+            int p = base + i;
+            if (m->ring_pos[li][p % W] != p || p > m->kv_conf) { ready = 0; break; }
+        }
         if (ready) {
             /* base is a multiple of both W and the tile, so the tile's g positions
              * sit in g contiguous ring slots and each head is a strided walk. */
@@ -919,6 +995,10 @@ static void conv_fwd(M *m, int li, const float *Xn, float *OUT, int S, Buf *b) {
                 st[(size_t)k * D + i] = st[(size_t)(k + 1) * D + i];
             if (CL > 1) st[(size_t)(CL - 2) * D + i] = cur;
         }
+        /* The state as of this position, for a later rejection to rewind to. */
+        if (m->snap_on && s < m->snap_cap)
+            memcpy(m->conv_snap[li] + (size_t)s * (CL - 1) * D, st,
+                   sizeof(float) * (size_t)(CL - 1) * D);
     }
     matmul(OUT, &L->conv_out, b->cy, S, b->mxq, b->msx);
 }
@@ -1175,6 +1255,70 @@ static void conv_reset(M *m) {
     m->conv_pos = 0;
 }
 
+/* DSpark
+ *
+ * A block-parallel drafter. Rather than proposing one token at a time it denoises a
+ * whole block of `block_size` at once: the block is embedded as [last real token,
+ * mask, mask, ...], run through five layers whose attention is bidirectional inside
+ * the block and cross-attends a context distilled from the target's own hidden
+ * states, and every row reads off the token for the position after its own. One
+ * target forward then verifies the lot.
+ *
+ * What it costs the engine is the conv recurrence (see conv_snap) and, at decode, a
+ * second pass over the embedding table per drafted position. What it buys is up to
+ * block_size+1 tokens per target forward.
+ */
+
+/* The drafter's rope is interleaved (rope_is_neox_style: false in its config), so
+ * the rotated pairs are adjacent lanes rather than lanes half a head apart. Both
+ * styles live here because the container records which one the checkpoint wants. */
+static void ds_rope(float *x, int H, int D, int pos, const float *invf, int neox) {
+    if (neox) { rope(x, H, D, pos, invf); return; }
+    int half = D / 2;
+    for (int i = 0; i < half; i++) {
+        float a = pos * invf[i], co = cosf(a), si = sinf(a);
+        for (int h = 0; h < H; h++) {
+            float *v = x + (size_t)h * D;
+            float x1 = v[2 * i], x2 = v[2 * i + 1];
+            v[2 * i]     = x1 * co - x2 * si;
+            v[2 * i + 1] = x2 * co + x1 * si;
+        }
+    }
+}
+
+/* Fold `rows` newly-computed target positions into the drafter's context cache.
+ *
+ * m->ds_th holds this forward's hidden states at the ds_ntl target layers. Per
+ * position they are concatenated, projected by fc, normed, and turned into that
+ * position's K and V for each draft layer -- exactly once, here, so that a draft
+ * block only ever pays for its own `block_size` positions however long the context
+ * is. This mirrors past_key_values_draft in the reference. */
+static void ds_absorb(M *m, int pos0, int rows) {
+    int D = m->ds_D, ntl = m->ds_ntl, nkv = m->ds_nkv, hd = m->ds_hd;
+    size_t kvdim = (size_t)nkv * hd;
+    for (int r = 0; r < rows; r++) {
+        int p = pos0 + r;
+        if (p >= m->c.ctx) break;
+        for (int ti = 0; ti < ntl; ti++)
+            memcpy(m->dsa_cat + (size_t)ti * D,
+                   m->ds_th + ((size_t)ti * rows + r) * D, sizeof(float) * D);
+        matvec(m->dsa_h, &m->ds_fc, m->dsa_cat, m->dsa_xq, m->dsa_sx);
+        rmsnorm(m->dsa_h, m->dsa_h, m->ds_hidden_norm.f, D, m->ds_eps);
+        for (int li = 0; li < m->ds_L; li++) {
+            Layer *L = &m->ds_layers[li];
+            float *k = m->ds_ck[li] + (size_t)p * kvdim;
+            float *v = m->ds_cv[li] + (size_t)p * kvdim;
+            matvec(k, &L->k_proj, m->dsa_h, m->dsa_xq, m->dsa_sx);
+            matvec(v, &L->v_proj, m->dsa_h, m->dsa_xq, m->dsa_sx);
+            for (int i = 0; i < nkv; i++)
+                rmsnorm(k + (size_t)i * hd, k + (size_t)i * hd, L->k_norm.f, hd,
+                        m->ds_eps);
+            ds_rope(k, nkv, hd, p, m->ds_invf, m->ds_neox);
+        }
+    }
+    if (pos0 + rows > m->ds_ctx_len) m->ds_ctx_len = pos0 + rows;
+}
+
 /* Run S tokens from pos_base. logits may be NULL (prefill) or [S,vocab]; the common
  * case, only the last row, goes through `last_only`.
  *
@@ -1190,8 +1334,24 @@ static void forward_chunk(M *m, const int *ids, int S, int pos_base,
 
     float *H = b->x;
     for (int s = 0; s < S; s++) embed_row(m, ids[s], H + (size_t)s * D);
-    for (int l = 0; l < c->n_layers; l++) layer_fwd(m, l, H, S, pos_base, b);
+
+    /* DSpark reads the residual stream at ds_ntl layers, taken after the layer's own
+     * output has been added and before any later layer or the final norm touches it:
+     * fc + hidden_norm were trained on exactly those. */
+    if (m->dspark && S > m->ds_th_cap) {
+        m->ds_th_cap = S;
+        free(m->ds_th);
+        m->ds_th = xmalloc(sizeof(float) * (size_t)m->ds_ntl * S * D);
+    }
+    for (int l = 0; l < c->n_layers; l++) {
+        layer_fwd(m, l, H, S, pos_base, b);
+        if (!m->dspark) continue;
+        for (int ti = 0; ti < m->ds_ntl; ti++)
+            if (m->ds_tids[ti] == l)
+                memcpy(m->ds_th + (size_t)ti * S * D, H, sizeof(float) * (size_t)S * D);
+    }
     m->conv_pos = pos_base + S;
+    if (m->dspark) ds_absorb(m, pos_base, S);
 
     if (!logits) return;
     int s0 = last_only ? S - 1 : 0;
@@ -1258,6 +1418,270 @@ static void forward(M *m, const int *ids, int S, int pos_base,
     }
 }
 
+/* DSpark drafter: scratch, layers, and the block forward.
+ *
+ * Everything here is sized by block_size, not by context: the context lives in
+ * ds_ck/ds_cv and was paid for by ds_absorb. */
+typedef struct {
+    float *h;                 /* the block's hidden states [BS * D] */
+    float *xn, *q, *ao, *tmp, *gate, *up, *mlp;
+    float *nk, *nv;           /* the block's own K/V [BS * nkv * hd] */
+    int8_t *xq; float *sx;
+    float *dlog;              /* draft logits [(BS-1) * V] */
+    float *mfeat, *mlog;      /* markov feature [rank] and its logits [V] */
+    float *conf;              /* per-drafted-position confidence [BS] */
+    int *draft, *frozen;      /* [BS] */
+} DBuf;
+
+/* ds_block is the number of MASKED positions, which is what the checkpoint's
+ * block_size counts; a block occupies one more row than that, row 0 being the last
+ * already-confirmed token. Every row predicts the position after its own, so all
+ * ds_block+1 of them yield a proposal: block_size 9 proposes 10 tokens and, if all
+ * of them survive, yields an eleventh for free from the verify's last row. */
+static DBuf *ds_bufs(M *m) {
+    int D = m->ds_D, BS = m->ds_block + 1;
+    int qmax = m->ds_nh * m->ds_hd, kvmax = m->ds_nkv * m->ds_hd;
+    int wide = D;
+    if (wide < qmax) wide = qmax;
+    if (wide < m->ds_inter) wide = m->ds_inter;
+
+    DBuf *b = calloc(1, sizeof *b);
+    /* xn holds all BS normed rows contiguously so each projection is one batched
+     * matmul over the block rather than BS matvecs: the drafter's weights get read
+     * once per block instead of once per position. */
+    b->h    = xmalloc(sizeof(float) * (size_t)BS * D);
+    b->xn   = xmalloc(sizeof(float) * ((size_t)BS * wide + 64));
+    b->q    = xmalloc(sizeof(float) * ((size_t)BS * qmax + 64));
+    b->ao   = xmalloc(sizeof(float) * ((size_t)BS * qmax + 64));
+    b->tmp  = xmalloc(sizeof(float) * ((size_t)BS * wide + 64));
+    b->gate = xmalloc(sizeof(float) * ((size_t)BS * m->ds_inter + 64));
+    b->up   = xmalloc(sizeof(float) * ((size_t)BS * m->ds_inter + 64));
+    b->mlp  = xmalloc(sizeof(float) * ((size_t)BS * m->ds_inter + 64));
+    b->nk   = xmalloc(sizeof(float) * ((size_t)BS * kvmax + 64));
+    b->nv   = xmalloc(sizeof(float) * ((size_t)BS * kvmax + 64));
+    b->xq   = xmalloc((size_t)BS * wide + 64);
+    b->sx   = xmalloc(sizeof(float) * ((size_t)BS * (wide / Q40_BLK) + 64));
+    b->dlog = xmalloc(sizeof(float) * (size_t)BS * m->ds_vocab);
+    b->mfeat = xmalloc(sizeof(float) * (m->ds_rank ? m->ds_rank : 1));
+    b->mlog = xmalloc(sizeof(float) * m->ds_vocab);
+    b->conf = xmalloc(sizeof(float) * BS);
+    b->draft = xmalloc(sizeof(int) * BS);
+    b->frozen = xmalloc(sizeof(int) * BS);
+    return b;
+}
+
+/* One draft layer's attention. Each of the S block positions attends the whole
+ * absorbed context (from ds_ck/ds_cv, keyed by absolute position) plus every other
+ * block position -- bidirectionally, which is the whole point: a masked position in
+ * the middle of the block gets to see the ones after it. */
+static void ds_attn(M *m, int li, float *H, int S, int pos_base, DBuf *b) {
+    int D = m->ds_D, nh = m->ds_nh, hd = m->ds_hd;
+    int nkv = m->ds_nkv, rep = nh / nkv;
+    size_t kvdim = (size_t)nkv * hd;
+    float scale = 1.0f / sqrtf((float)hd);
+    Layer *L = &m->ds_layers[li];
+    int ctx = pos_base < m->ds_ctx_len ? pos_base : m->ds_ctx_len;
+    const float *CK = m->ds_ck[li], *CV = m->ds_cv[li];
+
+    for (int s = 0; s < S; s++)
+        rmsnorm(b->xn + (size_t)s * D, H + (size_t)s * D, L->operator_norm.f, D, m->ds_eps);
+    matmul(b->q,  &L->q_proj, b->xn, S, b->xq, b->sx);
+    matmul(b->nk, &L->k_proj, b->xn, S, b->xq, b->sx);
+    matmul(b->nv, &L->v_proj, b->xn, S, b->xq, b->sx);
+    for (int s = 0; s < S; s++) {
+        float *q = b->q + (size_t)s * nh * hd;
+        float *k = b->nk + (size_t)s * kvdim;
+        for (int i = 0; i < nh; i++)
+            rmsnorm(q + (size_t)i * hd, q + (size_t)i * hd, L->q_norm.f, hd, m->ds_eps);
+        ds_rope(q, nh, hd, pos_base + s, m->ds_invf, m->ds_neox);
+        for (int i = 0; i < nkv; i++)
+            rmsnorm(k + (size_t)i * hd, k + (size_t)i * hd, L->k_norm.f, hd, m->ds_eps);
+        ds_rope(k, nkv, hd, pos_base + s, m->ds_invf, m->ds_neox);
+        /* fold the attention scale into q once rather than into every score */
+        for (int i = 0; i < nh * hd; i++) q[i] *= scale;
+    }
+
+    /* Online softmax, so nothing here is sized by the context: a score buffer over
+     * a full-attention context would be a per-thread array of ctx floats. */
+    #pragma omp parallel for collapse(2) schedule(static)
+    for (int s = 0; s < S; s++) {
+        for (int hh = 0; hh < nh; hh++) {
+            const float *qq = b->q + ((size_t)s * nh + hh) * hd;
+            float *ov = b->ao + ((size_t)s * nh + hh) * hd;
+            size_t koff = (size_t)(hh / rep) * hd;
+            float mx = -INFINITY, z = 0.0f;
+            memset(ov, 0, sizeof(float) * hd);
+            for (int t = 0; t < ctx + S; t++) {
+                const float *kk = t < ctx ? CK + (size_t)t * kvdim + koff
+                                          : b->nk + (size_t)(t - ctx) * kvdim + koff;
+                const float *vv = t < ctx ? CV + (size_t)t * kvdim + koff
+                                          : b->nv + (size_t)(t - ctx) * kvdim + koff;
+                float score = head_dot(qq, kk, hd);
+                float nm = score > mx ? score : mx;
+                float a = expf(mx - nm), w = expf(score - nm), nz = a * z + w;
+                float old = z ? a * z / nz : 0.0f, add = w / nz;
+                for (int d = 0; d < hd; d++) ov[d] = old * ov[d] + add * vv[d];
+                mx = nm; z = nz;
+            }
+        }
+    }
+
+    matmul(b->tmp, &L->o_proj, b->ao, S, b->xq, b->sx);
+    for (int s = 0; s < S; s++) {
+        float *h = H + (size_t)s * D, *o = b->tmp + (size_t)s * D;
+        for (int i = 0; i < D; i++) h[i] += o[i];
+    }
+}
+
+/* All draft layers over the block. H comes in as embeddings and goes out final-normed
+ * and ready for the target's lm_head. Touches no persistent state, so a refinement
+ * pass can simply re-run it. */
+static void ds_forward(M *m, float *H, int S, int pos_base, DBuf *b) {
+    int D = m->ds_D, MI = m->ds_inter;
+    for (int li = 0; li < m->ds_L; li++) {
+        ds_attn(m, li, H, S, pos_base, b);        /* residual added inside */
+        Layer *L = &m->ds_layers[li];
+        for (int s = 0; s < S; s++)
+            rmsnorm(b->xn + (size_t)s * D, H + (size_t)s * D, L->ffn_norm.f, D, m->ds_eps);
+        matmul(b->gate, &L->mlp_gate, b->xn, S, b->xq, b->sx);
+        matmul(b->up, &L->mlp_up, b->xn, S, b->xq, b->sx);
+        for (size_t i = 0; i < (size_t)S * MI; i++) b->mlp[i] = silu(b->gate[i]) * b->up[i];
+        matmul(b->tmp, &L->mlp_down, b->mlp, S, b->xq, b->sx);
+        for (int s = 0; s < S; s++) {
+            float *h = H + (size_t)s * D, *o = b->tmp + (size_t)s * D;
+            for (int i = 0; i < D; i++) h[i] += o[i];
+        }
+    }
+    for (int s = 0; s < S; s++)
+        rmsnorm(H + (size_t)s * D, H + (size_t)s * D, m->ds_norm.f, D, m->ds_eps);
+}
+
+/* Load the drafter from dspark.manifest.txt / dspark.bin. Returns 0 if the container
+ * has none, which is not an error until --dspark asks for one. */
+static int ds_load(M *m, const char *dir) {
+    char p[4096];
+    snprintf(p, sizeof p, "%s/dspark.manifest.txt", dir);
+    FILE *f = fopen(p, "r");
+    if (!f) return 0;
+
+    char line[1024];
+    int ndense = 0, di = 0;
+    DEnt *dd = NULL;
+    m->ds_theta = 1000000.0f;
+    m->ds_neox = 1;
+    while (fgets(line, sizeof line, f)) {
+        char k[64];
+        if (sscanf(line, "cfg %63s", k) == 1) {
+            char *v = line + 4 + strlen(k) + 1;
+            if (!strcmp(k, "target_layer_ids")) {
+                int n = 0;
+                for (char *t = strtok(v, " \n"); t && n < MAXL; t = strtok(NULL, " \n"))
+                    m->ds_tids[n++] = atoi(t);
+                m->ds_ntl = n;
+            }
+            else if (!strcmp(k, "hidden"))            m->ds_D = atoi(v);
+            else if (!strcmp(k, "n_layers"))          m->ds_L = atoi(v);
+            else if (!strcmp(k, "n_heads"))           m->ds_nh = atoi(v);
+            else if (!strcmp(k, "head_dim"))          m->ds_hd = atoi(v);
+            else if (!strcmp(k, "n_kv_heads"))        m->ds_nkv = atoi(v);
+            else if (!strcmp(k, "intermediate_size")) m->ds_inter = atoi(v);
+            else if (!strcmp(k, "vocab_size"))        m->ds_vocab = atoi(v);
+            else if (!strcmp(k, "eps"))               m->ds_eps = atof(v);
+            else if (!strcmp(k, "rope_theta"))        m->ds_theta = atof(v);
+            else if (!strcmp(k, "rope_neox"))         m->ds_neox = atoi(v);
+            else if (!strcmp(k, "block_size"))        m->ds_block = atoi(v);
+            else if (!strcmp(k, "mask_token_id"))     m->ds_mask_id = atoi(v);
+            else if (!strcmp(k, "markov_rank"))       m->ds_rank = atoi(v);
+            else if (!strcmp(k, "has_confidence"))    m->ds_has_conf = atoi(v);
+            continue;
+        }
+        if (sscanf(line, "ndense %d", &ndense) == 1) { dd = calloc(ndense, sizeof *dd); continue; }
+        char nm[96];
+        long long off, len; int fmt, O, I;
+        if (dd && sscanf(line, "dense %95s %lld %lld %d %d %d", nm, &off, &len, &fmt, &O, &I) == 6) {
+            snprintf(dd[di].name, sizeof dd[di].name, "%s", nm);
+            dd[di].off = off; dd[di].len = len; dd[di].fmt = fmt;
+            dd[di].O = O; dd[di].I = I; di++;
+        }
+    }
+    fclose(f);
+    if (!dd || !m->ds_L) { free(dd); return 0; }
+
+    snprintf(p, sizeof p, "%s/dspark.bin", dir);
+    int fd = open(p, O_RDONLY);
+    if (fd < 0) { free(dd); return 0; }
+    off_t sz = lseek(fd, 0, SEEK_END);
+    uint8_t *blob = xmalloc(sz);
+    for (off_t o = 0; o < sz;) {
+        ssize_t r = pread(fd, blob + o, sz - o, o);
+        if (r <= 0) { perror("read dspark.bin"); exit(1); }
+        o += r;
+    }
+    close(fd);
+    m->ds_blob = blob;
+    if (g_use_gpu && !gpu_map(blob, (size_t)sz))
+        fprintf(stderr, "metal: could not map the drafter; it will run on the CPU\n");
+
+    m->ds_fc          = dense_bind(dd, ndense, blob, "fc");
+    m->ds_hidden_norm = dense_bind(dd, ndense, blob, "hidden_norm");
+    m->ds_norm        = dense_bind(dd, ndense, blob, "norm");
+    if (m->ds_rank) {
+        m->ds_mk1 = dense_bind(dd, ndense, blob, "markov_w1");
+        m->ds_mk2 = dense_bind(dd, ndense, blob, "markov_w2");
+    }
+    if (m->ds_has_conf) {
+        m->ds_conf_w = dense_bind(dd, ndense, blob, "conf_w");
+        m->ds_conf_b = dense_bind(dd, ndense, blob, "conf_b");
+    }
+    /* The draft layers reuse the Layer struct, so the Qwen3-style names land in the
+     * lfm25 slots that play the same role: operator_norm is its input_layernorm and
+     * ffn_norm its post_attention_layernorm. */
+    char nm[128];
+    for (int l = 0; l < m->ds_L; l++) {
+        Layer *L = &m->ds_layers[l];
+        #define B(fld, s) do { snprintf(nm, sizeof nm, "layers.%d." s, l); \
+                               L->fld = dense_bind(dd, ndense, blob, nm); } while (0)
+        B(operator_norm, "input_layernorm");
+        B(ffn_norm, "post_attention_layernorm");
+        B(q_proj, "q_proj"); B(k_proj, "k_proj"); B(v_proj, "v_proj"); B(o_proj, "o_proj");
+        B(q_norm, "q_norm"); B(k_norm, "k_norm");
+        B(mlp_gate, "mlp_gate"); B(mlp_up, "mlp_up"); B(mlp_down, "mlp_down");
+        #undef B
+    }
+    free(dd);
+
+    if (m->ds_D != m->c.hidden) {
+        fprintf(stderr, "dspark: hidden %d != target %d\n", m->ds_D, m->c.hidden); exit(1);
+    }
+    if (m->ds_vocab != m->c.vocab) {
+        fprintf(stderr, "dspark: vocab %d != target %d\n", m->ds_vocab, m->c.vocab); exit(1);
+    }
+    for (int i = 0; i < m->ds_ntl; i++)
+        if (m->ds_tids[i] >= m->c.n_layers) {
+            fprintf(stderr, "dspark: target layer %d out of range\n", m->ds_tids[i]); exit(1);
+        }
+
+    m->ds_invf = xmalloc(sizeof(float) * (size_t)(m->ds_hd / 2 + 1));
+    for (int i = 0; i < m->ds_hd / 2; i++)
+        m->ds_invf[i] = powf(m->ds_theta, -(float)(2 * i) / (float)m->ds_hd);
+
+    size_t kvdim = (size_t)m->ds_nkv * m->ds_hd;
+    for (int l = 0; l < m->ds_L; l++) {
+        m->ds_ck[l] = xmalloc(sizeof(float) * (size_t)m->c.ctx * kvdim);
+        m->ds_cv[l] = xmalloc(sizeof(float) * (size_t)m->c.ctx * kvdim);
+    }
+    m->ds_ctx_len = 0;
+    int wideA = m->ds_ntl * m->ds_D;
+    m->dsa_cat = xmalloc(sizeof(float) * wideA);
+    m->dsa_h   = xmalloc(sizeof(float) * m->ds_D);
+    m->dsa_xq  = xmalloc(wideA + 64);
+    m->dsa_sx  = xmalloc(sizeof(float) * (wideA / Q40_BLK + 8));
+    m->ds_th_cap = m->ds_block + 2;
+    m->ds_th = xmalloc(sizeof(float) * (size_t)m->ds_ntl * m->ds_th_cap * m->ds_D);
+    m->dspark = 1;
+    return 1;
+}
+
 /* pinning */
 typedef struct { int64_t n; int e; } EC;
 static int ec_desc(const void *a, const void *b) {
@@ -1321,6 +1745,7 @@ static void pin_save(M *m) {
 /* init */
 static void init(M *m, const char *dir, int n_io, int ctx_override, double ram_gb,
                  int kb, int vb, int rwin, int tile) {
+    m->kv_conf = INT_MAX;                   /* nothing speculative yet */
     m->tile = tile > 0 ? tile : 128;
     /* KVARN_RWIN is a floor, not the ring size: KVarN seals whole tiles, so the
      * ring is rounded up to a whole number of them (kvarn_window). */
@@ -1609,6 +2034,164 @@ static int sample(const float *logits, int V, float temp, float topp, int topk,
     double acc = 0;
     for (int i = 0; i < n; i++) { acc += buf[i].p; if (r <= acc) return buf[i].i; }
     return buf[n - 1].i;
+}
+
+/* DSpark: draft a block, then verify it with one target forward.
+ *
+ * The markov head is what makes this more than DFlash: masking a block destroys the
+ * dependency between neighbouring positions, and a rank-256 bigram factorisation puts
+ * a cheap version of it back. Resolving it is sequential, but only over the block and
+ * only over a 256-wide contraction, so it costs a fraction of the lm_head pass it
+ * corrects. */
+static int ds_draft(M *m, DBuf *b, int first_tok, int pos, int d) {
+    int D = m->ds_D, V = m->ds_vocab, R = m->ds_rank;
+    W *embed = &m->L[MAXL - 1].q_proj;
+    int ndraft = d;
+    int markov = R && g_ds_markov;
+    int npass = g_ds_refine + 1;
+
+    for (int i = 0; i < ndraft; i++) { b->frozen[i] = 0; b->conf[i] = 1.0f; }
+
+    for (int pass = 0; pass < npass; pass++) {
+        int last_pass = (pass == npass - 1);
+
+        /* Row 0 is the last real token; the rest are masks, except any the previous
+         * pass was confident enough about to hand back as a real embedding. Row i
+         * stands at position pos+i, whose token is draft[i-1]. */
+        embed_row(m, first_tok, b->h);
+        for (int i = 1; i < d; i++)
+            embed_row(m, b->frozen[i - 1] ? b->draft[i - 1] : m->ds_mask_id,
+                      b->h + (size_t)i * D);
+
+        ds_forward(m, b->h, d, pos, b);
+
+        /* Row i sits at absolute position pos+i and predicts the position AFTER it,
+         * exactly as a causal row would: row 0 (the last confirmed token) gives
+         * draft[0], and the mask at pos+i gives draft[i] for pos+i+1. Reading row
+         * i+1 instead costs about thirty points of first-position acceptance.
+         *
+         * One batched pass over the tied lm_head for all of them: it is 140 MiB at
+         * q4_0 and reading it once per block instead of once per position is most of
+         * what makes drafting cheap. */
+        matmul(b->dlog, embed, b->h, ndraft, b->xq, b->sx);
+
+        int prev = first_tok;
+        for (int i = 0; i < ndraft; i++) {
+            float *dl = b->dlog + (size_t)i * V;
+            if (markov || m->ds_has_conf) {
+                const uint8_t *row = m->ds_mk1.q
+                                   + (size_t)prev * fmt_row_bytes(m->ds_mk1.fmt, R);
+                if (m->ds_mk1.fmt == FMT_Q80)      q80_dequant_row(row, b->mfeat, R);
+                else if (m->ds_mk1.fmt == FMT_Q40) q40_dequant_row(row, b->mfeat, R);
+                else memcpy(b->mfeat, (const float *)row, sizeof(float) * R);
+            }
+            if (markov) {
+                matvec(b->mlog, &m->ds_mk2, b->mfeat, b->xq, b->sx);
+                for (int j = 0; j < V; j++) dl[j] += b->mlog[j];
+            }
+            int am = 0;
+            for (int j = 1; j < V; j++) if (dl[j] > dl[am]) am = j;
+            b->draft[i] = am;              /* the drafter is greedy, as the reference is */
+
+            if (m->ds_has_conf && last_pass) {
+                /* Linear(hidden + rank -> 1) over concat(this row's final hidden,
+                 * the markov feature of the token before it), squashed. */
+                const float *cw = m->ds_conf_w.f, *hrow = b->h + (size_t)i * D;
+                double s = m->ds_conf_b.f[0];
+                for (int j = 0; j < D; j++) s += (double)cw[j] * hrow[j];
+                for (int j = 0; j < R; j++) s += (double)cw[D + j] * b->mfeat[j];
+                b->conf[i] = 1.0f / (1.0f + expf(-(float)s));
+            }
+            if (!last_pass && !b->frozen[i]) {
+                /* Freeze on the drafter's own max softmax probability rather than on
+                 * the confidence head: this asks "is this token settled", which is
+                 * what the next pass needs, not "will the target agree". */
+                double sum = 0;
+                for (int j = 0; j < V; j++) sum += expf(dl[j] - dl[am]);
+                if (1.0 / sum >= g_ds_freeze) b->frozen[i] = 1;
+            }
+            prev = am;
+        }
+    }
+
+    /* Trim where the drafter itself stops believing the block. Off by default: the
+     * reference proposes the whole block and lets the target sort it out, and a
+     * target forward over 10 rows costs barely more than over 4. */
+    if (m->ds_has_conf && g_ds_conf > 0.0f)
+        for (int i = 0; i < ndraft; i++)
+            if (b->conf[i] < g_ds_conf) return i;
+    return ndraft;
+}
+
+/* Verify a drafted block. ids[pos] holds the last confirmed token on entry; accepted
+ * tokens are written to ids[pos+1 ...] and the count of them returned, with the
+ * target's own next token left in *next_tok.
+ *
+ * Acceptance is equality with what the target's sampler would have produced, drawn
+ * from the same RNG stream in the same order. That is stricter than the usual
+ * rejection test at temp > 0 and accepts less often for it, but every emitted token
+ * is then literally one the target produced rather than one drawn from the right
+ * distribution.
+ *
+ * That is not the same as reproducing the non-speculative run token for token, and it
+ * does not: the verify is a batched forward and decode is a single-row one, and the
+ * two agree only to ~1e-6 (which is what `--check --nobatch` measures), so greedy can
+ * flip on a near-tie. See the Makefile's check-lfm25 comment for how to tell that
+ * apart from a rewind bug. */
+static int ds_step(M *m, Buf *bt, DBuf *bd, int *ids, int pos, int d,
+                   float temp, float topp, int topk, float penalty,
+                   unsigned char *seen, PI *pbuf, uint64_t *rng,
+                   float *vlog, int *next_tok) {
+    Cfg *c = &m->c;
+    int V = c->vocab;
+    int ndraft = ds_draft(m, bd, ids[pos], pos, d);
+
+    /* Verify [last confirmed token, draft...] at positions pos..pos+ndraft in one
+     * forward. Row j predicts position pos+j+1, so it is row j that judges draft[j],
+     * and row ndraft comes free: if the whole block survives, it is the next token. */
+    int batch[DS_MAXBLOCK + 2];
+    batch[0] = ids[pos];
+    for (int i = 0; i < ndraft; i++) batch[i + 1] = bd->draft[i];
+    m->kv_conf = pos - 1;
+    m->snap_on = 1;
+    forward(m, batch, ndraft + 1, pos, vlog, 0, bt);
+    m->snap_on = 0;
+
+    int n = 0;
+    for (; n < ndraft; n++) {
+        float *lg = vlog + (size_t)n * V;
+        repetition_penalty(lg, V, ids, pos + n + 1, penalty, seen);
+        int t = sample(lg, V, temp, topp, topk, pbuf, rng);
+        if (t != bd->draft[n]) { *next_tok = t; break; }
+        ids[pos + n + 1] = t;
+    }
+    if (n == ndraft) {
+        float *lg = vlog + (size_t)ndraft * V;
+        repetition_penalty(lg, V, ids, pos + ndraft + 1, penalty, seen);
+        *next_tok = sample(lg, V, temp, topp, topk, pbuf, rng);
+    }
+
+    /* Undo the speculation: the conv recurrence back to where the accepted prefix
+     * left it (see conv_snap), and the drafter's context cache made to forget the
+     * positions it absorbed past that. The KV needs nothing. */
+    if (n < ndraft) {
+        Cfg *cc = &m->c;
+        size_t sn = (size_t)(cc->conv_L - 1) * cc->hidden;
+        for (int l = 0; l < cc->n_layers; l++)
+            if (!cc->layer_types[l])
+                memcpy(m->conv_state[l], m->conv_snap[l] + (size_t)n * sn,
+                       sizeof(float) * sn);
+        m->conv_pos = pos + n + 1;
+    }
+    m->kv_conf = pos + n;
+    m->ds_ctx_len = pos + n + 1;
+
+    m->ds_steps++;
+    m->ds_proposed += ndraft;
+    m->ds_accepted += n;
+    for (int i = 0; i < ndraft; i++) m->ds_pos_prop[i]++;
+    for (int i = 0; i < n; i++) m->ds_pos_acc[i]++;
+    return n;
 }
 
 /* Plain ChatML, transcribed from LFM2.5's chat_template.jinja. There is no thinking
@@ -1969,6 +2552,17 @@ static void usage(const char *prog, FILE *out) {
         "                                 (default kvarn_k4v2_g128)\n"
         "         [--metal]               offload the matmuls to the GPU (off by\n"
         "                                 default: usually slower here, see matvec)\n"
+        "         [--dspark]              DSpark block-parallel speculative decoding\n"
+        "                                 (needs dspark.* in <dir>; see\n"
+        "                                 tools/convert_lfm25_dspark.py)\n"
+        "         [--ndraft N]            tokens proposed per step (default: the\n"
+        "                                 drafter's own block size plus one)\n"
+        "         [--drefine N]           extra denoising passes over the block\n"
+        "         [--dfreeze F]           confidence to freeze a position between\n"
+        "                                 refinement passes (default 0.9)\n"
+        "         [--dconf F]             stop proposing below this head confidence\n"
+        "                                 (default 0 = propose the whole block)\n"
+        "         [--no-markov]           draft without the bigram head\n"
         "         [--flash]               approximate lm_head: score clustered\n"
         "                                 centroids, compute only the top clusters\n"
         "         [--probes N]            FlashHead clusters probed per token\n"
@@ -1996,7 +2590,7 @@ int main(int argc, char **argv) {
     int batch = 128, ctx_override = 0, want_flash = 0, probes = 0, flash_check = 0;
     double ram_gb = 0;                   /* 0 = keep the container's own plan */
     int serve_mode = 0, serve_port = 8484;
-    int want_metal = 0, chk_gpu = 0;
+    int want_metal = 0, chk_gpu = 0, use_dspark = 0, ndraft = 0;
     float temp = 0.2f, topp = 1.0f, penalty = 1.05f;   /* LFM2.5 generation defaults */
     int topk = 80;
     for (int i = 2; i < argc; i++) {
@@ -2006,6 +2600,12 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--flash")) want_flash = 1;
         else if (!strcmp(argv[i], "--flash-check")) { flash_check = 1; want_flash = 1; }
         else if (!strcmp(argv[i], "--probes") && i + 1 < argc) probes = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--dspark")) use_dspark = 1;
+        else if (!strcmp(argv[i], "--ndraft") && i + 1 < argc) ndraft = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--drefine") && i + 1 < argc) g_ds_refine = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--dfreeze") && i + 1 < argc) g_ds_freeze = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--dconf") && i + 1 < argc) g_ds_conf = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--no-markov")) g_ds_markov = 0;
         else if (!strcmp(argv[i], "--metal")) want_metal = 1;
         else if (!strcmp(argv[i], "--check-gpu")) chk_gpu = 1;
         else if (!strcmp(argv[i], "--nobatch")) nobatch = 1;
@@ -2066,10 +2666,21 @@ int main(int argc, char **argv) {
     if (want_metal && !g_use_gpu)
         fprintf(stderr, "metal: no device available; using CPU\n");
 
+    /* Speculation is the one thing tiling charges for. A tile is sealed once its
+     * youngest position is ring - tile + 1 behind the write head, and a sealed tile
+     * is final, so a draft still unconfirmed by then would either be baked in or
+     * drop the whole tile. Widen the ring by a tile rather than making the user
+     * discover this: without --dspark it stays at KVARN_RWIN. */
+    int kv_tile = kvp ? kvp->group : 128;
+    int rwin = KVARN_RWIN;
+    if (kvp && use_dspark) {
+        int need = kv_tile + DS_MAXBLOCK + 2;
+        if (rwin < need) rwin = need;
+    }
+
     M m; memset(&m, 0, sizeof m);
     double t0 = now();
-    init(&m, dir, n_io, ctx_override, ram_gb, kb, vb, KVARN_RWIN,
-         kvp ? kvp->group : 128);
+    init(&m, dir, n_io, ctx_override, ram_gb, kb, vb, rwin, kv_tile);
     Cfg *c = &m.c;
     pin_load(&m, npin);
     /* Prefill batch size: bigger reuses each streamed weight row over more rows, but
@@ -2081,8 +2692,13 @@ int main(int argc, char **argv) {
         if (probes > c->flash_n_clusters) probes = c->flash_n_clusters;
         c->flash_n_probes = probes;
     }
-    /* Opt-in, and off under --check, which diffs against the oracle's exact logits. */
-    m.use_flash = c->flash_n_clusters && want_flash && !check;
+    /* Opt-in, and off under --check, which diffs against the oracle's exact logits,
+     * and under --dspark, whose accept test compares the target's sampled token
+     * against the draft: an approximate candidate set would reject on the head's
+     * approximation rather than on the drafter being wrong. */
+    m.use_flash = c->flash_n_clusters && want_flash && !check && !use_dspark;
+    if (want_flash && use_dspark)
+        fprintf(stderr, "--flash is off under --dspark: the verify needs exact logits\n");
     if (want_flash && !c->flash_n_clusters)
         fprintf(stderr, "--flash: this container has no FlashHead (rebuild it "
                 "without --no-flash); using the exact head\n");
@@ -2090,6 +2706,35 @@ int main(int argc, char **argv) {
         m.flash_check = 1;
         m.flash_exact = xmalloc(sizeof(float) * (size_t)c->vocab);
     }
+    DBuf *db = NULL;
+    float *vlog = NULL;
+    if (use_dspark) {
+        if (!ds_load(&m, dir)) {
+            fprintf(stderr, "--dspark: no usable dspark.* in %s "
+                    "(run tools/convert_lfm25_dspark.py)\n", dir);
+            return 1;
+        }
+        if (m.ds_block > DS_MAXBLOCK) m.ds_block = DS_MAXBLOCK;
+        /* --ndraft counts PROPOSALS, of which a block of ds_block masks yields
+         * ds_block + 1 (every row predicts the position after its own). */
+        if (ndraft > 0 && ndraft - 1 < m.ds_block) m.ds_block = ndraft - 1;
+        if (m.ds_block < 0) m.ds_block = 0;
+        /* A block has to fit one forward chunk: the conv snapshots are indexed by
+         * position within the chunk, and a block split across two would rewind to
+         * the wrong state. The verify is one row longer than the block, for the
+         * bonus token. */
+        if (batch < m.ds_block + 2) batch = m.ds_block + 2;
+        db = ds_bufs(&m);
+        vlog = xmalloc(sizeof(float) * (size_t)(m.ds_block + 2) * c->vocab);
+
+        m.snap_cap = m.ds_block + 2;
+        m.conv_snap = calloc(c->n_layers, sizeof(float *));
+        size_t sn = (size_t)(c->conv_L - 1) * c->hidden;
+        for (int l = 0; l < c->n_layers; l++)
+            if (!c->layer_types[l])
+                m.conv_snap[l] = xmalloc(sizeof(float) * (size_t)m.snap_cap * sn);
+    }
+
     Buf *b = bufs(&m, batch);
 
     int nattn = 0;
@@ -2100,6 +2745,14 @@ int main(int argc, char **argv) {
             c->slots_per_layer, m.dense_len / 1048576.0, now() - t0);
     if (g_use_gpu)
         fprintf(stderr, "metal: %s (q4_0/q8_0 matmul offloaded)\n", gpu_name());
+    if (m.dspark) {
+        fprintf(stderr, "dspark: %d layers, block %d (up to %d tok/step), reading "
+                "layers", m.ds_L, m.ds_block, m.ds_block + 2);
+        for (int i = 0; i < m.ds_ntl; i++) fprintf(stderr, " %d", m.ds_tids[i]);
+        fprintf(stderr, "; markov rank %d%s, confidence head %s\n",
+                m.ds_rank, m.ds_rank && !g_ds_markov ? " (off)" : "",
+                m.ds_has_conf ? "yes" : "no");
+    }
     if (m.use_flash)
         fprintf(stderr, "flash head: %d/%d clusters x %d probed (%.1f%% of the "
                 "vocabulary scored)\n", c->flash_n_probes, c->flash_n_clusters,
@@ -2313,22 +2966,51 @@ int main(int argc, char **argv) {
             }
 
             char piece[512];
-            int n = 0;
+            int n = 0, stop = 0;
             double t = now();
+            #define EMIT(tk) do { int _t = (tk); \
+                if (T) { lfmtok_decode(T, &_t, 1, piece, sizeof piece); \
+                         fputs(piece, stdout); } \
+                else printf("%d ", _t); \
+                fflush(stdout); } while (0)
 
-            while (n < max_tokens) {
-                repetition_penalty(logits, c->vocab, ids, np + n, penalty, seen);
-                int tok = sample(logits, c->vocab, temp, topp, topk, pbuf, &rng);
+            /* `tok` is always the next token to emit, already sampled. Keeping it in
+             * that shape is what lets the speculative branch slot in: ds_step hands
+             * back the target's own next token along with the accepted prefix, so
+             * there is nothing left to sample at the top of the next iteration. */
+            repetition_penalty(logits, c->vocab, ids, np, penalty, seen);
+            int tok = sample(logits, c->vocab, temp, topp, topk, pbuf, &rng);
+
+            while (n < max_tokens && !stop) {
                 if (tok == eos || tok == eot) break;
-                if (T) { lfmtok_decode(T, &tok, 1, piece, sizeof piece); fputs(piece, stdout); }
-                else printf("%d ", tok);
                 ids[np + n] = tok;
                 n++;
-                fflush(stdout);
-                if (n < max_tokens && np + n < c->ctx)
-                    forward(&m, &ids[np + n - 1], 1, np + n - 1, logits, 1, b);
-                else if (np + n >= c->ctx) break;
+                EMIT(tok);
+                if (n >= max_tokens || np + n >= c->ctx) break;
+
+                if (m.dspark) {
+                    int pos = np + n - 1;              /* where tok just landed */
+                    int room = c->ctx - pos - 1;
+                    int d = m.ds_block + 1;            /* block rows == proposals */
+                    if (d > room - 1) d = room - 1;    /* -1 leaves the bonus a home */
+                    if (d >= 1) {
+                        int acc = ds_step(&m, b, db, ids, pos, d, temp, topp, topk,
+                                          penalty, seen, pbuf, &rng, vlog, &tok);
+                        for (int i = 0; i < acc; i++) {
+                            int t2 = ids[pos + 1 + i];
+                            if (t2 == eos || t2 == eot) { stop = 1; break; }
+                            n++;
+                            EMIT(t2);
+                            if (n >= max_tokens) { stop = 1; break; }
+                        }
+                        continue;                      /* tok is the target's own next */
+                    }
+                }
+                forward(&m, &ids[np + n - 1], 1, np + n - 1, logits, 1, b);
+                repetition_penalty(logits, c->vocab, ids, np + n, penalty, seen);
+                tok = sample(logits, c->vocab, temp, topp, topk, pbuf, &rng);
             }
+            #undef EMIT
             double el = now() - t;
 
             if (interactive) {
@@ -2372,6 +3054,19 @@ int main(int argc, char **argv) {
                 printf("decode  %d tok in %.2fs (%.2f tok/s)\n", n, el, n / el);
                 printf("expert cache: %.1f%% hit (%lld reads total, %d pinned/layer)\n",
                        100.0 * m.hit / (tot ? tot : 1), tot, m.npin);
+                if (m.ds_steps)
+                    printf("dspark      : %.2f tok/step over %lld steps "
+                           "(%lld/%lld drafts accepted, %.1f%%)\n",
+                           (double)(m.ds_accepted + m.ds_steps) / m.ds_steps,
+                           m.ds_steps, m.ds_accepted, m.ds_proposed,
+                           100.0 * m.ds_accepted / (m.ds_proposed ? m.ds_proposed : 1));
+                if (m.ds_steps && getenv("LFMDBG")) {
+                    printf("  by block position:");
+                    for (int i = 0; i <= m.ds_block; i++)
+                        printf(" %.0f%%", m.ds_pos_prop[i]
+                               ? 100.0 * m.ds_pos_acc[i] / m.ds_pos_prop[i] : 0.0);
+                    printf("\n");
+                }
                 if (m.flash_check && m.flash_steps)
                     printf("flash head  : %lld/%lld argmax agree with the exact head "
                            "(%.1f%%)\n", m.flash_agree, m.flash_steps,
