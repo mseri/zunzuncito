@@ -2534,7 +2534,8 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++)
         if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { usage(argv[0], stdout); return 0; }
 
-    const char *dir = argv[1];
+    /* <dir> is a positional, not argv[1]: flags may precede it. */
+    const char *dir = NULL;
     const char *prompt = NULL, *sys = NULL;
     /* Thinking is ON by default: that is what the template does when the caller says
      * nothing (thinking_option defaults to 'on'). */
@@ -2551,7 +2552,7 @@ int main(int argc, char **argv) {
     int want_metal = 0, chk_gpu = 0;
     float temp = 1.0f, topp = 0.95f, penalty = 1.0f;   /* Ling generation defaults */
     int topk = 20;
-    for (int i = 2; i < argc; i++) {
+    for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--serve")) serve_mode = 1;
         else if (!strcmp(argv[i], "--port") && i + 1 < argc) serve_port = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--check")) check = 1;
@@ -2595,8 +2596,11 @@ int main(int argc, char **argv) {
             usage(argv[0], stderr);
             return 1;
         }
-        else if (!prompt) prompt = argv[i];   /* first non-flag positional is the prompt */
+        /* first non-flag positional is <dir>, the second is the prompt */
+        else if (!dir) dir = argv[i];
+        else if (!prompt) prompt = argv[i];
     }
+    if (!dir) { fprintf(stderr, "missing <dir>\n\n"); usage(argv[0], stderr); return 1; }
     /* --check diffs the forward pass against a stored oracle to ~1e-4, which is tighter
      * than any KV quantiser reproduces, so it defaults to an f32 cache whatever the
      * engine default is. Pass --kv explicitly to measure the codec instead. */
