@@ -2194,9 +2194,11 @@ static int ds_step(M *m, Buf *bt, DBuf *bd, int *ids, int pos, int d,
     return n;
 }
 
-/* Plain ChatML, transcribed from LFM2.5's chat_template.jinja. There is no thinking
- * toggle: the model decides for itself, emitting <think>...</think> inside the
- * assistant turn, and --think forces it by pre-filling the opening tag. */
+/* Plain ChatML, transcribed from LFM2.5's chat_template.jinja. The template has no
+ * thinking toggle: the model decides for itself, emitting <think>...</think> inside
+ * the assistant turn. think=1 (the default) forces reasoning by pre-filling the
+ * opening tag; --nothink only drops the prefill and hands the choice back to the
+ * model -- unlike ling/maple it cannot actually suppress a thought block. */
 static void chat_prompt(char *out, size_t cap, const char *sys,
                         const char *user, int think) {
     size_t n = 0;
@@ -2539,36 +2541,28 @@ static int check_gpu(void) {
 static void usage(const char *prog, FILE *out) {
     fprintf(out,
         "usage: %s <dir> [flags...] [prompt]\n"
-        "         [--chat] [--system S] [--think] [--raw] [--max_tokens N]\n"
+        "         [--chat] [--system S] [--nothink] [--raw] [--max_tokens N]\n"
         "         [--temp F] [--topp F] [--topk N]   (default 0.2 / 1.0 / 80)\n"
         "         [--penalty F]           repetition penalty (default 1.05, 1 = off)\n"
-        "         [--ctx N]               override the container's context length\n"
-        "         [--ram F]               re-plan the expert cache for an F GB budget\n"
+        "         [--ctx N]               override context length\n"
+        "         [--ram F]               RAM budget in GB for expert cache planning\n"
         "         [--pin N] [--io N] [--threads N] [--batch N] [--nobatch]\n"
-        "         [--serve] [--port N]    OpenAI-compatible local server (default 8484)\n"
-        "         [--kv PRESET]           KVarN KV-cache compression; PRESET is one\n"
-        "                                 of off | kvarn_k4v2_g128 | kvarn_k4v4_g128 |\n"
-        "                                 kvarn_k4v2_g64 | kvarn_k4v4_g64\n"
+        "         [--serve] [--port N]    OpenAI-compatible HTTP server (default 8484)\n"
+        "         [--kv PRESET]           KVarN KV cache preset: off | kvarn_k4v2_g128 |\n"
+        "                                 kvarn_k4v4_g128 | kvarn_k4v2_g64 | kvarn_k4v4_g64\n"
         "                                 (default kvarn_k4v2_g128)\n"
-        "         [--metal]               offload the matmuls to the GPU (off by\n"
-        "                                 default: usually slower here, see matvec)\n"
-        "         [--dspark]              DSpark block-parallel speculative decoding\n"
-        "                                 (needs dspark.* in <dir>; see\n"
-        "                                 tools/convert_lfm25_dspark.py)\n"
-        "         [--ndraft N]            tokens proposed per step (default: the\n"
-        "                                 drafter's own block size plus one)\n"
-        "         [--drefine N]           extra denoising passes over the block\n"
-        "         [--dfreeze F]           confidence to freeze a position between\n"
-        "                                 refinement passes (default 0.9)\n"
-        "         [--dconf F]             stop proposing below this head confidence\n"
-        "                                 (default 0 = propose the whole block)\n"
-        "         [--no-markov]           draft without the bigram head\n"
-        "         [--flash]               approximate lm_head: score clustered\n"
-        "                                 centroids, compute only the top clusters\n"
+        "         [--metal]               enable Metal GPU offloading (off by default)\n"
+        "         [--dspark]              DSpark speculative decoding\n"
+        "         [--ndraft N]            draft tokens proposed per step\n"
+        "         [--drefine N]           extra denoising passes over the draft block\n"
+        "         [--dfreeze F]           freeze confidence threshold (default 0.9)\n"
+        "         [--dconf F]             confidence cutoff to stop proposing (default 0)\n"
+        "         [--no-markov]           draft without bigram head\n"
+        "         [--flash]               approximate lm_head with clustered centroids\n"
         "         [--probes N]            FlashHead clusters probed per token\n"
-        "         [--flash-check]         also run the exact head, report agreement\n"
-        "         [--check]               diff against the numpy oracle's logits\n"
-        "         [--check-gpu]           diff the Metal kernels against the CPU\n"
+        "         [--flash-check]         compare FlashHead with exact head\n"
+        "         [--check]               diff forward pass against reference oracle\n"
+        "         [--check-gpu]           diff Metal kernels against CPU\n"
         "         [--help]\n",
         prog);
 }
@@ -2581,7 +2575,7 @@ int main(int argc, char **argv) {
     /* <dir> is a positional, not argv[1]: flags may precede it. */
     const char *dir = NULL;
     const char *prompt = NULL, *sys = NULL;
-    int think = 0, raw = 0, chat_mode = 0;
+    int think = 1, raw = 0, chat_mode = 0;
     /* KVarN is ON by default, at upstream's shipped preset, and a preset is all
      * there is: no per-parameter overrides, because the bit widths and the tile are
      * one calibrated recipe upstream measured together. --kv off gives f32 KV. */
@@ -2623,7 +2617,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--pin") && i + 1 < argc) npin = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--system") && i + 1 < argc) sys = argv[++i];
         else if (!strcmp(argv[i], "--chat")) chat_mode = 1;
-        else if (!strcmp(argv[i], "--think")) think = 1;
+        else if (!strcmp(argv[i], "--think")) think = 1;      /* the default; accepted for symmetry */
+        else if (!strcmp(argv[i], "--nothink")) think = 0;
         else if (!strcmp(argv[i], "--raw")) raw = 1;
         else if (!strcmp(argv[i], "--kv") && i + 1 < argc) {
             const char *v = argv[++i];

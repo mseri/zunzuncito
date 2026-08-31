@@ -2508,23 +2508,20 @@ static void usage(const char *prog, FILE *out) {
         "         [--chat] [--system S] [--nothink] [--raw] [--max_tokens N]\n"
         "         [--temp F] [--topp F] [--topk N]   (default 1.0 / 0.95 / 20)\n"
         "         [--penalty F]           repetition penalty (default 1, = off)\n"
-        "         [--ctx N]               override the container's context length\n"
-        "         [--ram F]               re-plan the expert cache for an F GB budget\n"
+        "         [--ctx N]               override context length\n"
+        "         [--ram F]               RAM budget in GB for expert cache planning\n"
         "         [--pin N] [--io N] [--threads N] [--batch N] [--nobatch]\n"
-        "         [--serve] [--port N]    OpenAI-compatible local server (default 8484)\n"
-        "         [--kv PRESET]           KVarN compression of the MLA latent cache;\n"
-        "                                 PRESET is one of off | kvarn_k4v2_g128 |\n"
-        "                                 kvarn_k4v4_g128 | kvarn_k4v2_g64 |\n"
-        "                                 kvarn_k4v4_g64 (default kvarn_k4v2_g128;\n"
-        "                                 only the K width is used, see init)\n"
-        "         [--metal]               offload the matmuls to the GPU (off by\n"
-        "                                 default: usually slower here, see matvec)\n"
-        "         [--flash]               approximate lm_head: score clustered\n"
-        "                                 centroids, compute only the top clusters\n"
+        "         [--serve] [--port N]    OpenAI-compatible HTTP server (default 8484)\n"
+        "         [--kv PRESET]           KVarN MLA latent cache preset: off |\n"
+        "                                 kvarn_k4v2_g128 | kvarn_k4v4_g128 |\n"
+        "                                 kvarn_k4v2_g64 | kvarn_k4v4_g64\n"
+        "                                 (default kvarn_k4v2_g128)\n"
+        "         [--metal]               enable Metal GPU offloading (off by default)\n"
+        "         [--flash]               approximate lm_head with clustered centroids\n"
         "         [--probes N]            FlashHead clusters probed per token\n"
-        "         [--flash-check]         also run the exact head, report agreement\n"
-        "         [--check]               diff against the numpy oracle's logits\n"
-        "         [--check-gpu]           diff the Metal kernels against the CPU\n"
+        "         [--flash-check]         compare FlashHead with exact head\n"
+        "         [--check]               diff forward pass against reference oracle\n"
+        "         [--check-gpu]           diff Metal kernels against CPU\n"
         "         [--help]\n",
         prog);
 }
@@ -2575,6 +2572,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--pin") && i + 1 < argc) npin = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--system") && i + 1 < argc) sys = argv[++i];
         else if (!strcmp(argv[i], "--chat")) chat_mode = 1;
+        else if (!strcmp(argv[i], "--think")) think = 1;      /* the default; accepted for symmetry */
         else if (!strcmp(argv[i], "--nothink")) think = 0;
         else if (!strcmp(argv[i], "--raw")) raw = 1;
         else if (!strcmp(argv[i], "--kv") && i + 1 < argc) {
