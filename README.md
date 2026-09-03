@@ -67,8 +67,8 @@ You can download ready-to-use containers from [huggingface.co/mseri](https://hug
 
 ### Gemma-4
 ```sh
-python3 tools/convert_gemma4.py /path/to/gemma-4-26B-A4B-it-qat-unquantized ./g4 --ram 4 --ctx 4096
-python3 tools/convert_tokenizer.py /path/to/checkpoint/tokenizer.json ./g4/tok.bin
+python3 tools/convert_gemma4.py /path/to/gemma-4-26B-A4B-it-qat-unquantized ./g4-ct --ram 4 --ctx 4096
+python3 tools/convert_tokenizer.py /path/to/checkpoint/tokenizer.json ./g4-ct/tok.bin
 ```
 
 ### LFM2.5
@@ -88,6 +88,8 @@ python3 tools/convert_lfm_tokenizer.py /path/to/maple-preview-mlx/tokenizer.json
 python3 tools/convert_ling.py /path/to/Ling-3.0-tiny ./ling-ct --ram 8 --ctx 8192
 ```
 
+Note that ram and ctx precompute how to distribute objects in memory but can be modified at runtime.
+
 ---
 
 ## Usage & CLI Flags
@@ -105,15 +107,15 @@ All four executables follow a consistent command line interface:
 
 - **One-shot generation:**
   ```sh
-  ./gemma4 ./g4 "Explain Mixture of Experts in simple terms."
+  ./gemma4 ./g4-ct "Explain Mixture of Experts in simple terms."
   ```
 - **Interactive multi-turn chat:**
   ```sh
-  ./gemma4 ./g4 --chat
+  ./gemma4 ./g4-ct --chat
   ```
 - **OpenAI-compatible HTTP Server:**
   ```sh
-  ./gemma4 ./g4 --serve --port 8484
+  ./gemma4 ./g4-ct --serve --port 8484
   ```
 
 ---
@@ -135,7 +137,7 @@ All four executables follow a consistent command line interface:
 | Flag | Description |
 |---|---|
 | `--temp F` | Sampling temperature (`--temp 0` selects greedy argmax). |
-| `--topp F` | Top-p nucleus sampling threshold (e.g. `0.95`). |
+| `--topp F` | Top-p sampling threshold (e.g. `0.95`). |
 | `--topk N` | Top-k sampling limit. |
 | `--penalty F` | Repetition penalty (`1.0` = disabled). |
 
@@ -145,7 +147,7 @@ All four executables follow a consistent command line interface:
 | `--ram F` | Total RAM budget in GB. Recalculates resident expert cache slots. |
 | `--ctx N` | Override context length. |
 | `--pin N` | Pin the top-N hot experts per layer into RAM from `usage.bin`. |
-| `--kv PRESET` | Select KVarN KV cache quantization preset (`off`, `kvarn_k4v2_g128`, `kvarn_k4v4_g128`, `kvarn_k4v2_g64`, `kvarn_k4v4_g64`). |
+| `--kv PRESET` | Select KVarN KV cache quantization preset (default: `kvarn_k4v2_g128`): `off`, `kvarn_k4v2_g128`, `kvarn_k4v4_g128`, `kvarn_k4v2_g64`, `kvarn_k4v4_g64`. |
 
 #### Performance & Hardware
 | Flag | Description |
@@ -162,7 +164,6 @@ All four executables follow a consistent command line interface:
 | `--flash` | Enable approximate `lm_head` using centroid clustering. |
 | `--noflash` | Force exact `lm_head` computation (Maple). |
 | `--probes N` | Number of FlashHead clusters to evaluate per token. |
-| `--flash-check` | Run exact head side-by-side with FlashHead to report agreement rate. |
 
 #### Speculative Decoding
 | Flag | Executable | Description |
@@ -182,13 +183,6 @@ All four executables follow a consistent command line interface:
 |---|---|
 | `--serve` | Launch an OpenAI-compatible HTTP server. |
 | `--port N` | TCP port for the HTTP server (default: `8484`). |
-
-#### Validation & Diagnostics
-| Flag | Description |
-|---|---|
-| `--check` | Verify numerical correctness against stored reference logits/oracle. |
-| `--check-gpu` | Verify Metal GPU kernel computations against CPU reference. |
-| `--help`, `-h` | Display help and usage summary. |
 
 ---
 
@@ -220,6 +214,72 @@ curl -N http://127.0.0.1:8484/v1/chat/completions \
     "max_tokens": 128
   }'
 ```
+
+---
+
+## Optional speculative-decoding weights
+
+Convert the target model first. Then run the matching converter below with the
+checkpoint directory and target container directory. The extra files go into
+the target container, so there is no second model directory to pass at runtime.
+
+#### Gemma-4 MTP
+
+[Download the Gemma-4 assistant checkpoint](https://huggingface.co/google/gemma-4-26B-A4B-it-assistant).
+It supplies the MTP head used by `gemma4` and shares the target model's KV
+cache. Convert it into `./g4-ct`:
+
+```sh
+python3 tools/convert_gemma4.py \
+  /path/to/gemma-4-26B-A4B-it-qat-unquantized ./g4-ct --ram 4 --ctx 4096
+python3 tools/convert_tokenizer.py \
+  /path/to/gemma-4-26B-A4B-it-qat-unquantized/tokenizer.json ./g4-ct/tok.bin
+python3 tools/convert_gemma4_mtp.py \
+  /path/to/gemma-4-26B-A4B-it-assistant ./g4-ct
+```
+
+Run it with `--mtp`:
+
+```sh
+./gemma4 ./g4-ct --mtp --ndraft 4
+```
+
+The converter writes `mtp.bin`, `mtp.idx`, `mtp.cfg.json`, and
+`mtp.manifest.txt`. The assistant must have the same hidden size and vocabulary
+as the Gemma-4 target.
+
+#### LFM2.5 DSpark
+
+[Download the LFM2.5 DSpark checkpoint](https://huggingface.co/LiquidAI/LFM2.5-8B-A1B-DSpark).
+The checkpoint is a drafter for LFM2.5. Install it in `./lfm-ct`:
+
+```sh
+python3 tools/convert_lfm25.py \
+  /path/to/LFM2.5-8B-A1B ./lfm-ct --ram 8 --ctx 4096
+python3 tools/convert_lfm_tokenizer.py \
+  /path/to/LFM2.5-8B-A1B/tokenizer.json ./lfm-ct/tok.bin
+python3 tools/convert_lfm25_dspark.py \
+  /path/to/LFM2.5-8B-A1B-DSpark ./lfm-ct
+```
+
+Then enable DSpark:
+
+```sh
+./lfm25 ./lfm-ct --dspark --ndraft 9
+```
+
+The converter writes `dspark.bin`, `dspark.idx`, `dspark.cfg.json`, and
+`dspark.manifest.txt`. It uses q4 drafter matrices by default. For q8 matrices,
+which use more resident memory, add `--draft-bits 8` to the conversion command:
+
+```sh
+python3 tools/convert_lfm25_dspark.py \
+  /path/to/LFM2.5-8B-A1B-DSpark ./lfm-ct --draft-bits 8
+```
+
+The DSpark checkpoint must match the target's hidden size, vocabulary, layer
+count, and target-layer configuration. Markov and confidence heads are copied
+when the checkpoint contains them.
 
 ---
 
