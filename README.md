@@ -230,10 +230,6 @@ It supplies the MTP head used by `gemma4` and shares the target model's KV
 cache. Convert it into `./g4-ct`:
 
 ```sh
-python3 tools/convert_gemma4.py \
-  /path/to/gemma-4-26B-A4B-it-qat-unquantized ./g4-ct --ram 4 --ctx 4096
-python3 tools/convert_tokenizer.py \
-  /path/to/gemma-4-26B-A4B-it-qat-unquantized/tokenizer.json ./g4-ct/tok.bin
 python3 tools/convert_gemma4_mtp.py \
   /path/to/gemma-4-26B-A4B-it-assistant ./g4-ct
 ```
@@ -254,10 +250,6 @@ as the Gemma-4 target.
 The checkpoint is a drafter for LFM2.5. Install it in `./lfm-ct`:
 
 ```sh
-python3 tools/convert_lfm25.py \
-  /path/to/LFM2.5-8B-A1B ./lfm-ct --ram 8 --ctx 4096
-python3 tools/convert_lfm_tokenizer.py \
-  /path/to/LFM2.5-8B-A1B/tokenizer.json ./lfm-ct/tok.bin
 python3 tools/convert_lfm25_dspark.py \
   /path/to/LFM2.5-8B-A1B-DSpark ./lfm-ct
 ```
