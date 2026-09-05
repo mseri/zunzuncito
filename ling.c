@@ -2204,12 +2204,203 @@ static int ling_append_content(LingString *dst, jval *msg) {
     return 1;
 }
 
-static int ling_build_chat_prompt(jval *messages, LingString *prompt, int think) {
+/* Tool calling, transcribed from the same chat_template.jinja: when `tools` is present the
+ * system turn documents them as JSON inside <tools></tools>, and the model is taught to
+ * answer with <tool_call>{name}<arg_key>k</arg_key>\n<arg_value>v</arg_value>...</tool_call>
+ * (string arguments verbatim, everything else JSON-encoded). Tool results replay as
+ * <role>OBSERVATION</role> turns holding one or more <tool_response> blocks. */
+static int ling_append_tools_system(LingString *prompt, jval *tools, const char *sys, int think) {
+    #define PUT(s) do { const char *_s = (s); \
+                        if (!ling_string_append(prompt, _s, strlen(_s))) return 0; } while (0)
+    PUT("<role>SYSTEM</role>");
+    if (sys && *sys) { PUT(sys); PUT("\n"); }
+    PUT("# Tools\n\nYou may call one or more functions to assist with the user query.\n\n"
+        "You are provided with function signatures within <tools></tools> XML tags:\n<tools>");
+    for (int i = 0; i < tools->len; i++) {
+        PUT("\n");
+        jbuf jb = {0};
+        int ok = json_encode(&jb, tools->kids[i]);
+        if (ok) ok = ling_string_append(prompt, jb.data ? jb.data : "", jb.len);
+        free(jb.data);
+        if (!ok) return 0;
+    }
+    PUT("\n</tools>\n\nIf none of the functions can be used, point it out. If the given "
+        "question lacks the parameters required by the function, also point it out.\n"
+        "If you need to use a function, for each function call, output the function name "
+        "and arguments within the following XML format:\n<tool_call>{function-name}\n"
+        "<arg_key>{arg-key-1}</arg_key>\n<arg_value>{arg-value-1}</arg_value>\n"
+        "<arg_key>{arg-key-2}</arg_key>\n<arg_value>{arg-value-2}</arg_value>\n...\n</tool_call>\n");
+    if (sys && (strstr(sys, "detailed thinking on") || strstr(sys, "detailed thinking off")))
+        PUT("<|role_end|>");
+    else { PUT("detailed thinking "); PUT(think ? "on" : "off"); PUT("<|role_end|>"); }
+    #undef PUT
+    return 1;
+}
+
+/* Replays an assistant turn's tool_calls (as sent back by the client on a later request)
+ * into the same wire format the model would have produced. `arguments` on the wire is a
+ * JSON-encoded string, per the OpenAI schema, so it is re-parsed here into an object to
+ * iterate its keys -- mirroring the template's `_args.items()`. */
+static int ling_append_tool_calls_block(LingString *prompt, jval *tool_calls, int had_content) {
+    for (int i = 0; i < tool_calls->len; i++) {
+        if ((i == 0 && had_content) || i > 0) {
+            if (!ling_string_append(prompt, "\n", 1)) return 0;
+        }
+        jval *tc = tool_calls->kids[i];
+        jval *fn = json_get(tc, "function"); if (!fn) fn = tc;
+        jval *name = json_get(fn, "name");
+        const char *name_str = (name && name->t == J_STR) ? name->str : "";
+        if (!ling_string_append(prompt, "<tool_call>", strlen("<tool_call>")) ||
+            !ling_string_append(prompt, name_str, strlen(name_str))) return 0;
+        jval *args_field = json_get(fn, "arguments");
+        char *args_arena = NULL; jval *args_parsed = NULL, *args_obj = NULL;
+        if (args_field && args_field->t == J_STR) {
+            args_parsed = json_parse(args_field->str, &args_arena);
+            if (args_parsed && args_parsed->t == J_OBJ) args_obj = args_parsed;
+        } else if (args_field && args_field->t == J_OBJ) args_obj = args_field;
+        int ok = 1;
+        if (args_obj) {
+            for (int k = 0; k < args_obj->len && ok; k++) {
+                const char *key = args_obj->keys[k]; jval *val = args_obj->kids[k];
+                ok = ling_string_append(prompt, "<arg_key>", strlen("<arg_key>")) &&
+                     ling_string_append(prompt, key, strlen(key)) &&
+                     ling_string_append(prompt, "</arg_key>\n<arg_value>", strlen("</arg_key>\n<arg_value>"));
+                if (ok) {
+                    if (val->t == J_STR) ok = ling_string_append(prompt, val->str, strlen(val->str));
+                    else {
+                        jbuf jb = {0};
+                        ok = json_encode(&jb, val) && ling_string_append(prompt, jb.data ? jb.data : "", jb.len);
+                        free(jb.data);
+                    }
+                }
+                ok = ok && ling_string_append(prompt, "</arg_value>", strlen("</arg_value>"));
+            }
+        }
+        if (args_parsed) { json_free(args_parsed); free(args_arena); }
+        if (!ok || !ling_string_append(prompt, "\n</tool_call>", strlen("\n</tool_call>"))) return 0;
+    }
+    return 1;
+}
+
+static const char *ling_find_bounded(const char *hay, const char *end, const char *needle) {
+    size_t nlen = strlen(needle);
+    if (!nlen || hay >= end) return NULL;
+    for (const char *p = hay; p + nlen <= end; p++) if (!memcmp(p, needle, nlen)) return p;
+    return NULL;
+}
+
+/* Whether a raw <arg_value> payload should be spliced into the rebuilt arguments object
+ * as-is (numbers, booleans, null, objects, arrays -- everything the template would have
+ * passed through tojson) rather than JSON-string-escaped. */
+static int ling_value_is_json_literal(const char *v, size_t n) {
+    while (n && (v[n-1]==' '||v[n-1]=='\n'||v[n-1]=='\t'||v[n-1]=='\r')) n--;
+    while (n && (*v==' '||*v=='\n'||*v=='\t'||*v=='\r')) { v++; n--; }
+    if (!n) return 0;
+    if (v[0]=='{' && v[n-1]=='}') return 1;
+    if (v[0]=='[' && v[n-1]==']') return 1;
+    if (n==4 && !strncmp(v,"true",4)) return 1;
+    if (n==5 && !strncmp(v,"false",5)) return 1;
+    if (n==4 && !strncmp(v,"null",4)) return 1;
+    size_t i = (v[0]=='-') ? 1 : 0, digits = 0;
+    while (i<n && isdigit((unsigned char)v[i])) { i++; digits++; }
+    if (!digits) return 0;
+    if (i<n && v[i]=='.') { i++; while (i<n && isdigit((unsigned char)v[i])) i++; }
+    if (i<n && (v[i]=='e'||v[i]=='E')) { i++; if (i<n && (v[i]=='+'||v[i]=='-')) i++; while (i<n && isdigit((unsigned char)v[i])) i++; }
+    return i==n;
+}
+
+typedef struct { char *name; char *arguments; } LingToolCall;
+typedef struct { LingToolCall *items; int len, cap; } LingToolCalls;
+
+static int ling_tool_calls_push(LingToolCalls *calls, const char *name, size_t name_len,
+                                const char *args, size_t args_len) {
+    if (calls->len == calls->cap) {
+        int cap = calls->cap ? calls->cap * 2 : 4;
+        LingToolCall *items = realloc(calls->items, sizeof *items * (size_t)cap);
+        if (!items) return 0;
+        calls->items = items; calls->cap = cap;
+    }
+    char *n = malloc(name_len + 1), *a = malloc(args_len + 1);
+    if (!n || !a) { free(n); free(a); return 0; }
+    memcpy(n, name, name_len); n[name_len] = 0;
+    memcpy(a, args, args_len); a[args_len] = 0;
+    calls->items[calls->len].name = n; calls->items[calls->len].arguments = a;
+    calls->len++;
+    return 1;
+}
+
+static void ling_tool_calls_free(LingToolCalls *calls) {
+    for (int i = 0; i < calls->len; i++) { free(calls->items[i].name); free(calls->items[i].arguments); }
+    free(calls->items); calls->items = NULL; calls->len = calls->cap = 0;
+}
+
+/* Parses zero or more <tool_call>...</tool_call> blocks out of the model's raw completion
+ * text. Text before the first tag is returned via *leading (the template only ever
+ * appends tool calls after any spoken content, never before). Tolerant of the exact
+ * whitespace the model puts around tags, since that varies a little from the template's
+ * own byte-for-byte rendering of training examples. */
+static int ling_extract_tool_calls(const char *text, LingToolCalls *calls, LingString *leading) {
+    const char *open_tag = "<tool_call>", *close_tag = "</tool_call>";
+    size_t open_len = strlen(open_tag), close_len = strlen(close_tag);
+    const char *first = strstr(text, open_tag);
+    size_t lead_len = first ? (size_t)(first - text) : strlen(text);
+    if (lead_len && !ling_string_append(leading, text, lead_len)) return 0;
+    while (first) {
+        const char *name_start = first + open_len;
+        const char *block_end = strstr(name_start, close_tag);
+        if (!block_end) break;
+        const char *name_end = ling_find_bounded(name_start, block_end, "<arg_key>");
+        if (!name_end) name_end = block_end;
+        const char *nl = memchr(name_start, '\n', (size_t)((name_end < block_end ? name_end : block_end) - name_start));
+        if (nl && nl < name_end) name_end = nl;
+        while (name_end > name_start && strchr(" \n\r\t", name_end[-1])) name_end--;
+        LingString args = {0};
+        if (!ling_string_append(&args, "{", 1)) { free(args.data); return 0; }
+        const char *cursor = name_end;
+        int first_kv = 1, ok = 1;
+        for (;;) {
+            const char *k0 = ling_find_bounded(cursor, block_end, "<arg_key>");
+            if (!k0) break;
+            k0 += strlen("<arg_key>");
+            const char *k1 = ling_find_bounded(k0, block_end, "</arg_key>");
+            if (!k1) break;
+            const char *v0 = ling_find_bounded(k1, block_end, "<arg_value>");
+            if (!v0) break;
+            v0 += strlen("<arg_value>");
+            const char *v1 = ling_find_bounded(v0, block_end, "</arg_value>");
+            if (!v1) break;
+            while (v0 < v1 && *v0 == '\n') v0++;
+            ok = (first_kv || ling_string_append(&args, ",", 1));
+            first_kv = 0;
+            if (ok) { jbuf kb = {0}; ok = json_encode_str(&kb, k0, (size_t)(k1 - k0)) &&
+                                          ling_string_append(&args, kb.data, kb.len); free(kb.data); }
+            ok = ok && ling_string_append(&args, ":", 1);
+            if (ok) {
+                if (ling_value_is_json_literal(v0, (size_t)(v1 - v0)))
+                    ok = ling_string_append(&args, v0, (size_t)(v1 - v0));
+                else { jbuf vb = {0}; ok = json_encode_str(&vb, v0, (size_t)(v1 - v0)) &&
+                                          ling_string_append(&args, vb.data, vb.len); free(vb.data); }
+            }
+            if (!ok) break;
+            cursor = v1 + strlen("</arg_value>");
+        }
+        if (ok) ok = ling_string_append(&args, "}", 1);
+        if (!ok) { free(args.data); return 0; }
+        int pushed = ling_tool_calls_push(calls, name_start, (size_t)(name_end - name_start), args.data, args.len);
+        free(args.data);
+        if (!pushed) return 0;
+        first = strstr(block_end + close_len, open_tag);
+    }
+    return 1;
+}
+
+static int ling_build_chat_prompt(jval *messages, LingString *prompt, int think, jval *tools) {
     #define PUT(s) do { const char *_s = (s); \
                         if (!ling_string_append(prompt, _s, strlen(_s))) return 0; } while (0)
     if (!messages || messages->t != J_ARR) return 0;
+    int has_tools = tools && tools->t == J_ARR && tools->len > 0;
     /* The system turn is emitted first and once, from messages[0] if it is a system
-     * message, because that is where the thinking switch has to go. */
+     * message, because that is where the thinking switch (and the tool listing) goes. */
     const char *sys = NULL;
     int first_is_system = 0;
     LingString sys_buf = {0};
@@ -2220,7 +2411,11 @@ static int ling_build_chat_prompt(jval *messages, LingString *prompt, int think)
             sys = sys_buf.data ? sys_buf.data : ""; first_is_system = 1;
         }
     }
-    {
+    if (has_tools) {
+        int ok = ling_append_tools_system(prompt, tools, sys, think);
+        free(sys_buf.data);
+        if (!ok) return 0;
+    } else {
         char head[8192]; size_t n = 0;
         chat_system(head, sizeof head, &n, sys, think);
         free(sys_buf.data);
@@ -2229,7 +2424,22 @@ static int ling_build_chat_prompt(jval *messages, LingString *prompt, int think)
     for (int i = first_is_system ? 1 : 0; i < messages->len; i++) {
         jval *message = messages->kids[i];
         jval *role = ling_json_field(message, "role", J_STR);
-        if (!role || !ling_msg_has_text(message)) continue;
+        if (!role) continue;
+        if (!strcmp(role->str, "tool")) {
+            jval *prev = i > 0 ? ling_json_field(messages->kids[i-1], "role", J_STR) : NULL;
+            jval *next = i+1 < messages->len ? ling_json_field(messages->kids[i+1], "role", J_STR) : NULL;
+            int is_first = !(prev && !strcmp(prev->str, "tool"));
+            int is_last = !(next && !strcmp(next->str, "tool"));
+            if (is_first) PUT("<role>OBSERVATION</role>");
+            PUT("\n<tool_response>\n");
+            if (!ling_append_content(prompt, message)) return 0;
+            PUT("\n</tool_response>");
+            if (is_last) PUT("<|role_end|>");
+            continue;
+        }
+        jval *tool_calls = ling_json_field(message, "tool_calls", J_ARR);
+        int has_calls = tool_calls && tool_calls->len > 0 && !strcmp(role->str, "assistant");
+        if (!ling_msg_has_text(message) && !has_calls) continue;
         if (!strcmp(role->str, "user")) {
             PUT("<role>HUMAN</role>");
             if (!ling_append_content(prompt, message)) return 0;
@@ -2262,6 +2472,7 @@ static int ling_build_chat_prompt(jval *messages, LingString *prompt, int think)
             }
             PUT("</think>");
             if (!ling_string_append(prompt, text, strlen(text))) { free(text_buf.data); return 0; }
+            if (has_calls && !ling_append_tool_calls_block(prompt, tool_calls, *text != 0)) { free(text_buf.data); return 0; }
             PUT("<|role_end|>");
             free(text_buf.data);
             continue;
@@ -2299,6 +2510,37 @@ static int ling_send_done(int fd, const char *id, int prompt_tokens, int complet
     return n > 0 && (size_t)n < sizeof event && samosa_send_all(fd, event, (size_t)n);
 }
 
+/* Tool calls are buffered whole (see the tools_present guard around content streaming in
+ * ling_serve_chat) rather than streamed incrementally: the wire format only reveals
+ * itself once </tool_call> has been seen, so there is nothing meaningful to stream
+ * mid-call. One delta chunk carrying the whole array is still a valid OpenAI stream. */
+static int ling_send_tool_call_chunk(int fd, const char *id, LingToolCalls *calls) {
+    LingString out = {0};
+    const char *prefix = "data: {\"id\":\"";
+    const char *middle = "\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[";
+    const char *tail = "]},\"finish_reason\":null}]}\n\n";
+    int ok = ling_string_append(&out,prefix,strlen(prefix)) && ling_json_escape(&out,id,strlen(id)) &&
+             ling_string_append(&out,middle,strlen(middle));
+    for (int i = 0; i < calls->len && ok; i++) {
+        char callid[80]; snprintf(callid,sizeof callid,"%s-call-%d",id,i);
+        char head[192];
+        int n = snprintf(head,sizeof head,
+            "%s{\"index\":%d,\"id\":\"%s\",\"type\":\"function\",\"function\":{\"name\":\"",
+            i ? "," : "", i, callid);
+        ok = n > 0 && (size_t)n < sizeof head && ling_string_append(&out,head,(size_t)n);
+        ok = ok && ling_json_escape(&out, calls->items[i].name, strlen(calls->items[i].name));
+        const char *between = "\",\"arguments\":\"";
+        ok = ok && ling_string_append(&out, between, strlen(between));
+        ok = ok && ling_json_escape(&out, calls->items[i].arguments, strlen(calls->items[i].arguments));
+        const char *close = "\"}}";
+        ok = ok && ling_string_append(&out, close, strlen(close));
+    }
+    ok = ok && ling_string_append(&out, tail, strlen(tail));
+    if (ok) ok = samosa_send_all(fd, out.data, out.len);
+    free(out.data);
+    return ok;
+}
+
 static int ling_serve_chat(LingServerContext *ctx, int fd, jval *root) {
     jval *messages = ling_json_field(root, "messages", J_ARR);
     int has_user = 0;
@@ -2309,6 +2551,8 @@ static int ling_serve_chat(LingServerContext *ctx, int fd, jval *root) {
         if (role && !strcmp(role->str,"user") && ling_msg_has_text(msg)) has_user = 1;
     }
     if (!has_user) return samosa_http_json_error(fd,400,"invalid_messages","A text user message is required.");
+    jval *tools = ling_json_field(root, "tools", J_ARR);
+    int tools_present = tools && tools->len > 0;
 
     int stream = 0, max_tokens = 2048, topk = 20, seed = 0, think = ctx->think;
     float temperature = 1.0f, topp = 0.95f, penalty = 1.0f;   /* Ling generation defaults */
@@ -2354,7 +2598,7 @@ static int ling_serve_chat(LingServerContext *ctx, int fd, jval *root) {
 
     M *m = ctx->model; Cfg *c = &m->c;
     LingString prompt = {0};
-    if (!ling_build_chat_prompt(messages, &prompt, think)) {
+    if (!ling_build_chat_prompt(messages, &prompt, think, tools)) {
         free(prompt.data);
         return samosa_http_json_error(fd,400,"invalid_prompt","Unable to construct the chat prompt.");
     }
@@ -2404,10 +2648,15 @@ static int ling_serve_chat(LingServerContext *ctx, int fd, jval *root) {
         if (n <= 0) { reason = "stop"; break; }
         size_t was_r = reasoning.len, was_c = answer.len;
         if (!ling_think_feed(&split, piece, (size_t)n, &reasoning, &answer)) { atomic_store(&ctx->cancel,1); break; }
-        if (stream &&
-            ((reasoning.len > was_r && !ling_send_chunk(fd,id,"reasoning_content",reasoning.data+was_r,reasoning.len-was_r)) ||
-             (answer.len > was_c && !ling_send_chunk(fd,id,"content",answer.data+was_c,answer.len-was_c))))
-            { atomic_store(&ctx->cancel,1); break; }
+        if (stream) {
+            if (reasoning.len > was_r && !ling_send_chunk(fd,id,"reasoning_content",reasoning.data+was_r,reasoning.len-was_r))
+                { atomic_store(&ctx->cancel,1); break; }
+            /* With tools in play, the answer is buffered whole below and scanned for
+             * <tool_call> blocks -- streaming it token-by-token would leak the raw XML
+             * tags into the client's rendered "content" before we know it was a call. */
+            if (!tools_present && answer.len > was_c && !ling_send_chunk(fd,id,"content",answer.data+was_c,answer.len-was_c))
+                { atomic_store(&ctx->cancel,1); break; }
+        }
         ids[np + generated++] = token;
         if (generated < max_tokens) forward(m, &token, 1, np + generated - 1, logits, 1, ctx->buffers);
     }
@@ -2416,21 +2665,55 @@ static int ling_serve_chat(LingServerContext *ctx, int fd, jval *root) {
         ling_think_flush(&split, &reasoning, &answer);
         if (stream) {
             if (reasoning.len > was_r) ling_send_chunk(fd,id,"reasoning_content",reasoning.data+was_r,reasoning.len-was_r);
-            if (answer.len > was_c) ling_send_chunk(fd,id,"content",answer.data+was_c,answer.len-was_c);
+            if (!tools_present && answer.len > was_c) ling_send_chunk(fd,id,"content",answer.data+was_c,answer.len-was_c);
         }
     }
     if (atomic_load(&ctx->cancel)) reason = "cancelled";
-    if (stream) ling_send_done(fd,id,np,generated,reason);
-    else {
-        LingString body={0}; char prefix[512], middle[64], suffix[512];
+    LingToolCalls calls = {0};
+    LingString leading = {0};
+    if (tools_present && !ling_extract_tool_calls(answer.data ? answer.data : "", &calls, &leading)) {
+        ling_tool_calls_free(&calls);
+        free(leading.data); leading.data = NULL; leading.len = leading.cap = 0;
+    }
+    const char *final_reason = calls.len ? "tool_calls" : reason;
+    if (stream) {
+        if (calls.len) {
+            if (leading.len) ling_send_chunk(fd,id,"content",leading.data,leading.len);
+            ling_send_tool_call_chunk(fd,id,&calls);
+        } else if (tools_present && answer.len) {
+            ling_send_chunk(fd,id,"content",answer.data,answer.len);
+        }
+        ling_send_done(fd,id,np,generated,final_reason);
+    } else {
+        LingString body={0}; char prefix[512], suffix[256];
         int n=snprintf(prefix,sizeof prefix,"{\"id\":\"%s\",\"object\":\"chat.completion\",\"model\":\"%s\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"reasoning_content\":\"",id,ctx->model_id);
         int ok=n>0&&ling_string_append(&body,prefix,(size_t)n)&&ling_json_escape(&body,reasoning.data?reasoning.data:"",reasoning.len);
-        n=snprintf(middle,sizeof middle,"\",\"content\":\"");
-        ok=ok&&n>0&&ling_string_append(&body,middle,(size_t)n)&&ling_json_escape(&body,answer.data?answer.data:"",answer.len);
-        n=snprintf(suffix,sizeof suffix,"\"},\"finish_reason\":\"%s\"}],\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d}}",reason,np,generated,np+generated);
+        ok=ok&&ling_string_append(&body,"\",\"content\":",strlen("\",\"content\":"));
+        if (calls.len && !leading.len) ok=ok&&ling_string_append(&body,"null",4);
+        else {
+            ok=ok&&ling_string_append(&body,"\"",1);
+            ok=ok&&ling_json_escape(&body, calls.len ? leading.data : (answer.data?answer.data:""), calls.len ? leading.len : answer.len);
+            ok=ok&&ling_string_append(&body,"\"",1);
+        }
+        if (calls.len) {
+            ok=ok&&ling_string_append(&body,",\"tool_calls\":[",strlen(",\"tool_calls\":["));
+            for (int i=0;i<calls.len && ok;i++) {
+                char callid[80]; snprintf(callid,sizeof callid,"%s-call-%d",id,i);
+                char head[192];
+                int m=snprintf(head,sizeof head,"%s{\"id\":\"%s\",\"type\":\"function\",\"function\":{\"name\":\"",i?",":"",callid);
+                ok = m>0 && (size_t)m<sizeof head && ling_string_append(&body,head,(size_t)m);
+                ok = ok && ling_json_escape(&body, calls.items[i].name, strlen(calls.items[i].name));
+                ok = ok && ling_string_append(&body,"\",\"arguments\":\"",strlen("\",\"arguments\":\""));
+                ok = ok && ling_json_escape(&body, calls.items[i].arguments, strlen(calls.items[i].arguments));
+                ok = ok && ling_string_append(&body,"\"}}",3);
+            }
+            ok = ok && ling_string_append(&body,"]",1);
+        }
+        n=snprintf(suffix,sizeof suffix,"},\"finish_reason\":\"%s\"}],\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d}}",final_reason,np,generated,np+generated);
         ok=ok&&n>0&&ling_string_append(&body,suffix,(size_t)n)&&samosa_http_headers(fd,200,"application/json",body.len,NULL)&&samosa_send_all(fd,body.data,body.len);
         free(body.data); (void)ok;
     }
+    ling_tool_calls_free(&calls); free(leading.data);
     int final_len = np + generated;
     if (final_len > ctx->cached_cap) {
         int cap = ctx->cached_cap ? ctx->cached_cap : 256;

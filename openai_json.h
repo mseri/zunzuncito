@@ -8,6 +8,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <ctype.h>
+#include <stdint.h>
 
 typedef enum { J_NULL, J_BOOL, J_NUM, J_STR, J_ARR, J_OBJ } jtype;
 
@@ -154,6 +155,68 @@ static void json_free(jval *value) {
     }
     if (value->t==J_STR) free(value->str);
     free(value->keys); free(value->kids); free(value);
+}
+
+/* Re-serializer: the inverse of json_parse, used to re-embed a parsed value (e.g. a tool
+ * signature echoed back into a prompt, or a decoded arguments object) as compact JSON
+ * text. Growable buffer, independent of any single model server's own string type. */
+typedef struct { char *data; size_t len, cap; } jbuf;
+
+static int jbuf_append(jbuf *b, const char *s, size_t n) {
+    if (n > SIZE_MAX - b->len - 1) return 0;
+    size_t need = b->len + n + 1;
+    if (need > b->cap) {
+        size_t cap = b->cap ? b->cap : 256;
+        while (cap < need) { if (cap > SIZE_MAX / 2) return 0; cap *= 2; }
+        char *p = (char *)realloc(b->data, cap);
+        if (!p) return 0;
+        b->data = p; b->cap = cap;
+    }
+    memcpy(b->data + b->len, s, n); b->len += n; b->data[b->len] = 0;
+    return 1;
+}
+
+static int json_encode_str(jbuf *b, const char *s, size_t n) {
+    static const char hex[] = "0123456789abcdef";
+    if (!jbuf_append(b, "\"", 1)) return 0;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == '"' || c == '\\') { char x[2] = {'\\', (char)c}; if (!jbuf_append(b,x,2)) return 0; }
+        else if (c == '\n') { if (!jbuf_append(b,"\\n",2)) return 0; }
+        else if (c == '\r') { if (!jbuf_append(b,"\\r",2)) return 0; }
+        else if (c == '\t') { if (!jbuf_append(b,"\\t",2)) return 0; }
+        else if (c < 0x20) { char x[6] = {'\\','u','0','0',hex[c>>4],hex[c&15]}; if (!jbuf_append(b,x,6)) return 0; }
+        else if (!jbuf_append(b,s+i,1)) return 0;
+    }
+    return jbuf_append(b, "\"", 1);
+}
+
+static inline int json_encode(jbuf *b, jval *v) {
+    if (!v) return jbuf_append(b, "null", 4);
+    switch (v->t) {
+        case J_NULL: return jbuf_append(b, "null", 4);
+        case J_BOOL: return v->boolean ? jbuf_append(b,"true",4) : jbuf_append(b,"false",5);
+        case J_NUM: { char buf[64]; int n = snprintf(buf,sizeof buf,"%.17g",v->num);
+                      return n > 0 && jbuf_append(b, buf, (size_t)n); }
+        case J_STR: return json_encode_str(b, v->str, strlen(v->str));
+        case J_ARR:
+            if (!jbuf_append(b,"[",1)) return 0;
+            for (int i = 0; i < v->len; i++) {
+                if (i && !jbuf_append(b,",",1)) return 0;
+                if (!json_encode(b, v->kids[i])) return 0;
+            }
+            return jbuf_append(b,"]",1);
+        case J_OBJ:
+            if (!jbuf_append(b,"{",1)) return 0;
+            for (int i = 0; i < v->len; i++) {
+                if (i && !jbuf_append(b,",",1)) return 0;
+                if (!json_encode_str(b, v->keys[i], strlen(v->keys[i]))) return 0;
+                if (!jbuf_append(b,":",1)) return 0;
+                if (!json_encode(b, v->kids[i])) return 0;
+            }
+            return jbuf_append(b,"}",1);
+    }
+    return 0;
 }
 
 #endif

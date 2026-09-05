@@ -1556,20 +1556,155 @@ static int mp_append_content(MpString *dst, jval *msg) {
     return 1;
 }
 
-static int mp_build_chat_prompt(jval *messages, MpString *prompt) {
+/* Tool calling, transcribed from maple's own chat_template.jinja (Hermes/Qwen-style: a
+ * plain JSON object inside <tool_call></tool_call>, not Ling's arg_key/arg_value XML).
+ * When `tools` is present, the system turn -- and messages[0] if it is a system message
+ * -- collapse into one turn documenting them; tool results replay as a "user" turn
+ * (this template has no dedicated OBSERVATION role) holding <tool_response> blocks. */
+static int mp_append_tools_system(MpString *prompt, jval *tools, jval *first_system) {
+    #define PUT(s) do { const char *_s = (s); \
+                        if (!mp_string_append(prompt, _s, strlen(_s))) return 0; } while (0)
+    PUT("<|im_start|>system\n");
+    if (first_system) {
+        if (!mp_append_content(prompt, first_system)) return 0;
+        PUT("\n\n");
+    }
+    PUT("# Tools\n\nYou may call one or more functions to assist with the user query.\n\n"
+        "You are provided with function signatures within <tools></tools> XML tags:\n<tools>");
+    for (int i = 0; i < tools->len; i++) {
+        PUT("\n");
+        jbuf jb = {0};
+        int ok = json_encode(&jb, tools->kids[i]);
+        if (ok) ok = mp_string_append(prompt, jb.data ? jb.data : "", jb.len);
+        free(jb.data);
+        if (!ok) return 0;
+    }
+    PUT("\n</tools>\n\nFor each function call, return a json object with function name and "
+        "arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n"
+        "{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n");
+    #undef PUT
+    return 1;
+}
+
+static int mp_append_tool_calls_block(MpString *prompt, jval *tool_calls, int had_content) {
+    for (int i = 0; i < tool_calls->len; i++) {
+        if ((i == 0 && had_content) || i > 0) {
+            if (!mp_string_append(prompt, "\n", 1)) return 0;
+        }
+        jval *tc = tool_calls->kids[i];
+        jval *fn = json_get(tc, "function"); if (!fn) fn = tc;
+        jval *name = json_get(fn, "name");
+        const char *name_str = (name && name->t == J_STR) ? name->str : "";
+        if (!mp_string_append(prompt, "<tool_call>\n{\"name\": \"", strlen("<tool_call>\n{\"name\": \"")) ||
+            !mp_string_append(prompt, name_str, strlen(name_str)) ||
+            !mp_string_append(prompt, "\", \"arguments\": ", strlen("\", \"arguments\": "))) return 0;
+        jval *args = json_get(fn, "arguments");
+        int ok;
+        if (args && args->t == J_STR) ok = mp_string_append(prompt, args->str, strlen(args->str));
+        else { jbuf jb = {0}; ok = json_encode(&jb, args) && mp_string_append(prompt, jb.data ? jb.data : "", jb.len); free(jb.data); }
+        if (!ok || !mp_string_append(prompt, "}\n</tool_call>", strlen("}\n</tool_call>"))) return 0;
+    }
+    return 1;
+}
+
+typedef struct { char *name; char *arguments; } MpToolCall;
+typedef struct { MpToolCall *items; int len, cap; } MpToolCalls;
+
+static int mp_tool_calls_push(MpToolCalls *calls, const char *name, size_t name_len,
+                              const char *args, size_t args_len) {
+    if (calls->len == calls->cap) {
+        int cap = calls->cap ? calls->cap * 2 : 4;
+        MpToolCall *items = realloc(calls->items, sizeof *items * (size_t)cap);
+        if (!items) return 0;
+        calls->items = items; calls->cap = cap;
+    }
+    char *n = malloc(name_len + 1), *a = malloc(args_len + 1);
+    if (!n || !a) { free(n); free(a); return 0; }
+    memcpy(n, name, name_len); n[name_len] = 0;
+    memcpy(a, args, args_len); a[args_len] = 0;
+    calls->items[calls->len].name = n; calls->items[calls->len].arguments = a;
+    calls->len++;
+    return 1;
+}
+
+static void mp_tool_calls_free(MpToolCalls *calls) {
+    for (int i = 0; i < calls->len; i++) { free(calls->items[i].name); free(calls->items[i].arguments); }
+    free(calls->items); calls->items = NULL; calls->len = calls->cap = 0;
+}
+
+/* Parses <tool_call>{"name": "...", "arguments": {...}}</tool_call> blocks out of the raw
+ * completion text. Since this wire format is real JSON, the existing parser does the
+ * work; no bespoke tag scanning needed beyond finding the block boundaries. */
+static int mp_extract_tool_calls(const char *text, MpToolCalls *calls, MpString *leading) {
+    const char *open_tag = "<tool_call>", *close_tag = "</tool_call>";
+    size_t open_len = strlen(open_tag), close_len = strlen(close_tag);
+    const char *first = strstr(text, open_tag);
+    size_t lead_len = first ? (size_t)(first - text) : strlen(text);
+    if (lead_len && !mp_string_append(leading, text, lead_len)) return 0;
+    while (first) {
+        const char *body_start = first + open_len;
+        const char *body_end = strstr(body_start, close_tag);
+        if (!body_end) break;
+        size_t blen = (size_t)(body_end - body_start);
+        char *buf = malloc(blen + 1);
+        if (!buf) return 0;
+        memcpy(buf, body_start, blen); buf[blen] = 0;
+        char *arena = NULL;
+        jval *obj = json_parse(buf, &arena);
+        if (obj && obj->t == J_OBJ) {
+            jval *name = json_get(obj, "name");
+            jval *args = json_get(obj, "arguments");
+            const char *name_str = (name && name->t == J_STR) ? name->str : "";
+            jbuf ab = {0};
+            int ok = args ? json_encode(&ab, args) : jbuf_append(&ab, "{}", 2);
+            if (ok) ok = mp_tool_calls_push(calls, name_str, strlen(name_str), ab.data ? ab.data : "{}", ab.len);
+            free(ab.data);
+            if (!ok) { json_free(obj); free(arena); free(buf); return 0; }
+        }
+        json_free(obj); free(arena); free(buf);
+        first = strstr(body_end + close_len, open_tag);
+    }
+    return 1;
+}
+
+static int mp_build_chat_prompt(jval *messages, MpString *prompt, jval *tools) {
     if (!messages || messages->t != J_ARR) return 0;
     #define PUT(s) do { const char *_s = (s); \
                         if (!mp_string_append(prompt, _s, strlen(_s))) return 0; } while (0)
-    for (int i = 0; i < messages->len; i++) {
+    int has_tools = tools && tools->t == J_ARR && tools->len > 0;
+    jval *first_role = messages->len > 0 ? mp_json_field(messages->kids[0], "role", J_STR) : NULL;
+    int first_is_system = first_role && !strcmp(first_role->str, "system") && mp_msg_has_text(messages->kids[0]);
+    if (has_tools) {
+        if (!mp_append_tools_system(prompt, tools, first_is_system ? messages->kids[0] : NULL)) return 0;
+    }
+    for (int i = (has_tools && first_is_system) ? 1 : 0; i < messages->len; i++) {
         jval *message = messages->kids[i];
         jval *role = mp_json_field(message, "role", J_STR);
-        if (!role || !mp_msg_has_text(message)) continue;
+        if (!role) continue;
+        if (!strcmp(role->str, "tool")) {
+            jval *prev = i > 0 ? mp_json_field(messages->kids[i-1], "role", J_STR) : NULL;
+            jval *next = i+1 < messages->len ? mp_json_field(messages->kids[i+1], "role", J_STR) : NULL;
+            int is_first = !(prev && !strcmp(prev->str, "tool"));
+            int is_last = !(next && !strcmp(next->str, "tool"));
+            if (is_first) PUT("<|im_start|>user");
+            PUT("\n<tool_response>\n");
+            if (!mp_append_content(prompt, message)) return 0;
+            PUT("\n</tool_response>");
+            if (is_last) PUT("<|im_end|>\n");
+            continue;
+        }
+        jval *tool_calls = mp_json_field(message, "tool_calls", J_ARR);
+        int has_calls = tool_calls && tool_calls->len > 0 && !strcmp(role->str, "assistant");
+        if (!mp_msg_has_text(message) && !has_calls) continue;
         if (strcmp(role->str, "system") && strcmp(role->str, "user") &&
             strcmp(role->str, "assistant")) continue;
         PUT("<|im_start|>");
         PUT(role->str);
         PUT("\n");
+        size_t before = prompt->len;
         if (!mp_append_content(prompt, message)) return 0;
+        int had_content = prompt->len > before;
+        if (has_calls && !mp_append_tool_calls_block(prompt, tool_calls, had_content)) return 0;
         PUT("<|im_end|>\n");
     }
     /* The template's generation prompt opens a reasoning block unconditionally, and
@@ -1607,6 +1742,33 @@ static int mp_send_done(int fd, const char *id, int prompt_tokens, int completio
     return n > 0 && (size_t)n < sizeof event && samosa_send_all(fd, event, (size_t)n);
 }
 
+static int mp_send_tool_call_chunk(int fd, const char *id, MpToolCalls *calls) {
+    MpString out = {0};
+    const char *prefix = "data: {\"id\":\"";
+    const char *middle = "\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[";
+    const char *tail = "]},\"finish_reason\":null}]}\n\n";
+    int ok = mp_string_append(&out,prefix,strlen(prefix)) && mp_json_escape(&out,id,strlen(id)) &&
+             mp_string_append(&out,middle,strlen(middle));
+    for (int i = 0; i < calls->len && ok; i++) {
+        char callid[80]; snprintf(callid,sizeof callid,"%s-call-%d",id,i);
+        char head[192];
+        int n = snprintf(head,sizeof head,
+            "%s{\"index\":%d,\"id\":\"%s\",\"type\":\"function\",\"function\":{\"name\":\"",
+            i ? "," : "", i, callid);
+        ok = n > 0 && (size_t)n < sizeof head && mp_string_append(&out,head,(size_t)n);
+        ok = ok && mp_json_escape(&out, calls->items[i].name, strlen(calls->items[i].name));
+        const char *between = "\",\"arguments\":\"";
+        ok = ok && mp_string_append(&out, between, strlen(between));
+        ok = ok && mp_json_escape(&out, calls->items[i].arguments, strlen(calls->items[i].arguments));
+        const char *close = "\"}}";
+        ok = ok && mp_string_append(&out, close, strlen(close));
+    }
+    ok = ok && mp_string_append(&out, tail, strlen(tail));
+    if (ok) ok = samosa_send_all(fd, out.data, out.len);
+    free(out.data);
+    return ok;
+}
+
 static int mp_serve_chat(MapleServerContext *ctx, int fd, jval *root) {
     jval *messages = mp_json_field(root, "messages", J_ARR);
     int has_user = 0;
@@ -1617,6 +1779,8 @@ static int mp_serve_chat(MapleServerContext *ctx, int fd, jval *root) {
         if (role && !strcmp(role->str,"user") && mp_msg_has_text(msg)) has_user = 1;
     }
     if (!has_user) return samosa_http_json_error(fd,400,"invalid_messages","A text user message is required.");
+    jval *tools = mp_json_field(root, "tools", J_ARR);
+    int tools_present = tools && tools->len > 0;
 
     int stream = 0, max_tokens = 2048, seed = 0;
     /* same defaults the CLI resolves: top-k 20 behind the FlashHead, off without */
@@ -1662,7 +1826,7 @@ static int mp_serve_chat(MapleServerContext *ctx, int fd, jval *root) {
 
     M *m = ctx->model; Cfg *c = &m->c;
     MpString prompt = {0};
-    if (!mp_build_chat_prompt(messages, &prompt)) {
+    if (!mp_build_chat_prompt(messages, &prompt, tools)) {
         free(prompt.data);
         return samosa_http_json_error(fd,400,"invalid_prompt","Unable to construct the chat prompt.");
     }
@@ -1709,20 +1873,57 @@ static int mp_serve_chat(MapleServerContext *ctx, int fd, jval *root) {
         char piece[4096]; int n = lfmtok_decode(tok, &token, 1, piece, sizeof piece - 1);
         if (n <= 0) { reason = "stop"; break; }
         if (!mp_string_append(&answer, piece, (size_t)n)) { atomic_store(&ctx->cancel,1); break; }
-        if (stream && !mp_send_chunk(fd,id,"content",piece,(size_t)n)) { atomic_store(&ctx->cancel,1); break; }
+        /* With tools in play, the answer is buffered whole and scanned for <tool_call>
+         * blocks below -- streaming it token-by-token would leak the raw tags. */
+        if (stream && !tools_present && !mp_send_chunk(fd,id,"content",piece,(size_t)n)) { atomic_store(&ctx->cancel,1); break; }
         ids[np + generated++] = token;
         if (generated < max_tokens) forward(m, &token, 1, np + generated - 1, logits, 1, ctx->buffers);
     }
     if (atomic_load(&ctx->cancel)) reason = "cancelled";
-    if (stream) mp_send_done(fd,id,np,generated,reason);
-    else {
-        MpString body={0}; char prefix[512], suffix[512];
-        int n=snprintf(prefix,sizeof prefix,"{\"id\":\"%s\",\"object\":\"chat.completion\",\"model\":\"%s\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"",id,ctx->model_id);
-        int ok=n>0&&mp_string_append(&body,prefix,(size_t)n)&&mp_json_escape(&body,answer.data?answer.data:"",answer.len);
-        n=snprintf(suffix,sizeof suffix,"\"},\"finish_reason\":\"%s\"}],\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d}}",reason,np,generated,np+generated);
+    MpToolCalls calls = {0};
+    MpString leading = {0};
+    if (tools_present && !mp_extract_tool_calls(answer.data ? answer.data : "", &calls, &leading)) {
+        mp_tool_calls_free(&calls);
+        free(leading.data); leading.data = NULL; leading.len = leading.cap = 0;
+    }
+    const char *final_reason = calls.len ? "tool_calls" : reason;
+    if (stream) {
+        if (calls.len) {
+            if (leading.len) mp_send_chunk(fd,id,"content",leading.data,leading.len);
+            mp_send_tool_call_chunk(fd,id,&calls);
+        } else if (tools_present && answer.len) {
+            mp_send_chunk(fd,id,"content",answer.data,answer.len);
+        }
+        mp_send_done(fd,id,np,generated,final_reason);
+    } else {
+        MpString body={0}; char prefix[512], suffix[256];
+        int n=snprintf(prefix,sizeof prefix,"{\"id\":\"%s\",\"object\":\"chat.completion\",\"model\":\"%s\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":",id,ctx->model_id);
+        int ok=n>0&&mp_string_append(&body,prefix,(size_t)n);
+        if (calls.len && !leading.len) ok=ok&&mp_string_append(&body,"null",4);
+        else {
+            ok=ok&&mp_string_append(&body,"\"",1);
+            ok=ok&&mp_json_escape(&body, calls.len ? leading.data : (answer.data?answer.data:""), calls.len ? leading.len : answer.len);
+            ok=ok&&mp_string_append(&body,"\"",1);
+        }
+        if (calls.len) {
+            ok=ok&&mp_string_append(&body,",\"tool_calls\":[",strlen(",\"tool_calls\":["));
+            for (int i=0;i<calls.len && ok;i++) {
+                char callid[80]; snprintf(callid,sizeof callid,"%s-call-%d",id,i);
+                char head[192];
+                int m2=snprintf(head,sizeof head,"%s{\"id\":\"%s\",\"type\":\"function\",\"function\":{\"name\":\"",i?",":"",callid);
+                ok = m2>0 && (size_t)m2<sizeof head && mp_string_append(&body,head,(size_t)m2);
+                ok = ok && mp_json_escape(&body, calls.items[i].name, strlen(calls.items[i].name));
+                ok = ok && mp_string_append(&body,"\",\"arguments\":\"",strlen("\",\"arguments\":\""));
+                ok = ok && mp_json_escape(&body, calls.items[i].arguments, strlen(calls.items[i].arguments));
+                ok = ok && mp_string_append(&body,"\"}}",3);
+            }
+            ok = ok && mp_string_append(&body,"]",1);
+        }
+        n=snprintf(suffix,sizeof suffix,"},\"finish_reason\":\"%s\"}],\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d}}",final_reason,np,generated,np+generated);
         ok=ok&&n>0&&mp_string_append(&body,suffix,(size_t)n)&&samosa_http_headers(fd,200,"application/json",body.len,NULL)&&samosa_send_all(fd,body.data,body.len);
         free(body.data); (void)ok;
     }
+    mp_tool_calls_free(&calls); free(leading.data);
     int final_len = np + generated;
     if (final_len > ctx->cached_cap) {
         int cap = ctx->cached_cap ? ctx->cached_cap : 256;

@@ -2297,21 +2297,232 @@ static int lfm_append_content(LfmString *dst, jval *msg) {
     return 1;
 }
 
-static int lfm_build_chat_prompt(jval *messages, LfmString *prompt) {
+/* Tool calling, transcribed from LFM2.5's own chat_template.jinja: tools are listed as
+ * "List of tools: [...]" folded into the system turn (there is no dedicated <tools> XML
+ * block like Ling/maple), and calls render as Python-call syntax --
+ * <|tool_call_start|>[name(key='val', key2=42), ...]<|tool_call_end|> -- rather than JSON
+ * or XML. Tool results have no special role wrapper: "tool" is rendered like any other
+ * role, content verbatim. */
+static int lfm_append_system(LfmString *prompt, jval *sys_msg, jval *tools) {
+    LfmString sys = {0};
+    int ok = sys_msg ? lfm_append_content(&sys, sys_msg) : 1;
+    if (ok && tools && tools->len > 0) {
+        if (sys.len) ok = lfm_string_append(&sys, "\n", 1);
+        ok = ok && lfm_string_append(&sys, "List of tools: [", strlen("List of tools: ["));
+        for (int i = 0; ok && i < tools->len; i++) {
+            if (i) ok = lfm_string_append(&sys, ", ", 2);
+            if (ok) { jbuf jb = {0}; ok = json_encode(&jb, tools->kids[i]) &&
+                                          lfm_string_append(&sys, jb.data ? jb.data : "", jb.len); free(jb.data); }
+        }
+        ok = ok && lfm_string_append(&sys, "]", 1);
+    }
+    if (ok && sys.len) {
+        ok = lfm_string_append(prompt, "<|im_start|>system\n", strlen("<|im_start|>system\n")) &&
+             lfm_string_append(prompt, sys.data, sys.len) &&
+             lfm_string_append(prompt, "<|im_end|>\n", strlen("<|im_end|>\n"));
+    }
+    free(sys.data);
+    return ok;
+}
+
+static int lfm_append_arg_value(LfmString *prompt, jval *v) {
+    if (!v || v->t == J_NULL) return lfm_string_append(prompt, "None", 4);
+    switch (v->t) {
+        case J_STR: return lfm_string_append(prompt,"'",1) &&
+                            lfm_string_append(prompt,v->str,strlen(v->str)) &&
+                            lfm_string_append(prompt,"'",1);
+        case J_BOOL: return v->boolean ? lfm_string_append(prompt,"True",4) : lfm_string_append(prompt,"False",5);
+        case J_NUM: { char buf[64]; int n = snprintf(buf,sizeof buf,"%.17g",v->num);
+                      return n > 0 && lfm_string_append(prompt,buf,(size_t)n); }
+        default: { jbuf jb = {0}; int ok = json_encode(&jb,v) && lfm_string_append(prompt,jb.data?jb.data:"",jb.len);
+                   free(jb.data); return ok; }
+    }
+}
+
+static int lfm_append_tool_calls_block(LfmString *prompt, jval *tool_calls) {
+    if (!lfm_string_append(prompt, "<|tool_call_start|>[", strlen("<|tool_call_start|>["))) return 0;
+    for (int i = 0; i < tool_calls->len; i++) {
+        if (i && !lfm_string_append(prompt, ", ", 2)) return 0;
+        jval *tc = tool_calls->kids[i];
+        jval *fn = json_get(tc, "function"); if (!fn) fn = tc;
+        jval *name = json_get(fn, "name");
+        const char *name_str = (name && name->t == J_STR) ? name->str : "";
+        if (!lfm_string_append(prompt, name_str, strlen(name_str)) || !lfm_string_append(prompt, "(", 1)) return 0;
+        jval *args_field = json_get(fn, "arguments");
+        char *arena = NULL; jval *parsed = NULL, *args_obj = NULL;
+        if (args_field && args_field->t == J_STR) { parsed = json_parse(args_field->str, &arena); if (parsed && parsed->t == J_OBJ) args_obj = parsed; }
+        else if (args_field && args_field->t == J_OBJ) args_obj = args_field;
+        int ok = 1;
+        if (args_obj) {
+            for (int k = 0; k < args_obj->len && ok; k++) {
+                if (k) ok = lfm_string_append(prompt, ", ", 2);
+                ok = ok && lfm_string_append(prompt, args_obj->keys[k], strlen(args_obj->keys[k])) &&
+                     lfm_string_append(prompt, "=", 1) && lfm_append_arg_value(prompt, args_obj->kids[k]);
+            }
+        }
+        if (parsed) { json_free(parsed); free(arena); }
+        if (!ok || !lfm_string_append(prompt, ")", 1)) return 0;
+    }
+    return lfm_string_append(prompt, "]<|tool_call_end|>", strlen("]<|tool_call_end|>"));
+}
+
+/* Scans [s, end) for the next occurrence of `sep` at nesting depth 0, outside quotes --
+ * used to split the Python-call-ish wire format without a real tokenizer. Tracks (), [],
+ * {} nesting and both quote styles with backslash escaping. */
+static const char *lfm_scan_top_level(const char *s, const char *end, char sep) {
+    int depth = 0; char quote = 0;
+    for (const char *p = s; p < end; p++) {
+        char c = *p;
+        if (quote) { if (c == '\\' && p+1 < end) p++; else if (c == quote) quote = 0; continue; }
+        if (c == '\'' || c == '"') { quote = c; continue; }
+        if (c=='('||c=='['||c=='{') depth++;
+        else if (c==')'||c==']'||c=='}') depth--;
+        else if (depth == 0 && c == sep) return p;
+    }
+    return end;
+}
+
+static int lfm_is_number_literal(const char *v, size_t n) {
+    if (!n) return 0;
+    size_t i = (v[0]=='-') ? 1 : 0, digits = 0;
+    while (i<n && isdigit((unsigned char)v[i])) { i++; digits++; }
+    if (!digits) return 0;
+    if (i<n && v[i]=='.') { i++; while (i<n && isdigit((unsigned char)v[i])) i++; }
+    if (i<n && (v[i]=='e'||v[i]=='E')) { i++; if (i<n && (v[i]=='+'||v[i]=='-')) i++; while (i<n && isdigit((unsigned char)v[i])) i++; }
+    return i==n;
+}
+
+static int lfm_parse_arg_value(const char *v, size_t n, LfmString *out) {
+    while (n && isspace((unsigned char)v[n-1])) n--;
+    while (n && isspace((unsigned char)*v)) { v++; n--; }
+    if (n >= 2 && (v[0] == '\'' || v[0] == '"') && v[n-1] == v[0]) {
+        jbuf jb = {0}; int ok = json_encode_str(&jb, v+1, n-2) && lfm_string_append(out, jb.data, jb.len); free(jb.data); return ok;
+    }
+    if (n == 4 && !strncmp(v,"True",4)) return lfm_string_append(out,"true",4);
+    if (n == 5 && !strncmp(v,"False",5)) return lfm_string_append(out,"false",5);
+    if ((n == 4 && !strncmp(v,"None",4)) || (n == 4 && !strncmp(v,"null",4))) return lfm_string_append(out,"null",4);
+    if (n && (v[0]=='{' || v[0]=='[')) return lfm_string_append(out, v, n);
+    if (lfm_is_number_literal(v, n)) return lfm_string_append(out, v, n);
+    jbuf jb = {0}; int ok = json_encode_str(&jb, v, n) && lfm_string_append(out, jb.data, jb.len); free(jb.data); return ok;
+}
+
+typedef struct { char *name; char *arguments; } LfmToolCall;
+typedef struct { LfmToolCall *items; int len, cap; } LfmToolCalls;
+
+static int lfm_tool_calls_push(LfmToolCalls *calls, const char *name, size_t name_len,
+                               const char *args, size_t args_len) {
+    if (calls->len == calls->cap) {
+        int cap = calls->cap ? calls->cap * 2 : 4;
+        LfmToolCall *items = realloc(calls->items, sizeof *items * (size_t)cap);
+        if (!items) return 0;
+        calls->items = items; calls->cap = cap;
+    }
+    char *n = malloc(name_len + 1), *a = malloc(args_len + 1);
+    if (!n || !a) { free(n); free(a); return 0; }
+    memcpy(n, name, name_len); n[name_len] = 0;
+    memcpy(a, args, args_len); a[args_len] = 0;
+    calls->items[calls->len].name = n; calls->items[calls->len].arguments = a;
+    calls->len++;
+    return 1;
+}
+
+static void lfm_tool_calls_free(LfmToolCalls *calls) {
+    for (int i = 0; i < calls->len; i++) { free(calls->items[i].name); free(calls->items[i].arguments); }
+    free(calls->items); calls->items = NULL; calls->len = calls->cap = 0;
+}
+
+/* Parses <|tool_call_start|>[name(k='v', k2=42), ...]<|tool_call_end|> out of the raw
+ * completion text. Commas and '=' inside quotes/brackets are not split points, tracked
+ * with lfm_scan_top_level rather than a real Python-expression parser. */
+static int lfm_extract_tool_calls(const char *text, LfmToolCalls *calls, LfmString *leading) {
+    const char *open_tag = "<|tool_call_start|>", *close_tag = "<|tool_call_end|>";
+    size_t open_len = strlen(open_tag), close_len = strlen(close_tag);
+    const char *first = strstr(text, open_tag);
+    size_t lead_len = first ? (size_t)(first - text) : strlen(text);
+    if (lead_len && !lfm_string_append(leading, text, lead_len)) return 0;
+    while (first) {
+        const char *body_start = first + open_len;
+        const char *body_end = strstr(body_start, close_tag);
+        if (!body_end) break;
+        const char *s = body_start, *e = body_end;
+        while (s < e && isspace((unsigned char)*s)) s++;
+        while (e > s && isspace((unsigned char)e[-1])) e--;
+        if (s < e && *s == '[') s++;
+        if (e > s && e[-1] == ']') e--;
+        const char *p = s;
+        int ok = 1;
+        while (ok && p < e) {
+            while (p < e && isspace((unsigned char)*p)) p++;
+            if (p >= e) break;
+            const char *sep = lfm_scan_top_level(p, e, ',');
+            const char *call_end = sep;
+            while (call_end > p && isspace((unsigned char)call_end[-1])) call_end--;
+            if (call_end > p) {
+                const char *op = memchr(p, '(', (size_t)(call_end - p));
+                if (op) {
+                    const char *name_end = op;
+                    while (name_end > p && isspace((unsigned char)name_end[-1])) name_end--;
+                    const char *args_start = op + 1;
+                    const char *args_end = call_end;
+                    if (args_end > args_start && args_end[-1] == ')') args_end--;
+                    LfmString args = {0};
+                    ok = lfm_string_append(&args, "{", 1);
+                    const char *q = args_start; int first_kv = 1;
+                    while (ok && q < args_end) {
+                        while (q < args_end && isspace((unsigned char)*q)) q++;
+                        if (q >= args_end) break;
+                        const char *ksep = lfm_scan_top_level(q, args_end, ',');
+                        const char *kv_end = ksep;
+                        while (kv_end > q && isspace((unsigned char)kv_end[-1])) kv_end--;
+                        const char *eq = lfm_scan_top_level(q, kv_end, '=');
+                        if (eq < kv_end) {
+                            const char *key_end = eq;
+                            while (key_end > q && isspace((unsigned char)key_end[-1])) key_end--;
+                            const char *val_start = eq + 1;
+                            if (!first_kv) ok = ok && lfm_string_append(&args, ",", 1);
+                            first_kv = 0;
+                            if (ok) { jbuf kb = {0}; ok = json_encode_str(&kb, q, (size_t)(key_end - q)) &&
+                                                          lfm_string_append(&args, kb.data, kb.len); free(kb.data); }
+                            ok = ok && lfm_string_append(&args, ":", 1);
+                            ok = ok && lfm_parse_arg_value(val_start, (size_t)(kv_end - val_start), &args);
+                        }
+                        q = (ksep < args_end) ? ksep + 1 : args_end;
+                    }
+                    ok = ok && lfm_string_append(&args, "}", 1);
+                    if (ok) { int pushed = lfm_tool_calls_push(calls, p, (size_t)(name_end - p), args.data, args.len); ok = pushed; }
+                    free(args.data);
+                }
+            }
+            p = (sep < e) ? sep + 1 : e;
+        }
+        if (!ok) return 0;
+        first = strstr(body_end + close_len, open_tag);
+    }
+    return 1;
+}
+
+static int lfm_build_chat_prompt(jval *messages, LfmString *prompt, jval *tools) {
     if (!messages || messages->t != J_ARR) return 0;
     #define PUT(s) do { const char *_s = (s); \
                         if (!lfm_string_append(prompt, _s, strlen(_s))) return 0; } while (0)
     PUT("<|startoftext|>");
-    for (int i = 0; i < messages->len; i++) {
+    jval *first_role = messages->len > 0 ? lfm_json_field(messages->kids[0], "role", J_STR) : NULL;
+    int first_is_system = first_role && !strcmp(first_role->str, "system") && lfm_msg_has_text(messages->kids[0]);
+    if (!lfm_append_system(prompt, first_is_system ? messages->kids[0] : NULL, tools)) return 0;
+    for (int i = first_is_system ? 1 : 0; i < messages->len; i++) {
         jval *message = messages->kids[i];
         jval *role = lfm_json_field(message, "role", J_STR);
-        if (!role || !lfm_msg_has_text(message)) continue;
+        if (!role) continue;
+        jval *tool_calls = lfm_json_field(message, "tool_calls", J_ARR);
+        int has_calls = tool_calls && tool_calls->len > 0 && !strcmp(role->str, "assistant");
+        if (!lfm_msg_has_text(message) && !has_calls) continue;
         if (strcmp(role->str, "system") && strcmp(role->str, "user") &&
-            strcmp(role->str, "assistant")) continue;
+            strcmp(role->str, "assistant") && strcmp(role->str, "tool")) continue;
         PUT("<|im_start|>");
         PUT(role->str);
         PUT("\n");
         if (!lfm_append_content(prompt, message)) return 0;
+        if (has_calls && !lfm_append_tool_calls_block(prompt, tool_calls)) return 0;
         PUT("<|im_end|>\n");
     }
     PUT("<|im_start|>assistant\n");
@@ -2345,6 +2556,33 @@ static int lfm_send_done(int fd, const char *id, int prompt_tokens, int completi
     return n > 0 && (size_t)n < sizeof event && samosa_send_all(fd, event, (size_t)n);
 }
 
+static int lfm_send_tool_call_chunk(int fd, const char *id, LfmToolCalls *calls) {
+    LfmString out = {0};
+    const char *prefix = "data: {\"id\":\"";
+    const char *middle = "\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[";
+    const char *tail = "]},\"finish_reason\":null}]}\n\n";
+    int ok = lfm_string_append(&out,prefix,strlen(prefix)) && lfm_json_escape(&out,id,strlen(id)) &&
+             lfm_string_append(&out,middle,strlen(middle));
+    for (int i = 0; i < calls->len && ok; i++) {
+        char callid[80]; snprintf(callid,sizeof callid,"%s-call-%d",id,i);
+        char head[192];
+        int n = snprintf(head,sizeof head,
+            "%s{\"index\":%d,\"id\":\"%s\",\"type\":\"function\",\"function\":{\"name\":\"",
+            i ? "," : "", i, callid);
+        ok = n > 0 && (size_t)n < sizeof head && lfm_string_append(&out,head,(size_t)n);
+        ok = ok && lfm_json_escape(&out, calls->items[i].name, strlen(calls->items[i].name));
+        const char *between = "\",\"arguments\":\"";
+        ok = ok && lfm_string_append(&out, between, strlen(between));
+        ok = ok && lfm_json_escape(&out, calls->items[i].arguments, strlen(calls->items[i].arguments));
+        const char *close = "\"}}";
+        ok = ok && lfm_string_append(&out, close, strlen(close));
+    }
+    ok = ok && lfm_string_append(&out, tail, strlen(tail));
+    if (ok) ok = samosa_send_all(fd, out.data, out.len);
+    free(out.data);
+    return ok;
+}
+
 static int lfm_serve_chat(LfmServerContext *ctx, int fd, jval *root) {
     jval *messages = lfm_json_field(root, "messages", J_ARR);
     int has_user = 0;
@@ -2355,6 +2593,8 @@ static int lfm_serve_chat(LfmServerContext *ctx, int fd, jval *root) {
         if (role && !strcmp(role->str,"user") && lfm_msg_has_text(msg)) has_user = 1;
     }
     if (!has_user) return samosa_http_json_error(fd,400,"invalid_messages","A text user message is required.");
+    jval *tools = lfm_json_field(root, "tools", J_ARR);
+    int tools_present = tools && tools->len > 0;
 
     int stream = 0, max_tokens = 2048, topk = 80, seed = 0;
     float temperature = 0.2f, topp = 1.0f, penalty = 1.05f;   /* LFM2.5 generation defaults */
@@ -2398,7 +2638,7 @@ static int lfm_serve_chat(LfmServerContext *ctx, int fd, jval *root) {
 
     M *m = ctx->model; Cfg *c = &m->c;
     LfmString prompt = {0};
-    if (!lfm_build_chat_prompt(messages, &prompt)) {
+    if (!lfm_build_chat_prompt(messages, &prompt, tools)) {
         free(prompt.data);
         return samosa_http_json_error(fd,400,"invalid_prompt","Unable to construct the chat prompt.");
     }
@@ -2446,20 +2686,58 @@ static int lfm_serve_chat(LfmServerContext *ctx, int fd, jval *root) {
         char piece[4096]; int n = lfmtok_decode(tok, &token, 1, piece, sizeof piece - 1);
         if (n <= 0) { reason = "stop"; break; }
         if (!lfm_string_append(&answer, piece, (size_t)n)) { atomic_store(&ctx->cancel,1); break; }
-        if (stream && !lfm_send_chunk(fd,id,"content",piece,(size_t)n)) { atomic_store(&ctx->cancel,1); break; }
+        /* With tools in play, the answer is buffered whole and scanned for
+         * <|tool_call_start|> blocks below -- streaming it token-by-token would leak
+         * the raw wire syntax. */
+        if (stream && !tools_present && !lfm_send_chunk(fd,id,"content",piece,(size_t)n)) { atomic_store(&ctx->cancel,1); break; }
         ids[np + generated++] = token;
         if (generated < max_tokens) forward(m, &token, 1, np + generated - 1, logits, 1, ctx->buffers);
     }
     if (atomic_load(&ctx->cancel)) reason = "cancelled";
-    if (stream) lfm_send_done(fd,id,np,generated,reason);
-    else {
-        LfmString body={0}; char prefix[512], suffix[512];
-        int n=snprintf(prefix,sizeof prefix,"{\"id\":\"%s\",\"object\":\"chat.completion\",\"model\":\"%s\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"",id,ctx->model_id);
-        int ok=n>0&&lfm_string_append(&body,prefix,(size_t)n)&&lfm_json_escape(&body,answer.data?answer.data:"",answer.len);
-        n=snprintf(suffix,sizeof suffix,"\"},\"finish_reason\":\"%s\"}],\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d}}",reason,np,generated,np+generated);
+    LfmToolCalls calls = {0};
+    LfmString leading = {0};
+    if (tools_present && !lfm_extract_tool_calls(answer.data ? answer.data : "", &calls, &leading)) {
+        lfm_tool_calls_free(&calls);
+        free(leading.data); leading.data = NULL; leading.len = leading.cap = 0;
+    }
+    const char *final_reason = calls.len ? "tool_calls" : reason;
+    if (stream) {
+        if (calls.len) {
+            if (leading.len) lfm_send_chunk(fd,id,"content",leading.data,leading.len);
+            lfm_send_tool_call_chunk(fd,id,&calls);
+        } else if (tools_present && answer.len) {
+            lfm_send_chunk(fd,id,"content",answer.data,answer.len);
+        }
+        lfm_send_done(fd,id,np,generated,final_reason);
+    } else {
+        LfmString body={0}; char prefix[512], suffix[256];
+        int n=snprintf(prefix,sizeof prefix,"{\"id\":\"%s\",\"object\":\"chat.completion\",\"model\":\"%s\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":",id,ctx->model_id);
+        int ok=n>0&&lfm_string_append(&body,prefix,(size_t)n);
+        if (calls.len && !leading.len) ok=ok&&lfm_string_append(&body,"null",4);
+        else {
+            ok=ok&&lfm_string_append(&body,"\"",1);
+            ok=ok&&lfm_json_escape(&body, calls.len ? leading.data : (answer.data?answer.data:""), calls.len ? leading.len : answer.len);
+            ok=ok&&lfm_string_append(&body,"\"",1);
+        }
+        if (calls.len) {
+            ok=ok&&lfm_string_append(&body,",\"tool_calls\":[",strlen(",\"tool_calls\":["));
+            for (int i=0;i<calls.len && ok;i++) {
+                char callid[80]; snprintf(callid,sizeof callid,"%s-call-%d",id,i);
+                char head[192];
+                int m2=snprintf(head,sizeof head,"%s{\"id\":\"%s\",\"type\":\"function\",\"function\":{\"name\":\"",i?",":"",callid);
+                ok = m2>0 && (size_t)m2<sizeof head && lfm_string_append(&body,head,(size_t)m2);
+                ok = ok && lfm_json_escape(&body, calls.items[i].name, strlen(calls.items[i].name));
+                ok = ok && lfm_string_append(&body,"\",\"arguments\":\"",strlen("\",\"arguments\":\""));
+                ok = ok && lfm_json_escape(&body, calls.items[i].arguments, strlen(calls.items[i].arguments));
+                ok = ok && lfm_string_append(&body,"\"}}",3);
+            }
+            ok = ok && lfm_string_append(&body,"]",1);
+        }
+        n=snprintf(suffix,sizeof suffix,"},\"finish_reason\":\"%s\"}],\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d}}",final_reason,np,generated,np+generated);
         ok=ok&&n>0&&lfm_string_append(&body,suffix,(size_t)n)&&samosa_http_headers(fd,200,"application/json",body.len,NULL)&&samosa_send_all(fd,body.data,body.len);
         free(body.data); (void)ok;
     }
+    lfm_tool_calls_free(&calls); free(leading.data);
     int final_len = np + generated;
     if (final_len > ctx->cached_cap) {
         int cap = ctx->cached_cap ? ctx->cached_cap : 256;

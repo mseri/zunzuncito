@@ -2718,13 +2718,367 @@ static int g4_append_content(G4String *dst, jval *msg) {
     return 1;
 }
 
-static int g4_build_chat_prompt(jval *messages, G4String *prompt) {
+/* Tool calling, transcribed from Gemma-4's own chat_template.jinja. This is the most
+ * idiosyncratic of the four wire formats: not JSON. Strings are quoted with the literal
+ * token <|"|>...<|"|> instead of double quotes, object keys in a *call*'s arguments are
+ * bare/unquoted (escape_keys=False), and tool declarations use their own bespoke
+ * (Gemini-style, upper-cased-type) schema notation rather than echoing the JSON schema
+ * verbatim. See g4_format_property for the declaration side and g4_parse_value for the
+ * reverse (parsing a completed call's arguments back out). */
+static int g4_is_number_literal(const char *v, size_t n) {
+    if (!n) return 0;
+    size_t i = (v[0]=='-') ? 1 : 0, digits = 0;
+    while (i<n && isdigit((unsigned char)v[i])) { i++; digits++; }
+    if (!digits) return 0;
+    if (i<n && v[i]=='.') { i++; while (i<n && isdigit((unsigned char)v[i])) i++; }
+    if (i<n && (v[i]=='e'||v[i]=='E')) { i++; if (i<n && (v[i]=='+'||v[i]=='-')) i++; while (i<n && isdigit((unsigned char)v[i])) i++; }
+    return i==n;
+}
+
+static int g4_format_parameters(G4String *out, jval *properties);
+
+static int g4_format_property(G4String *out, jval *value) {
+    #define PUT(s) do { const char *_s=(s); if(!g4_string_append(out,_s,strlen(_s))) return 0; } while(0)
+    jval *type = json_get(value, "type");
+    const char *type_str = (type && type->t == J_STR) ? type->str : "";
+    char type_upper[32]; size_t tl = strlen(type_str); if (tl >= sizeof type_upper) tl = sizeof type_upper - 1;
+    for (size_t i = 0; i < tl; i++) type_upper[i] = (char)toupper((unsigned char)type_str[i]);
+    type_upper[tl] = 0;
+    PUT("{");
+    int need_comma = 0;
+    jval *desc = json_get(value, "description");
+    if (desc && desc->t == J_STR) {
+        PUT("description:<|\"|>"); if (!g4_string_append(out, desc->str, strlen(desc->str))) return 0; PUT("<|\"|>");
+        need_comma = 1;
+    }
+    if (!strcasecmp(type_str, "string")) {
+        jval *en = json_get(value, "enum");
+        if (en && en->t == J_ARR && en->len > 0) {
+            if (need_comma && !g4_string_append(out,",",1)) return 0; need_comma = 1;
+            PUT("enum:[");
+            for (int i = 0; i < en->len; i++) {
+                if (i && !g4_string_append(out,",",1)) return 0;
+                jval *item = en->kids[i];
+                if (item->t == J_STR) { PUT("<|\"|>"); if(!g4_string_append(out,item->str,strlen(item->str))) return 0; PUT("<|\"|>"); }
+                else { jbuf jb={0}; int ok=json_encode(&jb,item)&&g4_string_append(out,jb.data?jb.data:"",jb.len); free(jb.data); if(!ok) return 0; }
+            }
+            PUT("]");
+        }
+    } else if (!strcasecmp(type_str, "array")) {
+        jval *items = json_get(value, "items");
+        if (items && items->t == J_OBJ) {
+            if (need_comma && !g4_string_append(out,",",1)) return 0; need_comma = 1;
+            PUT("items:");
+            if (!g4_format_property(out, items)) return 0;
+        }
+    } else if (!strcasecmp(type_str, "object")) {
+        jval *props = json_get(value, "properties");
+        jval *req = json_get(value, "required");
+        if (props && props->t == J_OBJ) {
+            if (need_comma && !g4_string_append(out,",",1)) return 0; need_comma = 1;
+            PUT("properties:{");
+            if (!g4_format_parameters(out, props)) return 0;
+            PUT("}");
+        }
+        if (req && req->t == J_ARR && req->len > 0) {
+            if (need_comma && !g4_string_append(out,",",1)) return 0; need_comma = 1;
+            PUT("required:[");
+            for (int i = 0; i < req->len; i++) {
+                if (i && !g4_string_append(out,",",1)) return 0;
+                jval *item = req->kids[i];
+                if (item->t == J_STR) { PUT("<|\"|>"); if(!g4_string_append(out,item->str,strlen(item->str))) return 0; PUT("<|\"|>"); }
+            }
+            PUT("]");
+        }
+    }
+    jval *nullable = json_get(value, "nullable");
+    if (nullable && nullable->t == J_BOOL && nullable->boolean) {
+        if (need_comma && !g4_string_append(out,",",1)) return 0; need_comma = 1;
+        PUT("nullable:true");
+    }
+    if (need_comma && !g4_string_append(out,",",1)) return 0;
+    PUT("type:<|\"|>"); if (!g4_string_append(out, type_upper, tl)) return 0; PUT("<|\"|>}");
+    #undef PUT
+    return 1;
+}
+
+static int g4_format_parameters(G4String *out, jval *properties) {
+    for (int i = 0; i < properties->len; i++) {
+        if (i && !g4_string_append(out, ",", 1)) return 0;
+        if (!g4_string_append(out, properties->keys[i], strlen(properties->keys[i]))) return 0;
+        if (!g4_string_append(out, ":", 1)) return 0;
+        if (!g4_format_property(out, properties->kids[i])) return 0;
+    }
+    return 1;
+}
+
+static int g4_format_function_declaration(G4String *out, jval *tool) {
+    jval *fn = json_get(tool, "function"); if (!fn) fn = tool;
+    jval *name = json_get(fn, "name");
+    jval *desc = json_get(fn, "description");
+    const char *name_str = (name && name->t == J_STR) ? name->str : "";
+    #define PUT(s) do { const char *_s=(s); if(!g4_string_append(out,_s,strlen(_s))) return 0; } while(0)
+    PUT("declaration:"); if (!g4_string_append(out,name_str,strlen(name_str))) return 0; PUT("{description:<|\"|>");
+    if (desc && desc->t == J_STR) { if (!g4_string_append(out,desc->str,strlen(desc->str))) return 0; }
+    PUT("<|\"|>");
+    jval *params = json_get(fn, "parameters");
+    if (params && params->t == J_OBJ) {
+        PUT(",parameters:{");
+        jval *props = json_get(params, "properties");
+        jval *req = json_get(params, "required");
+        jval *ptype = json_get(params, "type");
+        int need_comma = 0;
+        if (props && props->t == J_OBJ) {
+            PUT("properties:{");
+            if (!g4_format_parameters(out, props)) return 0;
+            PUT("}");
+            need_comma = 1;
+        }
+        if (req && req->t == J_ARR && req->len > 0) {
+            if (need_comma && !g4_string_append(out,",",1)) return 0; need_comma = 1;
+            PUT("required:[");
+            for (int i = 0; i < req->len; i++) {
+                if (i && !g4_string_append(out,",",1)) return 0;
+                jval *item = req->kids[i];
+                if (item->t == J_STR) { PUT("<|\"|>"); if(!g4_string_append(out,item->str,strlen(item->str))) return 0; PUT("<|\"|>"); }
+            }
+            PUT("]");
+        }
+        if (need_comma && !g4_string_append(out,",",1)) return 0;
+        const char *pt = (ptype && ptype->t == J_STR) ? ptype->str : "object";
+        char up[32]; size_t l = strlen(pt); if (l >= sizeof up) l = sizeof up - 1;
+        for (size_t i = 0; i < l; i++) up[i] = (char)toupper((unsigned char)pt[i]);
+        up[l] = 0;
+        PUT("type:<|\"|>"); if (!g4_string_append(out, up, l)) return 0; PUT("<|\"|>}");
+    }
+    PUT("}");
+    #undef PUT
+    return 1;
+}
+
+static int g4_append_arg_value(G4String *out, jval *v) {
+    if (!v || v->t == J_NULL) return 1;
+    switch (v->t) {
+        case J_STR:
+            return g4_string_append(out,"<|\"|>",5) && g4_string_append(out,v->str,strlen(v->str)) && g4_string_append(out,"<|\"|>",5);
+        case J_BOOL: return v->boolean ? g4_string_append(out,"true",4) : g4_string_append(out,"false",5);
+        case J_NUM: { char buf[64]; int n=snprintf(buf,sizeof buf,"%.17g",v->num); return n>0 && g4_string_append(out,buf,(size_t)n); }
+        case J_OBJ:
+            if (!g4_string_append(out,"{",1)) return 0;
+            for (int i=0;i<v->len;i++) {
+                if (i && !g4_string_append(out,",",1)) return 0;
+                if (!g4_string_append(out, v->keys[i], strlen(v->keys[i])) || !g4_string_append(out,":",1) ||
+                    !g4_append_arg_value(out, v->kids[i])) return 0;
+            }
+            return g4_string_append(out,"}",1);
+        case J_ARR:
+            if (!g4_string_append(out,"[",1)) return 0;
+            for (int i=0;i<v->len;i++) {
+                if (i && !g4_string_append(out,",",1)) return 0;
+                if (!g4_append_arg_value(out, v->kids[i])) return 0;
+            }
+            return g4_string_append(out,"]",1);
+        default: return 1;
+    }
+}
+
+static int g4_append_tool_calls_block(G4String *prompt, jval *tool_calls) {
+    for (int i = 0; i < tool_calls->len; i++) {
+        jval *tc = tool_calls->kids[i];
+        jval *fn = json_get(tc, "function"); if (!fn) fn = tc;
+        jval *name = json_get(fn, "name");
+        const char *name_str = (name && name->t == J_STR) ? name->str : "";
+        if (!g4_string_append(prompt, "<|tool_call>call:", strlen("<|tool_call>call:")) ||
+            !g4_string_append(prompt, name_str, strlen(name_str)) ||
+            !g4_string_append(prompt, "{", 1)) return 0;
+        jval *args_field = json_get(fn, "arguments");
+        char *arena = NULL; jval *parsed = NULL, *args_obj = NULL;
+        if (args_field && args_field->t == J_STR) { parsed = json_parse(args_field->str, &arena); if (parsed && parsed->t == J_OBJ) args_obj = parsed; }
+        else if (args_field && args_field->t == J_OBJ) args_obj = args_field;
+        int ok = 1;
+        if (args_obj) {
+            for (int k = 0; k < args_obj->len && ok; k++) {
+                if (k) ok = g4_string_append(prompt, ",", 1);
+                ok = ok && g4_string_append(prompt, args_obj->keys[k], strlen(args_obj->keys[k])) &&
+                     g4_string_append(prompt, ":", 1) && g4_append_arg_value(prompt, args_obj->kids[k]);
+            }
+        }
+        if (parsed) { json_free(parsed); free(arena); }
+        if (!ok || !g4_string_append(prompt, "}<tool_call|>", strlen("}<tool_call|>"))) return 0;
+    }
+    return 1;
+}
+
+static int g4_append_tool_response_block(G4String *prompt, const char *name, jval *tool_msg) {
+    if (!g4_string_append(prompt, "<|tool_response>response:", strlen("<|tool_response>response:")) ||
+        !g4_string_append(prompt, name, strlen(name)) ||
+        !g4_string_append(prompt, "{value:<|\"|>", strlen("{value:<|\"|>"))) return 0;
+    G4String text = {0};
+    int ok = g4_append_content(&text, tool_msg);
+    ok = ok && g4_string_append(prompt, text.data ? text.data : "", text.len);
+    free(text.data);
+    return ok && g4_string_append(prompt, "<|\"|>}<tool_response|>", strlen("<|\"|>}<tool_response|>"));
+}
+
+/* Reverse of g4_append_arg_value/g4_append_tool_calls_block: a tiny recursive-descent
+ * parser for the bespoke call-argument grammar (custom string quoting, bare
+ * true/false/numbers, {}/[] nesting with unquoted keys), emitting real JSON into `out`
+ * as it goes so the rest of the server only ever deals with JSON. */
+typedef struct { const char *p, *end; } G4Cursor;
+
+static const char *g4_find(const char *hay, const char *end, const char *needle, size_t nlen) {
+    if (!nlen || hay + nlen > end) return NULL;
+    return memmem(hay, (size_t)(end - hay), needle, nlen);
+}
+
+static void g4_skip_ws(G4Cursor *c) { while (c->p < c->end && isspace((unsigned char)*c->p)) c->p++; }
+
+static int g4_parse_value(G4Cursor *c, jbuf *out) {
+    g4_skip_ws(c);
+    if (c->p >= c->end) return jbuf_append(out, "null", 4);
+    if ((size_t)(c->end - c->p) >= 5 && !memcmp(c->p, "<|\"|>", 5)) {
+        c->p += 5;
+        const char *close = g4_find(c->p, c->end, "<|\"|>", 5);
+        if (!close) return 0;
+        int ok = json_encode_str(out, c->p, (size_t)(close - c->p));
+        c->p = close + 5;
+        return ok;
+    }
+    if (*c->p == '{') {
+        c->p++;
+        if (!jbuf_append(out, "{", 1)) return 0;
+        g4_skip_ws(c);
+        int first = 1;
+        while (c->p < c->end && *c->p != '}') {
+            if (!first && !jbuf_append(out, ",", 1)) return 0;
+            first = 0;
+            g4_skip_ws(c);
+            if ((size_t)(c->end - c->p) >= 5 && !memcmp(c->p, "<|\"|>", 5)) {
+                c->p += 5;
+                const char *kclose = g4_find(c->p, c->end, "<|\"|>", 5);
+                if (!kclose) return 0;
+                if (!json_encode_str(out, c->p, (size_t)(kclose - c->p))) return 0;
+                c->p = kclose + 5;
+                g4_skip_ws(c);
+                if (c->p >= c->end || *c->p != ':') return 0;
+                c->p++;
+            } else {
+                const char *key_start = c->p;
+                const char *colon = g4_find(c->p, c->end, ":", 1);
+                if (!colon) return 0;
+                const char *key_end = colon;
+                while (key_end > key_start && isspace((unsigned char)key_end[-1])) key_end--;
+                if (!json_encode_str(out, key_start, (size_t)(key_end - key_start))) return 0;
+                c->p = colon + 1;
+            }
+            if (!jbuf_append(out, ":", 1)) return 0;
+            if (!g4_parse_value(c, out)) return 0;
+            g4_skip_ws(c);
+            if (c->p < c->end && *c->p == ',') { c->p++; g4_skip_ws(c); }
+        }
+        if (c->p < c->end && *c->p == '}') c->p++;
+        return jbuf_append(out, "}", 1);
+    }
+    if (*c->p == '[') {
+        c->p++;
+        if (!jbuf_append(out, "[", 1)) return 0;
+        g4_skip_ws(c);
+        int first = 1;
+        while (c->p < c->end && *c->p != ']') {
+            if (!first && !jbuf_append(out, ",", 1)) return 0;
+            first = 0;
+            if (!g4_parse_value(c, out)) return 0;
+            g4_skip_ws(c);
+            if (c->p < c->end && *c->p == ',') { c->p++; g4_skip_ws(c); }
+        }
+        if (c->p < c->end && *c->p == ']') c->p++;
+        return jbuf_append(out, "]", 1);
+    }
+    const char *tok_start = c->p;
+    while (c->p < c->end && *c->p != ',' && *c->p != '}' && *c->p != ']') c->p++;
+    const char *tok_end = c->p;
+    while (tok_end > tok_start && isspace((unsigned char)tok_end[-1])) tok_end--;
+    size_t tn = (size_t)(tok_end - tok_start);
+    if (tn == 4 && !strncmp(tok_start,"true",4)) return jbuf_append(out,"true",4);
+    if (tn == 5 && !strncmp(tok_start,"false",5)) return jbuf_append(out,"false",5);
+    if (tn == 4 && !strncmp(tok_start,"null",4)) return jbuf_append(out,"null",4);
+    if (g4_is_number_literal(tok_start, tn)) return jbuf_append(out, tok_start, tn);
+    return json_encode_str(out, tok_start, tn);
+}
+
+typedef struct { char *name; char *arguments; } G4ToolCall;
+typedef struct { G4ToolCall *items; int len, cap; } G4ToolCalls;
+
+static int g4_tool_calls_push(G4ToolCalls *calls, const char *name, size_t name_len,
+                              const char *args, size_t args_len) {
+    if (calls->len == calls->cap) {
+        int cap = calls->cap ? calls->cap * 2 : 4;
+        G4ToolCall *items = realloc(calls->items, sizeof *items * (size_t)cap);
+        if (!items) return 0;
+        calls->items = items; calls->cap = cap;
+    }
+    char *n = malloc(name_len + 1), *a = malloc(args_len + 1);
+    if (!n || !a) { free(n); free(a); return 0; }
+    memcpy(n, name, name_len); n[name_len] = 0;
+    memcpy(a, args, args_len); a[args_len] = 0;
+    calls->items[calls->len].name = n; calls->items[calls->len].arguments = a;
+    calls->len++;
+    return 1;
+}
+
+static void g4_tool_calls_free(G4ToolCalls *calls) {
+    for (int i = 0; i < calls->len; i++) { free(calls->items[i].name); free(calls->items[i].arguments); }
+    free(calls->items); calls->items = NULL; calls->len = calls->cap = 0;
+}
+
+static int g4_extract_tool_calls(const char *text, G4ToolCalls *calls, G4String *leading) {
+    const char *open_tag = "<|tool_call>call:", *close_tag = "<tool_call|>";
+    size_t open_len = strlen(open_tag), close_len = strlen(close_tag);
+    const char *first = strstr(text, open_tag);
+    size_t lead_len = first ? (size_t)(first - text) : strlen(text);
+    if (lead_len && !g4_string_append(leading, text, lead_len)) return 0;
+    while (first) {
+        const char *name_start = first + open_len;
+        const char *block_end = strstr(name_start, close_tag);
+        if (!block_end) break;
+        const char *brace = memchr(name_start, '{', (size_t)(block_end - name_start));
+        const char *name_end = brace ? brace : block_end;
+        while (name_end > name_start && isspace((unsigned char)name_end[-1])) name_end--;
+        jbuf args_jb = {0};
+        int ok;
+        if (brace) { G4Cursor cur = { brace, block_end }; ok = g4_parse_value(&cur, &args_jb); }
+        else ok = jbuf_append(&args_jb, "{}", 2);
+        if (ok) ok = g4_tool_calls_push(calls, name_start, (size_t)(name_end - name_start), args_jb.data ? args_jb.data : "{}", args_jb.len);
+        free(args_jb.data);
+        if (!ok) return 0;
+        first = strstr(block_end + close_len, open_tag);
+    }
+    return 1;
+}
+
+static int g4_build_chat_prompt(jval *messages, G4String *prompt, jval *tools) {
     if (!messages || messages->t != J_ARR) return 0;
     if (!g4_string_append(prompt, "<bos>", 5)) return 0;
-    for (int i = 0; i < messages->len; i++) {
+    int has_tools = tools && tools->t == J_ARR && tools->len > 0;
+    jval *first_role = messages->len > 0 ? g4_json_field(messages->kids[0], "role", J_STR) : NULL;
+    int first_is_system = first_role && !strcmp(first_role->str, "system") && g4_msg_has_text(messages->kids[0]);
+    if (has_tools) {
+        if (!g4_string_append(prompt, "<|turn>system\\n", strlen("<|turn>system\\n"))) return 0;
+        if (first_is_system && !g4_append_content(prompt, messages->kids[0])) return 0;
+        for (int i = 0; i < tools->len; i++) {
+            if (!g4_string_append(prompt, "<|tool>", strlen("<|tool>")) ||
+                !g4_format_function_declaration(prompt, tools->kids[i]) ||
+                !g4_string_append(prompt, "<tool|>", strlen("<tool|>"))) return 0;
+        }
+        if (!g4_string_append(prompt, "<turn|>\\n", strlen("<turn|>\\n"))) return 0;
+    }
+    for (int i = (has_tools && first_is_system) ? 1 : 0; i < messages->len; i++) {
         jval *message = messages->kids[i];
         jval *role = g4_json_field(message, "role", J_STR);
-        if (!role || !g4_msg_has_text(message)) continue;
+        if (!role || !strcmp(role->str, "tool")) continue;   /* absorbed by the preceding assistant turn below */
+        jval *tool_calls = g4_json_field(message, "tool_calls", J_ARR);
+        int has_calls = tool_calls && tool_calls->len > 0 && !strcmp(role->str, "assistant");
+        if (!g4_msg_has_text(message) && !has_calls) continue;
         if (!strcmp(role->str, "system")) {
             if (!g4_string_append(prompt, "<|turn>system\\n", strlen("<|turn>system\\n")) ||
                             !g4_append_content(prompt, message) ||
@@ -2735,8 +3089,34 @@ static int g4_build_chat_prompt(jval *messages, G4String *prompt) {
                             !g4_string_append(prompt, "<turn|>\\n", strlen("<turn|>\\n"))) return 0;
         } else if (!strcmp(role->str, "assistant")) {
             if (!g4_string_append(prompt, "<|turn>model\\n", strlen("<|turn>model\\n")) ||
-                            !g4_append_content(prompt, message) ||
-                            !g4_string_append(prompt, "<turn|>\\n", strlen("<turn|>\\n"))) return 0;
+                            !g4_append_content(prompt, message)) return 0;
+            if (has_calls) {
+                if (!g4_append_tool_calls_block(prompt, tool_calls)) return 0;
+                int j = i + 1;
+                while (j < messages->len) {
+                    jval *next_role = g4_json_field(messages->kids[j], "role", J_STR);
+                    if (!next_role || strcmp(next_role->str, "tool")) break;
+                    jval *tool_msg = messages->kids[j];
+                    jval *call_id = json_get(tool_msg, "tool_call_id");
+                    const char *name_str = "unknown";
+                    if (call_id && call_id->t == J_STR) {
+                        for (int k = 0; k < tool_calls->len; k++) {
+                            jval *tc = tool_calls->kids[k];
+                            jval *tcid = json_get(tc, "id");
+                            if (tcid && tcid->t == J_STR && !strcmp(tcid->str, call_id->str)) {
+                                jval *fn = json_get(tc, "function"); if (!fn) fn = tc;
+                                jval *nm = json_get(fn, "name");
+                                if (nm && nm->t == J_STR) name_str = nm->str;
+                                break;
+                            }
+                        }
+                    }
+                    if (!g4_append_tool_response_block(prompt, name_str, tool_msg)) return 0;
+                    j++;
+                }
+                i = j - 1;
+            }
+            if (!g4_string_append(prompt, "<turn|>\\n", strlen("<turn|>\\n"))) return 0;
         }
     }
     return g4_string_append(prompt, "<|turn>model\\n<|channel>thought\\n<channel|>", strlen("<|turn>model\\n<|channel>thought\\n<channel|>"));
@@ -2768,6 +3148,33 @@ static int g4_send_done(int fd, const char *id, int prompt_tokens, int completio
     return n > 0 && (size_t)n < sizeof event && samosa_send_all(fd, event, (size_t)n);
 }
 
+static int g4_send_tool_call_chunk(int fd, const char *id, G4ToolCalls *calls) {
+    G4String out = {0};
+    const char *prefix = "data: {\"id\":\"";
+    const char *middle = "\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[";
+    const char *tail = "]},\"finish_reason\":null}]}\n\n";
+    int ok = g4_string_append(&out,prefix,strlen(prefix)) && g4_json_escape(&out,id,strlen(id)) &&
+             g4_string_append(&out,middle,strlen(middle));
+    for (int i = 0; i < calls->len && ok; i++) {
+        char callid[80]; snprintf(callid,sizeof callid,"%s-call-%d",id,i);
+        char head[192];
+        int n = snprintf(head,sizeof head,
+            "%s{\"index\":%d,\"id\":\"%s\",\"type\":\"function\",\"function\":{\"name\":\"",
+            i ? "," : "", i, callid);
+        ok = n > 0 && (size_t)n < sizeof head && g4_string_append(&out,head,(size_t)n);
+        ok = ok && g4_json_escape(&out, calls->items[i].name, strlen(calls->items[i].name));
+        const char *between = "\",\"arguments\":\"";
+        ok = ok && g4_string_append(&out, between, strlen(between));
+        ok = ok && g4_json_escape(&out, calls->items[i].arguments, strlen(calls->items[i].arguments));
+        const char *close = "\"}}";
+        ok = ok && g4_string_append(&out, close, strlen(close));
+    }
+    ok = ok && g4_string_append(&out, tail, strlen(tail));
+    if (ok) ok = samosa_send_all(fd, out.data, out.len);
+    free(out.data);
+    return ok;
+}
+
 static int g4_serve_chat(G4ServerContext *ctx, int fd, jval *root) {
     jval *messages = g4_json_field(root, "messages", J_ARR);
     int has_user = 0;
@@ -2778,6 +3185,8 @@ static int g4_serve_chat(G4ServerContext *ctx, int fd, jval *root) {
         if (role && !strcmp(role->str,"user") && g4_msg_has_text(msg)) has_user = 1;
     }
     if (!has_user) return samosa_http_json_error(fd,400,"invalid_messages","A text user message is required.");
+    jval *tools = g4_json_field(root, "tools", J_ARR);
+    int tools_present = tools && tools->len > 0;
 
     int stream = 0, max_tokens = 2048, topk = 64, seed = 0;
     float temperature = 1.0f, topp = 0.95f;
@@ -2815,7 +3224,7 @@ static int g4_serve_chat(G4ServerContext *ctx, int fd, jval *root) {
 
     M *m = ctx->model; Cfg *c = &m->c;
     G4String prompt = {0};
-    if (!g4_build_chat_prompt(messages, &prompt)) {
+    if (!g4_build_chat_prompt(messages, &prompt, tools)) {
         free(prompt.data);
         return samosa_http_json_error(fd,400,"invalid_prompt","Unable to construct the chat prompt.");
     }
@@ -2856,20 +3265,58 @@ static int g4_serve_chat(G4ServerContext *ctx, int fd, jval *root) {
         char piece[4096]; int n = g4tok_decode(tok, &token, 1, piece, sizeof piece - 1);
         if (n <= 0) { reason = "stop"; break; }
         if (!g4_string_append(&answer, piece, (size_t)n)) { atomic_store(&ctx->cancel,1); break; }
-        if (stream && !g4_send_chunk(fd,id,"content",piece,(size_t)n)) { atomic_store(&ctx->cancel,1); break; }
+        /* With tools in play, the answer is buffered whole and scanned for
+         * <|tool_call> blocks below -- streaming it token-by-token would leak the raw
+         * wire syntax (including the <|"|> string-quote tokens) into the client. */
+        if (stream && !tools_present && !g4_send_chunk(fd,id,"content",piece,(size_t)n)) { atomic_store(&ctx->cancel,1); break; }
         ids[np + generated++] = token;
         if (generated < max_tokens) forward(m, &token, 1, np + generated - 1, logits, 1, ctx->buffers);
     }
     if (atomic_load(&ctx->cancel)) reason = "cancelled";
-    if (stream) g4_send_done(fd,id,np,generated,reason);
-    else {
-        G4String body={0}; char prefix[512], suffix[512];
-        int n=snprintf(prefix,sizeof prefix,"{\"id\":\"%s\",\"object\":\"chat.completion\",\"model\":\"%s\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"",id,ctx->model_id);
-        int ok=n>0&&g4_string_append(&body,prefix,(size_t)n)&&g4_json_escape(&body,answer.data?answer.data:"",answer.len);
-        n=snprintf(suffix,sizeof suffix,"\"},\"finish_reason\":\"%s\"}],\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d}}",reason,np,generated,np+generated);
+    G4ToolCalls calls = {0};
+    G4String leading = {0};
+    if (tools_present && !g4_extract_tool_calls(answer.data ? answer.data : "", &calls, &leading)) {
+        g4_tool_calls_free(&calls);
+        free(leading.data); leading.data = NULL; leading.len = leading.cap = 0;
+    }
+    const char *final_reason = calls.len ? "tool_calls" : reason;
+    if (stream) {
+        if (calls.len) {
+            if (leading.len) g4_send_chunk(fd,id,"content",leading.data,leading.len);
+            g4_send_tool_call_chunk(fd,id,&calls);
+        } else if (tools_present && answer.len) {
+            g4_send_chunk(fd,id,"content",answer.data,answer.len);
+        }
+        g4_send_done(fd,id,np,generated,final_reason);
+    } else {
+        G4String body={0}; char prefix[512], suffix[256];
+        int n=snprintf(prefix,sizeof prefix,"{\"id\":\"%s\",\"object\":\"chat.completion\",\"model\":\"%s\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":",id,ctx->model_id);
+        int ok=n>0&&g4_string_append(&body,prefix,(size_t)n);
+        if (calls.len && !leading.len) ok=ok&&g4_string_append(&body,"null",4);
+        else {
+            ok=ok&&g4_string_append(&body,"\"",1);
+            ok=ok&&g4_json_escape(&body, calls.len ? leading.data : (answer.data?answer.data:""), calls.len ? leading.len : answer.len);
+            ok=ok&&g4_string_append(&body,"\"",1);
+        }
+        if (calls.len) {
+            ok=ok&&g4_string_append(&body,",\"tool_calls\":[",strlen(",\"tool_calls\":["));
+            for (int i=0;i<calls.len && ok;i++) {
+                char callid[80]; snprintf(callid,sizeof callid,"%s-call-%d",id,i);
+                char head[192];
+                int m2=snprintf(head,sizeof head,"%s{\"id\":\"%s\",\"type\":\"function\",\"function\":{\"name\":\"",i?",":"",callid);
+                ok = m2>0 && (size_t)m2<sizeof head && g4_string_append(&body,head,(size_t)m2);
+                ok = ok && g4_json_escape(&body, calls.items[i].name, strlen(calls.items[i].name));
+                ok = ok && g4_string_append(&body,"\",\"arguments\":\"",strlen("\",\"arguments\":\""));
+                ok = ok && g4_json_escape(&body, calls.items[i].arguments, strlen(calls.items[i].arguments));
+                ok = ok && g4_string_append(&body,"\"}}",3);
+            }
+            ok = ok && g4_string_append(&body,"]",1);
+        }
+        n=snprintf(suffix,sizeof suffix,"},\"finish_reason\":\"%s\"}],\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d}}",final_reason,np,generated,np+generated);
         ok=ok&&n>0&&g4_string_append(&body,suffix,(size_t)n)&&samosa_http_headers(fd,200,"application/json",body.len,NULL)&&samosa_send_all(fd,body.data,body.len);
         free(body.data); (void)ok;
     }
+    g4_tool_calls_free(&calls); free(leading.data);
     int final_len = np + generated;
     if (generated > 0)
         forward(m, &ids[final_len - 1], 1, final_len - 1, logits, 1, ctx->buffers);
