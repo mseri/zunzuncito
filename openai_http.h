@@ -15,6 +15,7 @@
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <time.h>
 
 #define SAMOSA_HTTP_MAX_HEADER (64u << 10)
 #define SAMOSA_HTTP_MAX_BODY (4u << 20)
@@ -43,6 +44,21 @@ typedef struct SamosaHttpServer {
 
 static __thread int samosa_last_status = 0;
 static __thread const SamosaHttpRequest *samosa_current_request = NULL;
+
+static double samosa_now(void) {
+    struct timeval tv; gettimeofday(&tv,NULL);
+    return (double)tv.tv_sec + tv.tv_usec*1e-6;
+}
+
+/* "HH:MM:SS.mmm" -- the date is in the shell scrollback already; what a log reader wants
+ * here is where a request sits relative to the one before it. */
+static const char *samosa_stamp(char out[16]) {
+    struct timeval tv; gettimeofday(&tv,NULL);
+    struct tm tm; localtime_r(&tv.tv_sec,&tm);
+    snprintf(out,16,"%02d:%02d:%02d.%03d",tm.tm_hour,tm.tm_min,tm.tm_sec,
+             (int)(tv.tv_usec/1000));
+    return out;
+}
 
 static int samosa_send_all(int fd, const void *data, size_t size) {
     const char *cursor=(const char *)data;
@@ -78,10 +94,25 @@ static const char *samosa_http_reason(int status) {
  * apart, and the point of this log is to see the response as it happens. */
 static void samosa_log_status(int status) {
     samosa_last_status = status;
+    char stamp[16];
     if (samosa_current_request)
-        fprintf(stderr,"[server] %s %s -> %d\n",samosa_current_request->method,samosa_current_request->path,status);
+        fprintf(stderr,"%s %s %s -> %d\n",samosa_stamp(stamp),samosa_current_request->method,samosa_current_request->path,status);
     else
-        fprintf(stderr,"[server] -> %d\n",status);
+        fprintf(stderr,"%s -> %d\n",samosa_stamp(stamp),status);
+    fflush(stderr);
+}
+
+/* Throughput of the completion that just finished. Separate from the status line because
+ * on a streamed response the status goes out before a single token exists. */
+static void samosa_log_generation(int prompt_tokens, double prefill_seconds,
+                                  int completion_tokens, double decode_seconds) {
+    char stamp[16];
+    fprintf(stderr,"%s prefill %d tok in %.2fs (%.1f tok/s), gen %d tok in %.2fs (%.1f tok/s)\n",
+            samosa_stamp(stamp),
+            prompt_tokens, prefill_seconds,
+            prefill_seconds>0 ? prompt_tokens/prefill_seconds : 0.0,
+            completion_tokens, decode_seconds,
+            decode_seconds>0 ? completion_tokens/decode_seconds : 0.0);
     fflush(stderr);
 }
 
@@ -285,7 +316,8 @@ static void *samosa_http_connection_main(void *opaque) {
     }
     else {
         samosa_current_request=&request;
-        fprintf(stderr,"[server] %s %s\n",request.method,request.path); fflush(stderr);
+        { char stamp[16];
+          fprintf(stderr,"%s %s %s\n",samosa_stamp(stamp),request.method,request.path); fflush(stderr); }
         server->handler(server,fd,&request,server->handler_ctx);
         samosa_current_request=NULL;
         free(request.body);

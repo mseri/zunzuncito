@@ -2591,11 +2591,18 @@ static int ling_serve_chat(LingServerContext *ctx, int fd, jval *root) {
      * need position np-1 replayed -- is reprocessed from scratch. */
     int common = 0;
     while (common < ctx->cached_len && common < np && ctx->cached_ids[common] == ids[common]) common++;
-    if (common > 0 && common == ctx->cached_len && common == m->rec_pos && common < np)
+    /* Timed over the tokens actually pushed through the model, so a prompt served mostly
+     * from the cached prefix does not report an inflated prefill rate. */
+    int prefilled = np; double t_prefill = samosa_now();
+    if (common > 0 && common == ctx->cached_len && common == m->rec_pos && common < np) {
+        prefilled = np - common;
         forward(m, ids + common, np - common, common, logits, 1, ctx->buffers);
+    }
     else
         forward(m, ids, np, 0, logits, 1, ctx->buffers);
+    t_prefill = samosa_now() - t_prefill;
     samosa_keepalive_stop(&keepalive);
+    double t_decode = samosa_now();
 
     LingString answer = {0}, reasoning = {0};
     size_t sent = 0; int saw_tool_tag = 0;   /* tools_present streaming, see below */
@@ -2638,6 +2645,7 @@ static int ling_serve_chat(LingServerContext *ctx, int fd, jval *root) {
             if (!tools_present && answer.len > was_c) ling_send_chunk(fd,id,"content",answer.data+was_c,answer.len-was_c);
         }
     }
+    t_decode = samosa_now() - t_decode;
     if (atomic_load(&ctx->cancel)) reason = "cancelled";
     OaiToolCalls calls = {0};
     LingString leading = {0};
@@ -2685,6 +2693,7 @@ static int ling_serve_chat(LingServerContext *ctx, int fd, jval *root) {
         ok=ok&&n>0&&ling_string_append(&body,suffix,(size_t)n)&&samosa_http_headers(fd,200,"application/json",body.len,NULL)&&samosa_send_all(fd,body.data,body.len);
         free(body.data); (void)ok;
     }
+    samosa_log_generation(prefilled, t_prefill, generated, t_decode);
     oai_tool_calls_free(&calls); free(leading.data);
     int final_len = np + generated;
     if (final_len > ctx->cached_cap) {
@@ -2736,7 +2745,7 @@ static int run_ling_server(M *m, Buf *buffers, LfmTok *tokenizer, const char *mo
     pthread_mutex_init(&ctx.generation_mu,NULL); atomic_init(&ctx.cancel,0);
     SamosaHttpServer server;
     if (!samosa_http_server_init(&server,port,ling_serve_handler,&ctx)) { fprintf(stderr,"server: cannot bind port %d: %s\n",port,strerror(errno)); pthread_mutex_destroy(&ctx.generation_mu); return 1; }
-    fprintf(stderr,"[server] OpenAI endpoint ready at http://127.0.0.1:%d\n",server.port); fflush(stderr);
+    fprintf(stderr,"OpenAI endpoint ready at http://127.0.0.1:%d\n",server.port); fflush(stderr);
     int ok=samosa_http_server_run(&server); samosa_http_server_destroy(&server);
     free(ctx.cached_ids); pthread_mutex_destroy(&ctx.generation_mu); return ok?0:1;
 }
