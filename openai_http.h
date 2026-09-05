@@ -42,6 +42,7 @@ typedef struct SamosaHttpServer {
 } SamosaHttpServer;
 
 static __thread int samosa_last_status = 0;
+static __thread const SamosaHttpRequest *samosa_current_request = NULL;
 
 static int samosa_send_all(int fd, const void *data, size_t size) {
     const char *cursor=(const char *)data;
@@ -72,9 +73,21 @@ static const char *samosa_http_reason(int status) {
     }
 }
 
+/* Logs the moment a status actually goes out on the wire, not when the handler that
+ * produced it eventually returns -- for a streamed completion those can be minutes
+ * apart, and the point of this log is to see the response as it happens. */
+static void samosa_log_status(int status) {
+    samosa_last_status = status;
+    if (samosa_current_request)
+        fprintf(stderr,"[server] %s %s -> %d\n",samosa_current_request->method,samosa_current_request->path,status);
+    else
+        fprintf(stderr,"[server] -> %d\n",status);
+    fflush(stderr);
+}
+
 static int samosa_http_headers(int fd, int status, const char *content_type,
                                size_t content_length, const char *extra) {
-    samosa_last_status = status;
+    samosa_log_status(status);
     char header[2048];
     int n=snprintf(header,sizeof(header),
         "HTTP/1.1 %d %s\r\n"
@@ -108,7 +121,7 @@ static int samosa_http_json_error(int fd, int status, const char *code,
 }
 
 static int samosa_http_stream_headers(int fd) {
-    samosa_last_status = 200;
+    samosa_log_status(200);
     const char *header=
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: text/event-stream; charset=utf-8\r\n"
@@ -193,7 +206,10 @@ static void *samosa_http_connection_main(void *opaque) {
         samosa_http_json_error(fd,error_status,"invalid_http_request",
                                "Invalid or oversized HTTP request.");
     else {
+        samosa_current_request=&request;
+        fprintf(stderr,"[server] %s %s\n",request.method,request.path); fflush(stderr);
         server->handler(server,fd,&request,server->handler_ctx);
+        samosa_current_request=NULL;
         free(request.body);
     }
     close(fd);

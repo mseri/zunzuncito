@@ -2601,8 +2601,12 @@ static int lfm_serve_chat(LfmServerContext *ctx, int fd, jval *root) {
     jval *v = json_get(root,"stream"); if (v && v->t == J_BOOL) stream = v->boolean;
     v = json_get(root,"max_tokens"); if (!v) v = json_get(root,"max_completion_tokens");
     if (v) {
-        if (v->t != J_NUM || v->num < 1 || v->num > 8192 || floor(v->num) != v->num)
-            return samosa_http_json_error(fd,400,"invalid_max_tokens","max_tokens must be an integer in 1..8192.");
+        /* Upper bound is generous and unrelated to this model's context: clients
+         * routinely pass a large budget expecting the server to clamp it, rather than
+         * sizing it to whatever context the server happens to be running with. It is
+         * clamped to what actually fits once the prompt length (np) is known below. */
+        if (v->t != J_NUM || v->num < 1 || v->num > 1000000 || floor(v->num) != v->num)
+            return samosa_http_json_error(fd,400,"invalid_max_tokens","max_tokens must be a positive integer.");
         max_tokens = (int)v->num;
     }
     v = json_get(root,"temperature");
@@ -2752,7 +2756,7 @@ static int lfm_serve_chat(LfmServerContext *ctx, int fd, jval *root) {
     free(answer.data); pthread_mutex_unlock(&ctx->generation_mu); free(ids); free(logits); free(pbuf); free(seen); return 0;
 }
 
-static int lfm_serve_dispatch(SamosaHttpServer *server, int fd, const SamosaHttpRequest *request, void *opaque) {
+static int lfm_serve_handler(SamosaHttpServer *server, int fd, const SamosaHttpRequest *request, void *opaque) {
     LfmServerContext *ctx = opaque;
     if (!strcmp(request->method,"GET") && !strcmp(request->path,"/healthz"))
         return samosa_http_response(fd,200,"application/json","{\"status\":\"ok\"}",NULL);
@@ -2771,9 +2775,7 @@ static int lfm_serve_dispatch(SamosaHttpServer *server, int fd, const SamosaHttp
         return samosa_http_response(fd,200,"application/json",body,NULL);
     }
     if (!strcmp(request->method,"GET") && !strcmp(request->path,"/models/sse")) {
-        /* Not a router: there is nothing to notify. Hold the stream open (as llama.cpp's
-         * router does between events) so clients that watch for model-status changes
-         * block here instead of hammering us with reconnects. */
+        /* Not a router: nothing to notify. Hold the stream open so status-watching clients block here instead of reconnecting in a loop. */
         if (!samosa_http_stream_headers(fd)) return 0;
         char buf[256];
         while (!atomic_load(&server->stopping)) {
@@ -2809,13 +2811,6 @@ static int lfm_serve_dispatch(SamosaHttpServer *server, int fd, const SamosaHttp
         atomic_store(&ctx->cancel,1); samosa_http_response(fd,200,"application/json","{\"shutting_down\":true}",NULL); samosa_http_server_stop(server); return 1;
     }
     return samosa_http_json_error(fd,404,"not_found","Endpoint not found.");
-}
-
-static int lfm_serve_handler(SamosaHttpServer *server, int fd, const SamosaHttpRequest *request, void *opaque) {
-    samosa_last_status = 0;
-    int rc = lfm_serve_dispatch(server, fd, request, opaque);
-    fprintf(stderr,"[server] %s %s -> %d\n",request->method,request->path,samosa_last_status); fflush(stderr);
-    return rc;
 }
 
 static int run_lfm_server(M *m, Buf *buffers, LfmTok *tokenizer, const char *model_id, int port) {

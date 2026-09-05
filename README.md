@@ -196,6 +196,12 @@ When running with `--serve`:
   - `maple` $\rightarrow$ `"id": "maple-preview"`
   - `ling` $\rightarrow$ `"id": "ling-3.0-tiny"`
 - `POST /v1/chat/completions` — Handles chat requests (supports both standard JSON and `stream: true` Server-Sent Events). `content` may be a plain string or an array of `{"type":"text","text":...}` parts (non-text parts, e.g. images, are ignored).
+  - All four models support OpenAI-style function calling (`tools`, `tool_calls`, `role: "tool"` results), each transcribed from that model's own chat template — none of them share a wire format:
+    - `ling` — XML `<tool_call>{name}<arg_key>k</arg_key><arg_value>v</arg_value>...</tool_call>`, results as a dedicated `<role>OBSERVATION</role>` turn.
+    - `maple` — JSON inside `<tool_call>{"name":...,"arguments":{...}}</tool_call>`, results replayed as a `user` turn holding `<tool_response>` blocks.
+    - `lfm25` — Python-call syntax `<|tool_call_start|>[name(key='val', key2=42), ...]<|tool_call_end|>`; tool results have no special wrapper (`role: "tool"` renders like any other turn).
+    - `gemma4` — Google's own non-JSON notation, `<|tool_call>call:name{key:value,...}<tool_call|>` with `<|"|>...<|"|>`-quoted strings; results are inlined into the same turn as `<|tool_response>` blocks instead of a separate turn. Tool *declarations* get re-derived from the incoming JSON schema into Gemini's uppercase-typed notation, so exotic schemas (deeply nested `items`, `response` schemas) may not translate perfectly.
+  - When `tools` is present, the response is buffered rather than streamed token-by-token, so raw wire syntax never leaks into a client's rendered content; `finish_reason` becomes `"tool_calls"` when the model actually calls one.
 - `GET /props` — llama.cpp-compatible server properties (context size, model alias, etc.), for clients that probe it before issuing requests.
 - `POST /props` — Always returns `501 not_supported_error`; this server has no mutable global properties.
 - `GET /models` — llama.cpp router-style catalog, always reporting the single loaded model (used by clients, e.g. the `pi` coding agent, that check model status before routing requests).

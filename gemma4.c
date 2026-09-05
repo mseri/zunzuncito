@@ -2718,13 +2718,12 @@ static int g4_append_content(G4String *dst, jval *msg) {
     return 1;
 }
 
-/* Tool calling, transcribed from Gemma-4's own chat_template.jinja. This is the most
+/* Tool calling, transcribed from Gemma-4's chat_template.jinja. This is the most
  * idiosyncratic of the four wire formats: not JSON. Strings are quoted with the literal
- * token <|"|>...<|"|> instead of double quotes, object keys in a *call*'s arguments are
- * bare/unquoted (escape_keys=False), and tool declarations use their own bespoke
- * (Gemini-style, upper-cased-type) schema notation rather than echoing the JSON schema
- * verbatim. See g4_format_property for the declaration side and g4_parse_value for the
- * reverse (parsing a completed call's arguments back out). */
+ * token <|"|>...<|"|> instead of double quotes, a call's argument keys are bare/unquoted
+ * (escape_keys=False), and tool declarations use a Gemini-style, upper-cased-type schema
+ * notation rather than the JSON schema verbatim. See g4_format_property for the
+ * declaration side and g4_parse_value for the reverse (parsing a call back out). */
 static int g4_is_number_literal(const char *v, size_t n) {
     if (!n) return 0;
     size_t i = (v[0]=='-') ? 1 : 0, digits = 0;
@@ -3193,8 +3192,12 @@ static int g4_serve_chat(G4ServerContext *ctx, int fd, jval *root) {
     jval *v = json_get(root,"stream"); if (v && v->t == J_BOOL) stream = v->boolean;
     v = json_get(root,"max_tokens"); if (!v) v = json_get(root,"max_completion_tokens");
     if (v) {
-        if (v->t != J_NUM || v->num < 1 || v->num > 8192 || floor(v->num) != v->num)
-            return samosa_http_json_error(fd,400,"invalid_max_tokens","max_tokens must be an integer in 1..8192.");
+        /* Upper bound is generous and unrelated to this model's context: clients
+         * routinely pass a large budget expecting the server to clamp it, rather than
+         * sizing it to whatever context the server happens to be running with. It is
+         * clamped to what actually fits once the prompt length (np) is known below. */
+        if (v->t != J_NUM || v->num < 1 || v->num > 1000000 || floor(v->num) != v->num)
+            return samosa_http_json_error(fd,400,"invalid_max_tokens","max_tokens must be a positive integer.");
         max_tokens = (int)v->num;
     }
     v = json_get(root,"temperature");
@@ -3333,7 +3336,7 @@ static int g4_serve_chat(G4ServerContext *ctx, int fd, jval *root) {
     free(answer.data); pthread_mutex_unlock(&ctx->generation_mu); free(ids); free(logits); free(pbuf); return 0;
 }
 
-static int g4_serve_dispatch(SamosaHttpServer *server, int fd, const SamosaHttpRequest *request, void *opaque) {
+static int g4_serve_handler(SamosaHttpServer *server, int fd, const SamosaHttpRequest *request, void *opaque) {
     G4ServerContext *ctx = opaque;
     if (!strcmp(request->method,"GET") && !strcmp(request->path,"/healthz"))
         return samosa_http_response(fd,200,"application/json","{\"status\":\"ok\"}",NULL);
@@ -3352,9 +3355,7 @@ static int g4_serve_dispatch(SamosaHttpServer *server, int fd, const SamosaHttpR
         return samosa_http_response(fd,200,"application/json",body,NULL);
     }
     if (!strcmp(request->method,"GET") && !strcmp(request->path,"/models/sse")) {
-        /* Not a router: there is nothing to notify. Hold the stream open (as llama.cpp's
-         * router does between events) so clients that watch for model-status changes
-         * block here instead of hammering us with reconnects. */
+        /* Not a router: nothing to notify. Hold the stream open so status-watching clients block here instead of reconnecting in a loop. */
         if (!samosa_http_stream_headers(fd)) return 0;
         char buf[256];
         while (!atomic_load(&server->stopping)) {
@@ -3390,13 +3391,6 @@ static int g4_serve_dispatch(SamosaHttpServer *server, int fd, const SamosaHttpR
         atomic_store(&ctx->cancel,1); samosa_http_response(fd,200,"application/json","{\"shutting_down\":true}",NULL); samosa_http_server_stop(server); return 1;
     }
     return samosa_http_json_error(fd,404,"not_found","Endpoint not found.");
-}
-
-static int g4_serve_handler(SamosaHttpServer *server, int fd, const SamosaHttpRequest *request, void *opaque) {
-    samosa_last_status = 0;
-    int rc = g4_serve_dispatch(server, fd, request, opaque);
-    fprintf(stderr,"[server] %s %s -> %d\n",request->method,request->path,samosa_last_status); fflush(stderr);
-    return rc;
 }
 
 static int run_g4_server(M *m, Buf *buffers, G4Tok *tokenizer, const char *model_id, int port) {
