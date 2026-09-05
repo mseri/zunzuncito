@@ -4,23 +4,18 @@
 
 Instead of relying on the OS page cache, zunzuncito streams routed experts directly from disk using an expert-granular cache. Dense weights and hot experts remain in memory, while inactive experts are streamed as needed.
 
-Pre-converted model weights and containers are available on Hugging Face:
-👉 **[https://huggingface.co/mseri](https://huggingface.co/mseri)**
+Ready-made containers and converted weights are published at [huggingface.co/mseri](https://huggingface.co/mseri), pre-configured for 4Gb of RAM and 4096 token of context (this can be changed at runtime using the flags described later in this README).
 
----
+## Supported models
 
-## Supported Models & Binaries
+| Program | Model ID from `/v1/models` | Shape and extras |
+|---|---|---|
+| `gemma4` | `gemma-4-26b-a4b` | Gemma-4 26B-A4B; 30 attention layers, 128 experts per layer, top-8 routing; MTP and DFlash drafting |
+| `lfm25` | `lfm2.5-8b-a1b` | LFM2.5-8B-A1B; 18 short-convolution layers plus 6 attention layers, 32 experts per layer; DSpark drafting |
+| `maple` | `maple-preview` | Maple-preview 20B-A1B; native ternary `tq2` weights, 256 experts per layer, sliding and full attention |
+| `ling` | `ling-3.0-tiny` | Ling-3.0-tiny 7.9B-A1.3B; 3:1 KDA/MLA mix, 128 routed experts plus one shared expert per layer, absorbed MLA cache |
 
-| Executable | Target Architecture | Model `id` (`/v1/models`) | Key Features |
-|---|---|---|---|
-| `gemma4` | **Gemma-4 26B-A4B** | `gemma-4-26b-a4b` | 30 attention layers, 128 experts/layer, top-8 routing, MTP & DFlash speculation |
-| `lfm25` | **LFM2.5-8B-A1B** | `lfm2.5-8b-a1b` | Hybrid 18 short-conv + 6 attention layers, 32 experts/layer, DSpark speculation |
-| `maple` | **Maple-preview 20B-A1B** | `maple-preview` | Native ternary (`tq2`) weights, 256 experts/layer, sliding + full attention |
-| `ling` | **Ling-3.0-tiny 7.9B-A1.3B** | `ling-3.0-tiny` | 3:1 KDA/MLA hybrid, 128 experts + 1 shared expert/layer, absorbed MLA cache |
-
----
-
-## How It Works
+Since this is meant for tight memory setups, we follow a few technical tricks:
 
 1. **Exact MoE Prefetching**: Routers evaluate the residual before the dense/attention block finishes, so disk reads for selected experts are scheduled ahead of time.
 2. **Batch-Union Streaming**: During prompt prefill, duplicate expert reads across tokens in the batch are deduplicated, drastically cutting disk I/O.
@@ -28,11 +23,11 @@ Pre-converted model weights and containers are available on Hugging Face:
 4. **KVarN KV Cache Compression**: Outlier-aware tile-based KV quantization (`kvarn.h`) keeps long contexts lightweight.
 5. **FlashHead**: Optional clustered centroid approximation for large embedding/lm_head projections.
 
----
+## How It Works
 
 ## Building
 
-A C99 compiler (clang or gcc) and OpenMP (recommended for multi-threading) are required.
+You only need a C99 compiler (clang or gcc). OpenMP is recommended for multi-threading and Metal is optional (and recommended for Apple Silicon).
 
 ### Quick Build
 
@@ -59,42 +54,44 @@ make METAL=0
 make check
 ```
 
----
+## Get a model
 
 ## Model Conversion & Setup
 
 You can download ready-to-use containers from [huggingface.co/mseri](https://huggingface.co/mseri), or convert Hugging Face checkpoints locally using the provided Python scripts in `tools/`:
 
 ### Gemma-4
+
 ```sh
 python3 tools/convert_gemma4.py /path/to/gemma-4-26B-A4B-it-qat-unquantized ./g4-ct --ram 4 --ctx 4096
 python3 tools/convert_tokenizer.py /path/to/checkpoint/tokenizer.json ./g4-ct/tok.bin
 ```
 
 ### LFM2.5
+
 ```sh
-python3 tools/convert_lfm25.py /path/to/LFM2.5-8B-A1B ./lfm-ct --ram 8 --ctx 4096
+python3 tools/convert_lfm25.py /path/to/LFM2.5-8B-A1B ./lfm-ct --ram 4 --ctx 4096
 python3 tools/convert_lfm_tokenizer.py /path/to/LFM2.5-8B-A1B/tokenizer.json ./lfm-ct/tok.bin
 ```
 
 ### Maple
+
 ```sh
 python3 tools/convert_maple.py /path/to/maple-preview-mlx ./maple-ct --ram 4 --ctx 4096
 python3 tools/convert_lfm_tokenizer.py /path/to/maple-preview-mlx/tokenizer.json ./maple-ct/tok.bin
 ```
 
 ### Ling
+
 ```sh
 python3 tools/convert_ling.py /path/to/Ling-3.0-tiny ./ling-ct --ram 8 --ctx 8192
 ```
 
-Note that ram and ctx precompute how to distribute objects in memory but can be modified at runtime.
-
----
+Note that ram and ctx precompute how to distribute objects in memory but can be modified at runtime (see below for the appropriate flags).
 
 ## Usage & CLI Flags
 
-All four executables follow a consistent command line interface:
+All four executables follow a common command line interface:
 
 ```sh
 ./gemma4 <model_dir> [flags...] [prompt]
@@ -105,24 +102,23 @@ All four executables follow a consistent command line interface:
 
 ### Common Modes
 
-- **One-shot generation:**
-  ```sh
-  ./gemma4 ./g4-ct "Explain Mixture of Experts in simple terms."
-  ```
-- **Interactive multi-turn chat:**
-  ```sh
-  ./gemma4 ./g4-ct --chat
-  ```
-- **OpenAI-compatible HTTP Server:**
-  ```sh
-  ./gemma4 ./g4-ct --serve --port 8484
-  ```
+```sh
+# Generate one answer.
+./gemma4 ./g4 "Explain Mixture of Experts in simple terms."
 
----
+# Keep a local chat going.
+./gemma4 ./g4 --chat
 
-### Command-Line Flags Reference
+# Serve the OpenAI-style API on port 8484.
+./gemma4 ./g4 --serve --port 8484
+```
 
-#### General & Chat Flags
+## Command-Line Flags Reference
+
+Use `--help` on the program you are running. We collect all the flags below.
+
+### Conversation and sampling
+
 | Flag | Description |
 |---|---|
 | `<dir>` | Path to the directory containing model weights and manifest (*required*). |
@@ -132,51 +128,41 @@ All four executables follow a consistent command line interface:
 | `--nothink` | Disable thinking/reasoning output (reasoning is on by default). |
 | `--raw` | Feed the prompt verbatim, bypassing the chat template formatting. |
 | `--max_tokens N` | Maximum number of tokens to generate (default: `2048`). |
+| `--temp F` | Sampling temperature. `0` selects greedy argmax. |
+| `--topp F` | Nucleus-sampling cutoff, such as `0.95`. |
+| `--topk N` | Top-k limit. |
+| `--penalty F` | Repetition penalty; `1.0` turns it off. |
 
-#### Sampling Parameters
+### Memory, I/O, and compute
+
 | Flag | Description |
 |---|---|
-| `--temp F` | Sampling temperature (`--temp 0` selects greedy argmax). |
-| `--topp F` | Top-p sampling threshold (e.g. `0.95`). |
-| `--topk N` | Top-k sampling limit. |
-| `--penalty F` | Repetition penalty (`1.0` = disabled). |
-
-#### Memory & Cache Management
-| Flag | Description |
-|---|---|
-| `--ram F` | Total RAM budget in GB. Recalculates resident expert cache slots. |
-| `--ctx N` | Override context length. |
-| `--pin N` | Pin the top-N hot experts per layer into RAM from `usage.bin`. |
-| `--kv PRESET` | Select KVarN KV cache quantization preset (default: `kvarn_k4v2_g128`): `off`, `kvarn_k4v2_g128`, `kvarn_k4v4_g128`, `kvarn_k4v2_g64`, `kvarn_k4v4_g64`. |
-
-#### Performance & Hardware
-| Flag | Description |
-|---|---|
-| `--threads N` | Number of compute threads (OpenMP). |
-| `--io N` | Number of background asynchronous I/O threads for streaming experts (default: `8`). |
+| `--ram F` | Set the total RAM budget in GB and recalculate resident expert slots. |
+| `--ctx N` | Replace the container's context length. |
+| `--pin N` | Keep the top `N` experts from `usage.bin` resident for each layer. |
+| `--kv PRESET` | Choose KV quantization: `off`, `kvarn_k4v2_g128`, `kvarn_k4v4_g128`, `kvarn_k4v2_g64`, or `kvarn_k4v4_g64` (default: `kvarn_k4v2_g128`). |
+| `--threads N` | Number of OpenMP compute threads. |
+| `--io N` | Background I/O threads for expert reads; default `8`. |
 | `--batch N` | Prefill batch size (default: `128`). |
-| `--nobatch` | Process prefill tokens sequentially one-by-one. |
-| `--metal` | Enable Apple Metal GPU offloading (disabled by default). |
+| `--nobatch` | Prefill tokens one at a time. |
+| `--metal` | Use Apple Metal offload. It starts disabled. |
 
-#### FlashHead Approximation
-| Flag | Description |
-|---|---|
-| `--flash` | Enable approximate `lm_head` using centroid clustering. |
-| `--noflash` | Force exact `lm_head` computation (Maple). |
-| `--probes N` | Number of FlashHead clusters to evaluate per token. |
+### FlashHead and drafting
 
-#### Speculative Decoding
-| Flag | Executable | Description |
+| Flag | Available in | Description |
 |---|---|---|
-| `--mtp` | `gemma4` | Enable Multi-Token Prediction speculation. |
-| `--dflash` | `gemma4` | Enable DFlash block speculation. |
-| `--dspark` | `lfm25` | Enable DSpark block-parallel speculative decoding. |
-| `--draft DIR` | `gemma4` | Path to separate drafter model container. |
-| `--ndraft N` | `gemma4`/`lfm25` | Number of speculative draft tokens proposed per step. |
-| `--drefine N` | `gemma4`/`lfm25` | Extra denoising passes across the draft block. |
-| `--dfreeze F` | `lfm25` | Confidence threshold to freeze tokens between refinement passes. |
-| `--dconf F` | `lfm25` | Early-exit confidence cutoff for speculative proposals. |
-| `--no-markov` | `lfm25` | Disable bigram Markov head during DSpark drafting. |
+| `--flash` | `gemma4`, `lfm25`, `ling` | Approximate `lm_head` with centroid clusters. |
+| `--noflash` | `maple` | Force the exact `lm_head`. |
+| `--probes N` | all programs | Evaluate this many FlashHead clusters per token. |
+| `--mtp` | `gemma4` | Turn on Multi-Token Prediction drafting. |
+| `--dflash` | `gemma4` | Turn on DFlash block drafting. |
+| `--dspark` | `lfm25` | Turn on DSpark block-parallel drafting. |
+| `--draft DIR` | `gemma4` | Use a separate drafter container. |
+| `--ndraft N` | `gemma4`, `lfm25` | Draft tokens proposed per step. |
+| `--drefine N` | `gemma4`, `lfm25` | Extra denoising passes through a draft block. |
+| `--dfreeze F` | `lfm25` | Confidence needed to freeze a token between refinement passes. |
+| `--dconf F` | `lfm25` | Confidence cutoff for leaving a proposal early. |
+| `--no-markov` | `lfm25` | Do not use the bigram Markov head while DSpark drafts. |
 
 #### HTTP Server
 | Flag | Description |
@@ -184,31 +170,28 @@ All four executables follow a consistent command line interface:
 | `--serve` | Launch an OpenAI-compatible HTTP server. |
 | `--port N` | TCP port for the HTTP server (default: `8484`). |
 
----
+## HTTP server
 
-## OpenAI Server Endpoints
+Start the OpenAI server with `--serve`. It loads the model and offers the following endpoints.
 
-When running with `--serve`:
+| Method and path | Behavior |
+|---|---|
+| `GET /v1/models` | Returns the loaded model and its ID. |
+| `POST /v1/chat/completions` | Handles chat completions, including `stream: true` Server-Sent Events. `content` accepts a string or text-part array; image and other non-text parts are ignored. |
+| `GET /props` | Returns llama.cpp-style server properties, including context size and model alias. |
+| `POST /props` | Returns `501 not_supported_error`; global properties cannot be changed. |
+| `GET /models` | Returns a one-model llama.cpp router-style catalog. |
+| `GET /models/sse` | Holds an idle router-style status connection open. |
+| `GET /healthz` | Health check. |
+| `POST /v1/cancel` | Stops a generation in progress. |
+| `POST /v1/shutdown` | Stops the server cleanly. |
 
-- `GET /v1/models` — Lists the loaded model and its advertised `id`:
-  - `gemma4` $\rightarrow$ `"id": "gemma-4-26b-a4b"`
-  - `lfm25` $\rightarrow$ `"id": "lfm2.5-8b-a1b"`
-  - `maple` $\rightarrow$ `"id": "maple-preview"`
-  - `ling` $\rightarrow$ `"id": "ling-3.0-tiny"`
-- `POST /v1/chat/completions` — Handles chat requests (supports both standard JSON and `stream: true` Server-Sent Events). `content` may be a plain string or an array of `{"type":"text","text":...}` parts (non-text parts, e.g. images, are ignored).
-  - All four models support OpenAI-style function calling (`tools`, `tool_calls`, `role: "tool"` results), each transcribed from that model's own chat template — none of them share a wire format:
-    - `ling` — XML `<tool_call>{name}<arg_key>k</arg_key><arg_value>v</arg_value>...</tool_call>`, results as a dedicated `<role>OBSERVATION</role>` turn.
-    - `maple` — JSON inside `<tool_call>{"name":...,"arguments":{...}}</tool_call>`, results replayed as a `user` turn holding `<tool_response>` blocks.
-    - `lfm25` — Python-call syntax `<|tool_call_start|>[name(key='val', key2=42), ...]<|tool_call_end|>`; tool results have no special wrapper (`role: "tool"` renders like any other turn).
-    - `gemma4` — Google's own non-JSON notation, `<|tool_call>call:name{key:value,...}<tool_call|>` with `<|"|>...<|"|>`-quoted strings; results are inlined into the same turn as `<|tool_response>` blocks instead of a separate turn. Tool *declarations* get re-derived from the incoming JSON schema into Gemini's uppercase-typed notation, so exotic schemas (deeply nested `items`, `response` schemas) may not translate perfectly.
-  - When `tools` is present, the response is buffered rather than streamed token-by-token, so raw wire syntax never leaks into a client's rendered content; `finish_reason` becomes `"tool_calls"` when the model actually calls one.
-- `GET /props` — llama.cpp-compatible server properties (context size, model alias, etc.), for clients that probe it before issuing requests.
-- `POST /props` — Always returns `501 not_supported_error`; this server has no mutable global properties.
-- `GET /models` — llama.cpp router-style catalog, always reporting the single loaded model (used by clients, e.g. the `pi` coding agent, that check model status before routing requests).
-- `GET /models/sse` — llama.cpp router-style model-status stream. This server never has anything to report, so the connection is just held open (matching an idle router) instead of erroring, which stops such clients from reconnecting in a loop.
-- `GET /healthz` — Health check endpoint.
-- `POST /v1/cancel` — Abort ongoing generation.
-- `POST /v1/shutdown` — Gracefully stop server.
+`/v1/models` reports `gemma-4-26b-a4b`, `lfm2.5-8b-a1b`, `maple-preview`, or `ling-3.0-tiny`, according to the executable.
+
+
+
+All four servers accept OpenAI-style `tools`, `tool_calls`, and `role: "tool"` results.
+When tools are supplied, the server waits for a complete tool call instead of streaming raw model tokens. A real call yields `"finish_reason": "tool_calls"`.
 
 ### Example Request
 
@@ -225,13 +208,12 @@ curl -N http://127.0.0.1:8484/v1/chat/completions \
   }'
 ```
 
----
+## Optional speculative-decoding
 
-## Optional speculative-decoding weights
-
-Convert the target model first. Then run the matching converter below with the
-checkpoint directory and target container directory. The extra files go into
+Convert the target mode, then run the matching converter below with the
+checkpoint directory and target container directory. The extra files can go into
 the target container, so there is no second model directory to pass at runtime.
+If you download the pre-made containers from Hugging Face, the drafter files are already included.
 
 #### Gemma-4 MTP
 
@@ -279,11 +261,6 @@ python3 tools/convert_lfm25_dspark.py \
   /path/to/LFM2.5-8B-A1B-DSpark ./lfm-ct --draft-bits 8
 ```
 
-The DSpark checkpoint must match the target's hidden size, vocabulary, layer
-count, and target-layer configuration. Markov and confidence heads are copied
-when the checkpoint contains them.
-
----
 
 ## License
 
