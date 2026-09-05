@@ -2169,24 +2169,6 @@ static jval *ling_json_field(jval *object, const char *key, jtype type) {
     jval *v = json_get(object, key); return v && v->t == type ? v : NULL;
 }
 
-/* OpenAI content is either a plain string or an array of content-part objects (used by
- * clients that also attach images), e.g. [{"type":"text","text":"..."}, ...]. Text parts
- * are concatenated in order; non-text parts (image_url, etc.) are silently dropped since
- * these models take no visual input. */
-static int ling_msg_has_text(jval *msg) {
-    jval *content = json_get(msg, "content");
-    if (!content) return 0;
-    if (content->t == J_STR) return 1;
-    if (content->t != J_ARR) return 0;
-    for (int i = 0; i < content->len; i++) {
-        jval *part = content->kids[i];
-        if (part->t != J_OBJ) continue;
-        jval *type = json_get(part, "type"), *text = json_get(part, "text");
-        if (type && type->t == J_STR && strcmp(type->str, "text")) continue;
-        if (text && text->t == J_STR) return 1;
-    }
-    return 0;
-}
 
 static int ling_append_content(LingString *dst, jval *msg) {
     jval *content = json_get(msg, "content");
@@ -2301,37 +2283,7 @@ static int ling_value_is_json_literal(const char *v, size_t n) {
     if (n==4 && !strncmp(v,"true",4)) return 1;
     if (n==5 && !strncmp(v,"false",5)) return 1;
     if (n==4 && !strncmp(v,"null",4)) return 1;
-    size_t i = (v[0]=='-') ? 1 : 0, digits = 0;
-    while (i<n && isdigit((unsigned char)v[i])) { i++; digits++; }
-    if (!digits) return 0;
-    if (i<n && v[i]=='.') { i++; while (i<n && isdigit((unsigned char)v[i])) i++; }
-    if (i<n && (v[i]=='e'||v[i]=='E')) { i++; if (i<n && (v[i]=='+'||v[i]=='-')) i++; while (i<n && isdigit((unsigned char)v[i])) i++; }
-    return i==n;
-}
-
-typedef struct { char *name; char *arguments; } LingToolCall;
-typedef struct { LingToolCall *items; int len, cap; } LingToolCalls;
-
-static int ling_tool_calls_push(LingToolCalls *calls, const char *name, size_t name_len,
-                                const char *args, size_t args_len) {
-    if (calls->len == calls->cap) {
-        int cap = calls->cap ? calls->cap * 2 : 4;
-        LingToolCall *items = realloc(calls->items, sizeof *items * (size_t)cap);
-        if (!items) return 0;
-        calls->items = items; calls->cap = cap;
-    }
-    char *n = malloc(name_len + 1), *a = malloc(args_len + 1);
-    if (!n || !a) { free(n); free(a); return 0; }
-    memcpy(n, name, name_len); n[name_len] = 0;
-    memcpy(a, args, args_len); a[args_len] = 0;
-    calls->items[calls->len].name = n; calls->items[calls->len].arguments = a;
-    calls->len++;
-    return 1;
-}
-
-static void ling_tool_calls_free(LingToolCalls *calls) {
-    for (int i = 0; i < calls->len; i++) { free(calls->items[i].name); free(calls->items[i].arguments); }
-    free(calls->items); calls->items = NULL; calls->len = calls->cap = 0;
+    return oai_is_number_literal(v, n);
 }
 
 /* Parses zero or more <tool_call>...</tool_call> blocks out of the model's raw completion
@@ -2339,7 +2291,7 @@ static void ling_tool_calls_free(LingToolCalls *calls) {
  * appends tool calls after any spoken content, never before). Tolerant of the exact
  * whitespace the model puts around tags, since that varies a little from the template's
  * own byte-for-byte rendering of training examples. */
-static int ling_extract_tool_calls(const char *text, LingToolCalls *calls, LingString *leading) {
+static int ling_extract_tool_calls(const char *text, OaiToolCalls *calls, LingString *leading) {
     const char *open_tag = "<tool_call>", *close_tag = "</tool_call>";
     size_t open_len = strlen(open_tag), close_len = strlen(close_tag);
     const char *first = strstr(text, open_tag);
@@ -2386,7 +2338,7 @@ static int ling_extract_tool_calls(const char *text, LingToolCalls *calls, LingS
         }
         if (ok) ok = ling_string_append(&args, "}", 1);
         if (!ok) { free(args.data); return 0; }
-        int pushed = ling_tool_calls_push(calls, name_start, (size_t)(name_end - name_start), args.data, args.len);
+        int pushed = oai_tool_calls_push(calls, name_start, (size_t)(name_end - name_start), args.data, args.len);
         free(args.data);
         if (!pushed) return 0;
         first = strstr(block_end + close_len, open_tag);
@@ -2406,7 +2358,7 @@ static int ling_build_chat_prompt(jval *messages, LingString *prompt, int think,
     LingString sys_buf = {0};
     if (messages->len > 0) {
         jval *role = ling_json_field(messages->kids[0], "role", J_STR);
-        if (role && !strcmp(role->str, "system") && ling_msg_has_text(messages->kids[0])) {
+        if (role && !strcmp(role->str, "system") && oai_msg_has_text(messages->kids[0])) {
             if (!ling_append_content(&sys_buf, messages->kids[0])) { free(sys_buf.data); return 0; }
             sys = sys_buf.data ? sys_buf.data : ""; first_is_system = 1;
         }
@@ -2439,7 +2391,7 @@ static int ling_build_chat_prompt(jval *messages, LingString *prompt, int think,
         }
         jval *tool_calls = ling_json_field(message, "tool_calls", J_ARR);
         int has_calls = tool_calls && tool_calls->len > 0 && !strcmp(role->str, "assistant");
-        if (!ling_msg_has_text(message) && !has_calls) continue;
+        if (!oai_msg_has_text(message) && !has_calls) continue;
         if (!strcmp(role->str, "user")) {
             PUT("<role>HUMAN</role>");
             if (!ling_append_content(prompt, message)) return 0;
@@ -2511,7 +2463,7 @@ static int ling_send_done(int fd, const char *id, int prompt_tokens, int complet
 }
 
 /* One delta chunk carrying the whole array; still a valid OpenAI-style stream. */
-static int ling_send_tool_call_chunk(int fd, const char *id, LingToolCalls *calls) {
+static int ling_send_tool_call_chunk(int fd, const char *id, OaiToolCalls *calls) {
     LingString out = {0};
     const char *prefix = "data: {\"id\":\"";
     const char *middle = "\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[";
@@ -2545,7 +2497,7 @@ static int ling_serve_chat(LingServerContext *ctx, int fd, jval *root) {
     for (int i = 0; i < messages->len; i++) {
         jval *msg = messages->kids[i];
         jval *role = ling_json_field(msg,"role",J_STR);
-        if (role && !strcmp(role->str,"user") && ling_msg_has_text(msg)) has_user = 1;
+        if (role && !strcmp(role->str,"user") && oai_msg_has_text(msg)) has_user = 1;
     }
     if (!has_user) return samosa_http_json_error(fd,400,"invalid_messages","A text user message is required.");
     jval *tools = ling_json_field(root, "tools", J_ARR);
@@ -2670,10 +2622,10 @@ static int ling_serve_chat(LingServerContext *ctx, int fd, jval *root) {
         }
     }
     if (atomic_load(&ctx->cancel)) reason = "cancelled";
-    LingToolCalls calls = {0};
+    OaiToolCalls calls = {0};
     LingString leading = {0};
     if (tools_present && !ling_extract_tool_calls(answer.data ? answer.data : "", &calls, &leading)) {
-        ling_tool_calls_free(&calls);
+        oai_tool_calls_free(&calls);
         free(leading.data); leading.data = NULL; leading.len = leading.cap = 0;
     }
     const char *final_reason = calls.len ? "tool_calls" : reason;
@@ -2714,7 +2666,7 @@ static int ling_serve_chat(LingServerContext *ctx, int fd, jval *root) {
         ok=ok&&n>0&&ling_string_append(&body,suffix,(size_t)n)&&samosa_http_headers(fd,200,"application/json",body.len,NULL)&&samosa_send_all(fd,body.data,body.len);
         free(body.data); (void)ok;
     }
-    ling_tool_calls_free(&calls); free(leading.data);
+    oai_tool_calls_free(&calls); free(leading.data);
     int final_len = np + generated;
     if (final_len > ctx->cached_cap) {
         int cap = ctx->cached_cap ? ctx->cached_cap : 256;
@@ -2740,38 +2692,8 @@ static int ling_serve_handler(SamosaHttpServer *server, int fd, const SamosaHttp
             ctx->model_id, ctx->model->c.ctx, ctx->model->c.ctx);
         return samosa_http_response(fd,200,"application/json",body,NULL);
     }
-    if (!strcmp(request->method,"GET") && !strcmp(request->path,"/models")) {
-        char body[512]; snprintf(body,sizeof body,
-            "{\"data\":[{\"id\":\"%s\",\"status\":{\"value\":\"loaded\"},"
-            "\"meta\":{\"n_ctx\":%d}}]}",
-            ctx->model_id, ctx->model->c.ctx);
-        return samosa_http_response(fd,200,"application/json",body,NULL);
-    }
-    if (!strcmp(request->method,"GET") && !strcmp(request->path,"/models/sse")) {
-        /* Not a router: nothing to notify. Hold the stream open so status-watching clients block here instead of reconnecting in a loop. */
-        if (!samosa_http_stream_headers(fd)) return 0;
-        char buf[256];
-        while (!atomic_load(&server->stopping)) {
-            ssize_t n = recv(fd, buf, sizeof buf, 0);
-            if (n == 0) break;
-            if (n < 0) { if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue; break; }
-        }
-        return 1;
-    }
-    if (!strcmp(request->method,"GET") && !strcmp(request->path,"/props")) {
-        char body[768]; snprintf(body,sizeof body,
-            "{\"default_generation_settings\":{\"n_ctx\":%d},"
-            "\"total_slots\":1,\"model_path\":\"%s\",\"model_alias\":\"%s\","
-            "\"chat_template\":\"\",\"bos_token\":\"\",\"eos_token\":\"\","
-            "\"build_info\":\"zunzuncito\",\"endpoint_slots\":false,"
-            "\"endpoint_props\":false,\"endpoint_metrics\":false}",
-            ctx->model->c.ctx, ctx->model_id, ctx->model_id);
-        return samosa_http_response(fd,200,"application/json",body,NULL);
-    }
-    if (!strcmp(request->method,"POST") && !strcmp(request->path,"/props")) {
-        return samosa_http_json_error(fd,501,"not_supported",
-            "This server does not support changing global properties.");
-    }
+    { int ok;
+      if (samosa_http_common_routes(server, fd, request, ctx->model_id, ctx->model->c.ctx, &ok)) return ok; }
     if (!strcmp(request->method,"POST") && !strcmp(request->path,"/v1/cancel")) {
         atomic_store(&ctx->cancel,1); return samosa_http_response(fd,200,"application/json","{\"cancelled\":true}",NULL);
     }

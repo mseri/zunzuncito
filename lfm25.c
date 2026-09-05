@@ -2262,25 +2262,6 @@ static jval *lfm_json_field(jval *object, const char *key, jtype type) {
     jval *v = json_get(object, key); return v && v->t == type ? v : NULL;
 }
 
-/* OpenAI content is either a plain string or an array of content-part objects (used by
- * clients that also attach images), e.g. [{"type":"text","text":"..."}, ...]. Text parts
- * are concatenated in order; non-text parts (image_url, etc.) are silently dropped since
- * this model takes no visual input over this endpoint. */
-static int lfm_msg_has_text(jval *msg) {
-    jval *content = json_get(msg, "content");
-    if (!content) return 0;
-    if (content->t == J_STR) return 1;
-    if (content->t != J_ARR) return 0;
-    for (int i = 0; i < content->len; i++) {
-        jval *part = content->kids[i];
-        if (part->t != J_OBJ) continue;
-        jval *type = json_get(part, "type"), *text = json_get(part, "text");
-        if (type && type->t == J_STR && strcmp(type->str, "text")) continue;
-        if (text && text->t == J_STR) return 1;
-    }
-    return 0;
-}
-
 static int lfm_append_content(LfmString *dst, jval *msg) {
     jval *content = json_get(msg, "content");
     if (!content) return 1;
@@ -2382,16 +2363,6 @@ static const char *lfm_scan_top_level(const char *s, const char *end, char sep) 
     return end;
 }
 
-static int lfm_is_number_literal(const char *v, size_t n) {
-    if (!n) return 0;
-    size_t i = (v[0]=='-') ? 1 : 0, digits = 0;
-    while (i<n && isdigit((unsigned char)v[i])) { i++; digits++; }
-    if (!digits) return 0;
-    if (i<n && v[i]=='.') { i++; while (i<n && isdigit((unsigned char)v[i])) i++; }
-    if (i<n && (v[i]=='e'||v[i]=='E')) { i++; if (i<n && (v[i]=='+'||v[i]=='-')) i++; while (i<n && isdigit((unsigned char)v[i])) i++; }
-    return i==n;
-}
-
 static int lfm_parse_arg_value(const char *v, size_t n, LfmString *out) {
     while (n && isspace((unsigned char)v[n-1])) n--;
     while (n && isspace((unsigned char)*v)) { v++; n--; }
@@ -2402,39 +2373,14 @@ static int lfm_parse_arg_value(const char *v, size_t n, LfmString *out) {
     if (n == 5 && !strncmp(v,"False",5)) return lfm_string_append(out,"false",5);
     if ((n == 4 && !strncmp(v,"None",4)) || (n == 4 && !strncmp(v,"null",4))) return lfm_string_append(out,"null",4);
     if (n && (v[0]=='{' || v[0]=='[')) return lfm_string_append(out, v, n);
-    if (lfm_is_number_literal(v, n)) return lfm_string_append(out, v, n);
+    if (oai_is_number_literal(v, n)) return lfm_string_append(out, v, n);
     jbuf jb = {0}; int ok = json_encode_str(&jb, v, n) && lfm_string_append(out, jb.data, jb.len); free(jb.data); return ok;
-}
-
-typedef struct { char *name; char *arguments; } LfmToolCall;
-typedef struct { LfmToolCall *items; int len, cap; } LfmToolCalls;
-
-static int lfm_tool_calls_push(LfmToolCalls *calls, const char *name, size_t name_len,
-                               const char *args, size_t args_len) {
-    if (calls->len == calls->cap) {
-        int cap = calls->cap ? calls->cap * 2 : 4;
-        LfmToolCall *items = realloc(calls->items, sizeof *items * (size_t)cap);
-        if (!items) return 0;
-        calls->items = items; calls->cap = cap;
-    }
-    char *n = malloc(name_len + 1), *a = malloc(args_len + 1);
-    if (!n || !a) { free(n); free(a); return 0; }
-    memcpy(n, name, name_len); n[name_len] = 0;
-    memcpy(a, args, args_len); a[args_len] = 0;
-    calls->items[calls->len].name = n; calls->items[calls->len].arguments = a;
-    calls->len++;
-    return 1;
-}
-
-static void lfm_tool_calls_free(LfmToolCalls *calls) {
-    for (int i = 0; i < calls->len; i++) { free(calls->items[i].name); free(calls->items[i].arguments); }
-    free(calls->items); calls->items = NULL; calls->len = calls->cap = 0;
 }
 
 /* Parses <|tool_call_start|>[name(k='v', k2=42), ...]<|tool_call_end|> out of the raw
  * completion text. Commas and '=' inside quotes/brackets are not split points, tracked
  * with lfm_scan_top_level rather than a real Python-expression parser. */
-static int lfm_extract_tool_calls(const char *text, LfmToolCalls *calls, LfmString *leading) {
+static int lfm_extract_tool_calls(const char *text, OaiToolCalls *calls, LfmString *leading) {
     const char *open_tag = "<|tool_call_start|>", *close_tag = "<|tool_call_end|>";
     size_t open_len = strlen(open_tag), close_len = strlen(close_tag);
     const char *first = strstr(text, open_tag);
@@ -2489,7 +2435,7 @@ static int lfm_extract_tool_calls(const char *text, LfmToolCalls *calls, LfmStri
                         q = (ksep < args_end) ? ksep + 1 : args_end;
                     }
                     ok = ok && lfm_string_append(&args, "}", 1);
-                    if (ok) { int pushed = lfm_tool_calls_push(calls, p, (size_t)(name_end - p), args.data, args.len); ok = pushed; }
+                    if (ok) { int pushed = oai_tool_calls_push(calls, p, (size_t)(name_end - p), args.data, args.len); ok = pushed; }
                     free(args.data);
                 }
             }
@@ -2507,7 +2453,7 @@ static int lfm_build_chat_prompt(jval *messages, LfmString *prompt, jval *tools)
                         if (!lfm_string_append(prompt, _s, strlen(_s))) return 0; } while (0)
     PUT("<|startoftext|>");
     jval *first_role = messages->len > 0 ? lfm_json_field(messages->kids[0], "role", J_STR) : NULL;
-    int first_is_system = first_role && !strcmp(first_role->str, "system") && lfm_msg_has_text(messages->kids[0]);
+    int first_is_system = first_role && !strcmp(first_role->str, "system") && oai_msg_has_text(messages->kids[0]);
     if (!lfm_append_system(prompt, first_is_system ? messages->kids[0] : NULL, tools)) return 0;
     for (int i = first_is_system ? 1 : 0; i < messages->len; i++) {
         jval *message = messages->kids[i];
@@ -2515,7 +2461,7 @@ static int lfm_build_chat_prompt(jval *messages, LfmString *prompt, jval *tools)
         if (!role) continue;
         jval *tool_calls = lfm_json_field(message, "tool_calls", J_ARR);
         int has_calls = tool_calls && tool_calls->len > 0 && !strcmp(role->str, "assistant");
-        if (!lfm_msg_has_text(message) && !has_calls) continue;
+        if (!oai_msg_has_text(message) && !has_calls) continue;
         if (strcmp(role->str, "system") && strcmp(role->str, "user") &&
             strcmp(role->str, "assistant") && strcmp(role->str, "tool")) continue;
         PUT("<|im_start|>");
@@ -2556,7 +2502,7 @@ static int lfm_send_done(int fd, const char *id, int prompt_tokens, int completi
     return n > 0 && (size_t)n < sizeof event && samosa_send_all(fd, event, (size_t)n);
 }
 
-static int lfm_send_tool_call_chunk(int fd, const char *id, LfmToolCalls *calls) {
+static int lfm_send_tool_call_chunk(int fd, const char *id, OaiToolCalls *calls) {
     LfmString out = {0};
     const char *prefix = "data: {\"id\":\"";
     const char *middle = "\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[";
@@ -2590,7 +2536,7 @@ static int lfm_serve_chat(LfmServerContext *ctx, int fd, jval *root) {
     for (int i = 0; i < messages->len; i++) {
         jval *msg = messages->kids[i];
         jval *role = lfm_json_field(msg,"role",J_STR);
-        if (role && !strcmp(role->str,"user") && lfm_msg_has_text(msg)) has_user = 1;
+        if (role && !strcmp(role->str,"user") && oai_msg_has_text(msg)) has_user = 1;
     }
     if (!has_user) return samosa_http_json_error(fd,400,"invalid_messages","A text user message is required.");
     jval *tools = lfm_json_field(root, "tools", J_ARR);
@@ -2698,10 +2644,10 @@ static int lfm_serve_chat(LfmServerContext *ctx, int fd, jval *root) {
         if (generated < max_tokens) forward(m, &token, 1, np + generated - 1, logits, 1, ctx->buffers);
     }
     if (atomic_load(&ctx->cancel)) reason = "cancelled";
-    LfmToolCalls calls = {0};
+    OaiToolCalls calls = {0};
     LfmString leading = {0};
     if (tools_present && !lfm_extract_tool_calls(answer.data ? answer.data : "", &calls, &leading)) {
-        lfm_tool_calls_free(&calls);
+        oai_tool_calls_free(&calls);
         free(leading.data); leading.data = NULL; leading.len = leading.cap = 0;
     }
     const char *final_reason = calls.len ? "tool_calls" : reason;
@@ -2741,7 +2687,7 @@ static int lfm_serve_chat(LfmServerContext *ctx, int fd, jval *root) {
         ok=ok&&n>0&&lfm_string_append(&body,suffix,(size_t)n)&&samosa_http_headers(fd,200,"application/json",body.len,NULL)&&samosa_send_all(fd,body.data,body.len);
         free(body.data); (void)ok;
     }
-    lfm_tool_calls_free(&calls); free(leading.data);
+    oai_tool_calls_free(&calls); free(leading.data);
     int final_len = np + generated;
     if (final_len > ctx->cached_cap) {
         int cap = ctx->cached_cap ? ctx->cached_cap : 256;
@@ -2767,38 +2713,8 @@ static int lfm_serve_handler(SamosaHttpServer *server, int fd, const SamosaHttpR
             ctx->model_id, ctx->model->c.ctx, ctx->model->c.ctx);
         return samosa_http_response(fd,200,"application/json",body,NULL);
     }
-    if (!strcmp(request->method,"GET") && !strcmp(request->path,"/models")) {
-        char body[512]; snprintf(body,sizeof body,
-            "{\"data\":[{\"id\":\"%s\",\"status\":{\"value\":\"loaded\"},"
-            "\"meta\":{\"n_ctx\":%d}}]}",
-            ctx->model_id, ctx->model->c.ctx);
-        return samosa_http_response(fd,200,"application/json",body,NULL);
-    }
-    if (!strcmp(request->method,"GET") && !strcmp(request->path,"/models/sse")) {
-        /* Not a router: nothing to notify. Hold the stream open so status-watching clients block here instead of reconnecting in a loop. */
-        if (!samosa_http_stream_headers(fd)) return 0;
-        char buf[256];
-        while (!atomic_load(&server->stopping)) {
-            ssize_t n = recv(fd, buf, sizeof buf, 0);
-            if (n == 0) break;
-            if (n < 0) { if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue; break; }
-        }
-        return 1;
-    }
-    if (!strcmp(request->method,"GET") && !strcmp(request->path,"/props")) {
-        char body[768]; snprintf(body,sizeof body,
-            "{\"default_generation_settings\":{\"n_ctx\":%d},"
-            "\"total_slots\":1,\"model_path\":\"%s\",\"model_alias\":\"%s\","
-            "\"chat_template\":\"\",\"bos_token\":\"\",\"eos_token\":\"\","
-            "\"build_info\":\"zunzuncito\",\"endpoint_slots\":false,"
-            "\"endpoint_props\":false,\"endpoint_metrics\":false}",
-            ctx->model->c.ctx, ctx->model_id, ctx->model_id);
-        return samosa_http_response(fd,200,"application/json",body,NULL);
-    }
-    if (!strcmp(request->method,"POST") && !strcmp(request->path,"/props")) {
-        return samosa_http_json_error(fd,501,"not_supported",
-            "This server does not support changing global properties.");
-    }
+    { int ok;
+      if (samosa_http_common_routes(server, fd, request, ctx->model_id, ctx->model->c.ctx, &ok)) return ok; }
     if (!strcmp(request->method,"POST") && !strcmp(request->path,"/v1/cancel")) {
         atomic_store(&ctx->cancel,1); return samosa_http_response(fd,200,"application/json","{\"cancelled\":true}",NULL);
     }

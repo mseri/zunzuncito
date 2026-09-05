@@ -132,6 +132,52 @@ static int samosa_http_stream_headers(int fd) {
     return samosa_send_all(fd,header,strlen(header));
 }
 
+/* llama.cpp router/props compatibility routes: identical across all four model servers
+ * (gemma4, lfm25, ling, maple), parameterized only by the model id and context size they
+ * report. Returns 1 if `request` matched one of these routes (with the handling result
+ * stored in *ok), 0 if the caller should keep trying its own routes. */
+static int samosa_http_common_routes(SamosaHttpServer *server, int fd,
+                                     const SamosaHttpRequest *request,
+                                     const char *model_id, int n_ctx, int *ok) {
+    if (!strcmp(request->method,"GET") && !strcmp(request->path,"/models")) {
+        char body[512]; snprintf(body,sizeof body,
+            "{\"data\":[{\"id\":\"%s\",\"status\":{\"value\":\"loaded\"},"
+            "\"meta\":{\"n_ctx\":%d}}]}",
+            model_id, n_ctx);
+        *ok = samosa_http_response(fd,200,"application/json",body,NULL);
+        return 1;
+    }
+    if (!strcmp(request->method,"GET") && !strcmp(request->path,"/models/sse")) {
+        /* Not a router: nothing to notify. Hold the stream open so status-watching clients block here instead of reconnecting in a loop. */
+        if (!samosa_http_stream_headers(fd)) { *ok = 0; return 1; }
+        char buf[256];
+        while (!atomic_load(&server->stopping)) {
+            ssize_t n = recv(fd, buf, sizeof buf, 0);
+            if (n == 0) break;
+            if (n < 0) { if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue; break; }
+        }
+        *ok = 1;
+        return 1;
+    }
+    if (!strcmp(request->method,"GET") && !strcmp(request->path,"/props")) {
+        char body[768]; snprintf(body,sizeof body,
+            "{\"default_generation_settings\":{\"n_ctx\":%d},"
+            "\"total_slots\":1,\"model_path\":\"%s\",\"model_alias\":\"%s\","
+            "\"chat_template\":\"\",\"bos_token\":\"\",\"eos_token\":\"\","
+            "\"build_info\":\"zunzuncito\",\"endpoint_slots\":false,"
+            "\"endpoint_props\":false,\"endpoint_metrics\":false}",
+            n_ctx, model_id, model_id);
+        *ok = samosa_http_response(fd,200,"application/json",body,NULL);
+        return 1;
+    }
+    if (!strcmp(request->method,"POST") && !strcmp(request->path,"/props")) {
+        *ok = samosa_http_json_error(fd,501,"not_supported",
+            "This server does not support changing global properties.");
+        return 1;
+    }
+    return 0;
+}
+
 static int samosa_http_read_request(int fd, SamosaHttpRequest *request,
                                     int *error_status) {
     memset(request,0,sizeof(*request));

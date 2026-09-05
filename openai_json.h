@@ -179,14 +179,20 @@ static int jbuf_append(jbuf *b, const char *s, size_t n) {
 static int json_encode_str(jbuf *b, const char *s, size_t n) {
     static const char hex[] = "0123456789abcdef";
     if (!jbuf_append(b, "\"", 1)) return 0;
-    for (size_t i = 0; i < n; i++) {
-        unsigned char c = (unsigned char)s[i];
+    size_t i = 0;
+    while (i < n) {
+        /* Copy runs of plain bytes in one memcpy instead of one jbuf_append per byte;
+         * only the rare escape-worthy byte falls through to the switch below. */
+        size_t start = i;
+        while (i < n && (unsigned char)s[i] >= 0x20 && s[i] != '"' && s[i] != '\\') i++;
+        if (i > start && !jbuf_append(b, s + start, i - start)) return 0;
+        if (i == n) break;
+        unsigned char c = (unsigned char)s[i++];
         if (c == '"' || c == '\\') { char x[2] = {'\\', (char)c}; if (!jbuf_append(b,x,2)) return 0; }
         else if (c == '\n') { if (!jbuf_append(b,"\\n",2)) return 0; }
         else if (c == '\r') { if (!jbuf_append(b,"\\r",2)) return 0; }
         else if (c == '\t') { if (!jbuf_append(b,"\\t",2)) return 0; }
-        else if (c < 0x20) { char x[6] = {'\\','u','0','0',hex[c>>4],hex[c&15]}; if (!jbuf_append(b,x,6)) return 0; }
-        else if (!jbuf_append(b,s+i,1)) return 0;
+        else { char x[6] = {'\\','u','0','0',hex[c>>4],hex[c&15]}; if (!jbuf_append(b,x,6)) return 0; }
     }
     return jbuf_append(b, "\"", 1);
 }
@@ -217,6 +223,65 @@ static inline int json_encode(jbuf *b, jval *v) {
             return jbuf_append(b,"}",1);
     }
     return 0;
+}
+
+/* OpenAI content is either a plain string or an array of content-part objects (used by
+ * clients that also attach images), e.g. [{"type":"text","text":"..."}, ...]. Shared by
+ * every model server: deciding whether a message carries any text is independent of that
+ * model's own prompt-string type. */
+static int oai_msg_has_text(jval *msg) {
+    jval *content = json_get(msg, "content");
+    if (!content) return 0;
+    if (content->t == J_STR) return 1;
+    if (content->t != J_ARR) return 0;
+    for (int i = 0; i < content->len; i++) {
+        jval *part = content->kids[i];
+        if (part->t != J_OBJ) continue;
+        jval *type = json_get(part, "type"), *text = json_get(part, "text");
+        if (type && type->t == J_STR && strcmp(type->str, "text")) continue;
+        if (text && text->t == J_STR) return 1;
+    }
+    return 0;
+}
+
+/* Scans a bare (unquoted) token for a JSON number grammar. Shared by the wire formats
+ * that emit unquoted numeric literals (Gemma-4's notation, LFM2.5's Python-call syntax). */
+static inline int oai_is_number_literal(const char *v, size_t n) {
+    if (!n) return 0;
+    size_t i = (v[0]=='-') ? 1 : 0, digits = 0;
+    while (i<n && isdigit((unsigned char)v[i])) { i++; digits++; }
+    if (!digits) return 0;
+    if (i<n && v[i]=='.') { i++; while (i<n && isdigit((unsigned char)v[i])) i++; }
+    if (i<n && (v[i]=='e'||v[i]=='E')) { i++; if (i<n && (v[i]=='+'||v[i]=='-')) i++; while (i<n && isdigit((unsigned char)v[i])) i++; }
+    return i==n;
+}
+
+/* A parsed OpenAI-style tool call (function name + JSON arguments string), as extracted
+ * from a model's own wire format. Shared bookkeeping type: every model server collects
+ * the same (name, arguments) pairs, only the parser that fills them differs. */
+typedef struct { char *name; char *arguments; } OaiToolCall;
+typedef struct { OaiToolCall *items; int len, cap; } OaiToolCalls;
+
+static int oai_tool_calls_push(OaiToolCalls *calls, const char *name, size_t name_len,
+                               const char *args, size_t args_len) {
+    if (calls->len == calls->cap) {
+        int cap = calls->cap ? calls->cap * 2 : 4;
+        OaiToolCall *items = realloc(calls->items, sizeof *items * (size_t)cap);
+        if (!items) return 0;
+        calls->items = items; calls->cap = cap;
+    }
+    char *n = malloc(name_len + 1), *a = malloc(args_len + 1);
+    if (!n || !a) { free(n); free(a); return 0; }
+    memcpy(n, name, name_len); n[name_len] = 0;
+    memcpy(a, args, args_len); a[args_len] = 0;
+    calls->items[calls->len].name = n; calls->items[calls->len].arguments = a;
+    calls->len++;
+    return 1;
+}
+
+static void oai_tool_calls_free(OaiToolCalls *calls) {
+    for (int i = 0; i < calls->len; i++) { free(calls->items[i].name); free(calls->items[i].arguments); }
+    free(calls->items); calls->items = NULL; calls->len = calls->cap = 0;
 }
 
 #endif

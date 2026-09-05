@@ -2683,25 +2683,6 @@ static jval *g4_json_field(jval *object, const char *key, jtype type) {
     jval *v = json_get(object, key); return v && v->t == type ? v : NULL;
 }
 
-/* OpenAI content is either a plain string or an array of content-part objects (used by
- * clients that also attach images), e.g. [{"type":"text","text":"..."}, ...]. Text parts
- * are concatenated in order; non-text parts (image_url, etc.) are silently dropped since
- * this model takes no visual input over this endpoint. */
-static int g4_msg_has_text(jval *msg) {
-    jval *content = json_get(msg, "content");
-    if (!content) return 0;
-    if (content->t == J_STR) return 1;
-    if (content->t != J_ARR) return 0;
-    for (int i = 0; i < content->len; i++) {
-        jval *part = content->kids[i];
-        if (part->t != J_OBJ) continue;
-        jval *type = json_get(part, "type"), *text = json_get(part, "text");
-        if (type && type->t == J_STR && strcmp(type->str, "text")) continue;
-        if (text && text->t == J_STR) return 1;
-    }
-    return 0;
-}
-
 static int g4_append_content(G4String *dst, jval *msg) {
     jval *content = json_get(msg, "content");
     if (!content) return 1;
@@ -2724,16 +2705,6 @@ static int g4_append_content(G4String *dst, jval *msg) {
  * (escape_keys=False), and tool declarations use a Gemini-style, upper-cased-type schema
  * notation rather than the JSON schema verbatim. See g4_format_property for the
  * declaration side and g4_parse_value for the reverse (parsing a call back out). */
-static int g4_is_number_literal(const char *v, size_t n) {
-    if (!n) return 0;
-    size_t i = (v[0]=='-') ? 1 : 0, digits = 0;
-    while (i<n && isdigit((unsigned char)v[i])) { i++; digits++; }
-    if (!digits) return 0;
-    if (i<n && v[i]=='.') { i++; while (i<n && isdigit((unsigned char)v[i])) i++; }
-    if (i<n && (v[i]=='e'||v[i]=='E')) { i++; if (i<n && (v[i]=='+'||v[i]=='-')) i++; while (i<n && isdigit((unsigned char)v[i])) i++; }
-    return i==n;
-}
-
 static int g4_format_parameters(G4String *out, jval *properties);
 
 static int g4_format_property(G4String *out, jval *value) {
@@ -3001,36 +2972,11 @@ static int g4_parse_value(G4Cursor *c, jbuf *out) {
     if (tn == 4 && !strncmp(tok_start,"true",4)) return jbuf_append(out,"true",4);
     if (tn == 5 && !strncmp(tok_start,"false",5)) return jbuf_append(out,"false",5);
     if (tn == 4 && !strncmp(tok_start,"null",4)) return jbuf_append(out,"null",4);
-    if (g4_is_number_literal(tok_start, tn)) return jbuf_append(out, tok_start, tn);
+    if (oai_is_number_literal(tok_start, tn)) return jbuf_append(out, tok_start, tn);
     return json_encode_str(out, tok_start, tn);
 }
 
-typedef struct { char *name; char *arguments; } G4ToolCall;
-typedef struct { G4ToolCall *items; int len, cap; } G4ToolCalls;
-
-static int g4_tool_calls_push(G4ToolCalls *calls, const char *name, size_t name_len,
-                              const char *args, size_t args_len) {
-    if (calls->len == calls->cap) {
-        int cap = calls->cap ? calls->cap * 2 : 4;
-        G4ToolCall *items = realloc(calls->items, sizeof *items * (size_t)cap);
-        if (!items) return 0;
-        calls->items = items; calls->cap = cap;
-    }
-    char *n = malloc(name_len + 1), *a = malloc(args_len + 1);
-    if (!n || !a) { free(n); free(a); return 0; }
-    memcpy(n, name, name_len); n[name_len] = 0;
-    memcpy(a, args, args_len); a[args_len] = 0;
-    calls->items[calls->len].name = n; calls->items[calls->len].arguments = a;
-    calls->len++;
-    return 1;
-}
-
-static void g4_tool_calls_free(G4ToolCalls *calls) {
-    for (int i = 0; i < calls->len; i++) { free(calls->items[i].name); free(calls->items[i].arguments); }
-    free(calls->items); calls->items = NULL; calls->len = calls->cap = 0;
-}
-
-static int g4_extract_tool_calls(const char *text, G4ToolCalls *calls, G4String *leading) {
+static int g4_extract_tool_calls(const char *text, OaiToolCalls *calls, G4String *leading) {
     const char *open_tag = "<|tool_call>call:", *close_tag = "<tool_call|>";
     size_t open_len = strlen(open_tag), close_len = strlen(close_tag);
     const char *first = strstr(text, open_tag);
@@ -3047,7 +2993,7 @@ static int g4_extract_tool_calls(const char *text, G4ToolCalls *calls, G4String 
         int ok;
         if (brace) { G4Cursor cur = { brace, block_end }; ok = g4_parse_value(&cur, &args_jb); }
         else ok = jbuf_append(&args_jb, "{}", 2);
-        if (ok) ok = g4_tool_calls_push(calls, name_start, (size_t)(name_end - name_start), args_jb.data ? args_jb.data : "{}", args_jb.len);
+        if (ok) ok = oai_tool_calls_push(calls, name_start, (size_t)(name_end - name_start), args_jb.data ? args_jb.data : "{}", args_jb.len);
         free(args_jb.data);
         if (!ok) return 0;
         first = strstr(block_end + close_len, open_tag);
@@ -3060,7 +3006,7 @@ static int g4_build_chat_prompt(jval *messages, G4String *prompt, jval *tools) {
     if (!g4_string_append(prompt, "<bos>", 5)) return 0;
     int has_tools = tools && tools->t == J_ARR && tools->len > 0;
     jval *first_role = messages->len > 0 ? g4_json_field(messages->kids[0], "role", J_STR) : NULL;
-    int first_is_system = first_role && !strcmp(first_role->str, "system") && g4_msg_has_text(messages->kids[0]);
+    int first_is_system = first_role && !strcmp(first_role->str, "system") && oai_msg_has_text(messages->kids[0]);
     if (has_tools) {
         if (!g4_string_append(prompt, "<|turn>system\\n", strlen("<|turn>system\\n"))) return 0;
         if (first_is_system && !g4_append_content(prompt, messages->kids[0])) return 0;
@@ -3077,7 +3023,7 @@ static int g4_build_chat_prompt(jval *messages, G4String *prompt, jval *tools) {
         if (!role || !strcmp(role->str, "tool")) continue;   /* absorbed by the preceding assistant turn below */
         jval *tool_calls = g4_json_field(message, "tool_calls", J_ARR);
         int has_calls = tool_calls && tool_calls->len > 0 && !strcmp(role->str, "assistant");
-        if (!g4_msg_has_text(message) && !has_calls) continue;
+        if (!oai_msg_has_text(message) && !has_calls) continue;
         if (!strcmp(role->str, "system")) {
             if (!g4_string_append(prompt, "<|turn>system\\n", strlen("<|turn>system\\n")) ||
                             !g4_append_content(prompt, message) ||
@@ -3147,7 +3093,7 @@ static int g4_send_done(int fd, const char *id, int prompt_tokens, int completio
     return n > 0 && (size_t)n < sizeof event && samosa_send_all(fd, event, (size_t)n);
 }
 
-static int g4_send_tool_call_chunk(int fd, const char *id, G4ToolCalls *calls) {
+static int g4_send_tool_call_chunk(int fd, const char *id, OaiToolCalls *calls) {
     G4String out = {0};
     const char *prefix = "data: {\"id\":\"";
     const char *middle = "\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[";
@@ -3181,7 +3127,7 @@ static int g4_serve_chat(G4ServerContext *ctx, int fd, jval *root) {
     for (int i = 0; i < messages->len; i++) {
         jval *msg = messages->kids[i];
         jval *role = g4_json_field(msg,"role",J_STR);
-        if (role && !strcmp(role->str,"user") && g4_msg_has_text(msg)) has_user = 1;
+        if (role && !strcmp(role->str,"user") && oai_msg_has_text(msg)) has_user = 1;
     }
     if (!has_user) return samosa_http_json_error(fd,400,"invalid_messages","A text user message is required.");
     jval *tools = g4_json_field(root, "tools", J_ARR);
@@ -3276,10 +3222,10 @@ static int g4_serve_chat(G4ServerContext *ctx, int fd, jval *root) {
         if (generated < max_tokens) forward(m, &token, 1, np + generated - 1, logits, 1, ctx->buffers);
     }
     if (atomic_load(&ctx->cancel)) reason = "cancelled";
-    G4ToolCalls calls = {0};
+    OaiToolCalls calls = {0};
     G4String leading = {0};
     if (tools_present && !g4_extract_tool_calls(answer.data ? answer.data : "", &calls, &leading)) {
-        g4_tool_calls_free(&calls);
+        oai_tool_calls_free(&calls);
         free(leading.data); leading.data = NULL; leading.len = leading.cap = 0;
     }
     const char *final_reason = calls.len ? "tool_calls" : reason;
@@ -3319,7 +3265,7 @@ static int g4_serve_chat(G4ServerContext *ctx, int fd, jval *root) {
         ok=ok&&n>0&&g4_string_append(&body,suffix,(size_t)n)&&samosa_http_headers(fd,200,"application/json",body.len,NULL)&&samosa_send_all(fd,body.data,body.len);
         free(body.data); (void)ok;
     }
-    g4_tool_calls_free(&calls); free(leading.data);
+    oai_tool_calls_free(&calls); free(leading.data);
     int final_len = np + generated;
     if (generated > 0)
         forward(m, &ids[final_len - 1], 1, final_len - 1, logits, 1, ctx->buffers);
@@ -3347,38 +3293,8 @@ static int g4_serve_handler(SamosaHttpServer *server, int fd, const SamosaHttpRe
             ctx->model_id, ctx->model->c.ctx, ctx->model->c.ctx);
         return samosa_http_response(fd,200,"application/json",body,NULL);
     }
-    if (!strcmp(request->method,"GET") && !strcmp(request->path,"/models")) {
-        char body[512]; snprintf(body,sizeof body,
-            "{\"data\":[{\"id\":\"%s\",\"status\":{\"value\":\"loaded\"},"
-            "\"meta\":{\"n_ctx\":%d}}]}",
-            ctx->model_id, ctx->model->c.ctx);
-        return samosa_http_response(fd,200,"application/json",body,NULL);
-    }
-    if (!strcmp(request->method,"GET") && !strcmp(request->path,"/models/sse")) {
-        /* Not a router: nothing to notify. Hold the stream open so status-watching clients block here instead of reconnecting in a loop. */
-        if (!samosa_http_stream_headers(fd)) return 0;
-        char buf[256];
-        while (!atomic_load(&server->stopping)) {
-            ssize_t n = recv(fd, buf, sizeof buf, 0);
-            if (n == 0) break;
-            if (n < 0) { if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue; break; }
-        }
-        return 1;
-    }
-    if (!strcmp(request->method,"GET") && !strcmp(request->path,"/props")) {
-        char body[768]; snprintf(body,sizeof body,
-            "{\"default_generation_settings\":{\"n_ctx\":%d},"
-            "\"total_slots\":1,\"model_path\":\"%s\",\"model_alias\":\"%s\","
-            "\"chat_template\":\"\",\"bos_token\":\"\",\"eos_token\":\"\","
-            "\"build_info\":\"zunzuncito\",\"endpoint_slots\":false,"
-            "\"endpoint_props\":false,\"endpoint_metrics\":false}",
-            ctx->model->c.ctx, ctx->model_id, ctx->model_id);
-        return samosa_http_response(fd,200,"application/json",body,NULL);
-    }
-    if (!strcmp(request->method,"POST") && !strcmp(request->path,"/props")) {
-        return samosa_http_json_error(fd,501,"not_supported",
-            "This server does not support changing global properties.");
-    }
+    { int ok;
+      if (samosa_http_common_routes(server, fd, request, ctx->model_id, ctx->model->c.ctx, &ok)) return ok; }
     if (!strcmp(request->method,"POST") && !strcmp(request->path,"/v1/cancel")) {
         atomic_store(&ctx->cancel,1); return samosa_http_response(fd,200,"application/json","{\"cancelled\":true}",NULL);
     }
