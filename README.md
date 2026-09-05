@@ -195,7 +195,11 @@ When running with `--serve`:
   - `lfm25` $\rightarrow$ `"id": "lfm2.5-8b-a1b"`
   - `maple` $\rightarrow$ `"id": "maple-preview"`
   - `ling` $\rightarrow$ `"id": "ling-3.0-tiny"`
-- `POST /v1/chat/completions` — Handles chat requests (supports both standard JSON and `stream: true` Server-Sent Events).
+- `POST /v1/chat/completions` — Handles chat requests (supports both standard JSON and `stream: true` Server-Sent Events). `content` may be a plain string or an array of `{"type":"text","text":...}` parts (non-text parts, e.g. images, are ignored).
+- `GET /props` — llama.cpp-compatible server properties (context size, model alias, etc.), for clients that probe it before issuing requests.
+- `POST /props` — Always returns `501 not_supported_error`; this server has no mutable global properties.
+- `GET /models` — llama.cpp router-style catalog, always reporting the single loaded model (used by clients, e.g. the `pi` coding agent, that check model status before routing requests).
+- `GET /models/sse` — llama.cpp router-style model-status stream. This server never has anything to report, so the connection is just held open (matching an idle router) instead of erroring, which stops such clients from reconnecting in a loop.
 - `GET /healthz` — Health check endpoint.
 - `POST /v1/cancel` — Abort ongoing generation.
 - `POST /v1/shutdown` — Gracefully stop server.

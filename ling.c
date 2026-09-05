@@ -2169,6 +2169,41 @@ static jval *ling_json_field(jval *object, const char *key, jtype type) {
     jval *v = json_get(object, key); return v && v->t == type ? v : NULL;
 }
 
+/* OpenAI content is either a plain string or an array of content-part objects (used by
+ * clients that also attach images), e.g. [{"type":"text","text":"..."}, ...]. Text parts
+ * are concatenated in order; non-text parts (image_url, etc.) are silently dropped since
+ * these models take no visual input. */
+static int ling_msg_has_text(jval *msg) {
+    jval *content = json_get(msg, "content");
+    if (!content) return 0;
+    if (content->t == J_STR) return 1;
+    if (content->t != J_ARR) return 0;
+    for (int i = 0; i < content->len; i++) {
+        jval *part = content->kids[i];
+        if (part->t != J_OBJ) continue;
+        jval *type = json_get(part, "type"), *text = json_get(part, "text");
+        if (type && type->t == J_STR && strcmp(type->str, "text")) continue;
+        if (text && text->t == J_STR) return 1;
+    }
+    return 0;
+}
+
+static int ling_append_content(LingString *dst, jval *msg) {
+    jval *content = json_get(msg, "content");
+    if (!content) return 1;
+    if (content->t == J_STR) return ling_string_append(dst, content->str, strlen(content->str));
+    if (content->t != J_ARR) return 1;
+    for (int i = 0; i < content->len; i++) {
+        jval *part = content->kids[i];
+        if (part->t != J_OBJ) continue;
+        jval *type = json_get(part, "type"), *text = json_get(part, "text");
+        if (type && type->t == J_STR && strcmp(type->str, "text")) continue;
+        if (!text || text->t != J_STR) continue;
+        if (!ling_string_append(dst, text->str, strlen(text->str))) return 0;
+    }
+    return 1;
+}
+
 static int ling_build_chat_prompt(jval *messages, LingString *prompt, int think) {
     #define PUT(s) do { const char *_s = (s); \
                         if (!ling_string_append(prompt, _s, strlen(_s))) return 0; } while (0)
@@ -2177,30 +2212,43 @@ static int ling_build_chat_prompt(jval *messages, LingString *prompt, int think)
      * message, because that is where the thinking switch has to go. */
     const char *sys = NULL;
     int first_is_system = 0;
+    LingString sys_buf = {0};
     if (messages->len > 0) {
         jval *role = ling_json_field(messages->kids[0], "role", J_STR);
-        jval *content = ling_json_field(messages->kids[0], "content", J_STR);
-        if (role && content && !strcmp(role->str, "system")) {
-            sys = content->str; first_is_system = 1;
+        if (role && !strcmp(role->str, "system") && ling_msg_has_text(messages->kids[0])) {
+            if (!ling_append_content(&sys_buf, messages->kids[0])) { free(sys_buf.data); return 0; }
+            sys = sys_buf.data ? sys_buf.data : ""; first_is_system = 1;
         }
     }
     {
         char head[8192]; size_t n = 0;
         chat_system(head, sizeof head, &n, sys, think);
+        free(sys_buf.data);
         PUT(head);
     }
     for (int i = first_is_system ? 1 : 0; i < messages->len; i++) {
         jval *message = messages->kids[i];
         jval *role = ling_json_field(message, "role", J_STR);
-        jval *content = ling_json_field(message, "content", J_STR);
-        if (!role || !content) continue;
-        if (!strcmp(role->str, "user"))        PUT("<role>HUMAN</role>");
-        else if (!strcmp(role->str, "system")) PUT("<role>SYSTEM</role>");
-        else if (!strcmp(role->str, "assistant")) {
+        if (!role || !ling_msg_has_text(message)) continue;
+        if (!strcmp(role->str, "user")) {
+            PUT("<role>HUMAN</role>");
+            if (!ling_append_content(prompt, message)) return 0;
+            PUT("<|role_end|>");
+            continue;
+        }
+        if (!strcmp(role->str, "system")) {
+            PUT("<role>SYSTEM</role>");
+            if (!ling_append_content(prompt, message)) return 0;
+            PUT("<|role_end|>");
+            continue;
+        }
+        if (!strcmp(role->str, "assistant")) {
             /* preserved_thinking: an earlier turn's reasoning is replayed if the client
              * sends it back, either as reasoning_content or still inline in content. */
             jval *rc = ling_json_field(message, "reasoning_content", J_STR);
-            const char *text = content->str;
+            LingString text_buf = {0};
+            if (!ling_append_content(&text_buf, message)) { free(text_buf.data); return 0; }
+            const char *text = text_buf.data ? text_buf.data : "";
             PUT("<role>ASSISTANT</role>\n<think>");
             if (rc && *rc->str) PUT(rc->str);
             else {
@@ -2208,18 +2256,16 @@ static int ling_build_chat_prompt(jval *messages, LingString *prompt, int think)
                 if (close) {
                     const char *open = strstr(text, "<think>");
                     const char *begin = open && open < close ? open + 7 : text;
-                    if (!ling_string_append(prompt, begin, (size_t)(close - begin))) return 0;
+                    if (!ling_string_append(prompt, begin, (size_t)(close - begin))) { free(text_buf.data); return 0; }
                     text = close + sizeof LING_THINK_CLOSE - 1;
                 }
             }
             PUT("</think>");
-            PUT(text);
+            if (!ling_string_append(prompt, text, strlen(text))) { free(text_buf.data); return 0; }
             PUT("<|role_end|>");
+            free(text_buf.data);
             continue;
         }
-        else continue;
-        PUT(content->str);
-        PUT("<|role_end|>");
     }
     PUT("<role>ASSISTANT</role>\n<think>");
     if (!think) PUT("</think>");
@@ -2260,8 +2306,7 @@ static int ling_serve_chat(LingServerContext *ctx, int fd, jval *root) {
     for (int i = 0; i < messages->len; i++) {
         jval *msg = messages->kids[i];
         jval *role = ling_json_field(msg,"role",J_STR);
-        jval *content = ling_json_field(msg,"content",J_STR);
-        if (role && content && !strcmp(role->str,"user")) has_user = 1;
+        if (role && !strcmp(role->str,"user") && ling_msg_has_text(msg)) has_user = 1;
     }
     if (!has_user) return samosa_http_json_error(fd,400,"invalid_messages","A text user message is required.");
 
@@ -2400,7 +2445,7 @@ static int ling_serve_chat(LingServerContext *ctx, int fd, jval *root) {
     free(answer.data); free(reasoning.data); pthread_mutex_unlock(&ctx->generation_mu); free(ids); free(logits); free(pbuf); free(seen); return 0;
 }
 
-static int ling_serve_handler(SamosaHttpServer *server, int fd, const SamosaHttpRequest *request, void *opaque) {
+static int ling_serve_dispatch(SamosaHttpServer *server, int fd, const SamosaHttpRequest *request, void *opaque) {
     LingServerContext *ctx = opaque;
     if (!strcmp(request->method,"GET") && !strcmp(request->path,"/healthz"))
         return samosa_http_response(fd,200,"application/json","{\"status\":\"ok\"}",NULL);
@@ -2411,8 +2456,42 @@ static int ling_serve_handler(SamosaHttpServer *server, int fd, const SamosaHttp
             ctx->model_id, ctx->model->c.ctx, ctx->model->c.ctx);
         return samosa_http_response(fd,200,"application/json",body,NULL);
     }
+    if (!strcmp(request->method,"GET") && !strcmp(request->path,"/models")) {
+        char body[512]; snprintf(body,sizeof body,
+            "{\"data\":[{\"id\":\"%s\",\"status\":{\"value\":\"loaded\"},"
+            "\"meta\":{\"n_ctx\":%d}}]}",
+            ctx->model_id, ctx->model->c.ctx);
+        return samosa_http_response(fd,200,"application/json",body,NULL);
+    }
+    if (!strcmp(request->method,"GET") && !strcmp(request->path,"/models/sse")) {
+        /* Not a router: there is nothing to notify. Hold the stream open (as llama.cpp's
+         * router does between events) so clients that watch for model-status changes
+         * block here instead of hammering us with reconnects. */
+        if (!samosa_http_stream_headers(fd)) return 0;
+        char buf[256];
+        while (!atomic_load(&server->stopping)) {
+            ssize_t n = recv(fd, buf, sizeof buf, 0);
+            if (n == 0) break;
+            if (n < 0) { if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue; break; }
+        }
+        return 1;
+    }
+    if (!strcmp(request->method,"GET") && !strcmp(request->path,"/props")) {
+        char body[768]; snprintf(body,sizeof body,
+            "{\"default_generation_settings\":{\"n_ctx\":%d},"
+            "\"total_slots\":1,\"model_path\":\"%s\",\"model_alias\":\"%s\","
+            "\"chat_template\":\"\",\"bos_token\":\"\",\"eos_token\":\"\","
+            "\"build_info\":\"zunzuncito\",\"endpoint_slots\":false,"
+            "\"endpoint_props\":false,\"endpoint_metrics\":false}",
+            ctx->model->c.ctx, ctx->model_id, ctx->model_id);
+        return samosa_http_response(fd,200,"application/json",body,NULL);
+    }
+    if (!strcmp(request->method,"POST") && !strcmp(request->path,"/props")) {
+        return samosa_http_json_error(fd,501,"not_supported",
+            "This server does not support changing global properties.");
+    }
     if (!strcmp(request->method,"POST") && !strcmp(request->path,"/v1/cancel")) {
-        atomic_store(&ctx->cancel,1); samosa_http_response(fd,200,"application/json","{\"cancelled\":true}",NULL);
+        atomic_store(&ctx->cancel,1); return samosa_http_response(fd,200,"application/json","{\"cancelled\":true}",NULL);
     }
     if (!strcmp(request->method,"POST") && !strcmp(request->path,"/v1/chat/completions")) {
         char *arena=NULL; jval *root=json_parse(request->body,&arena);
@@ -2423,6 +2502,13 @@ static int ling_serve_handler(SamosaHttpServer *server, int fd, const SamosaHttp
         atomic_store(&ctx->cancel,1); samosa_http_response(fd,200,"application/json","{\"shutting_down\":true}",NULL); samosa_http_server_stop(server); return 1;
     }
     return samosa_http_json_error(fd,404,"not_found","Endpoint not found.");
+}
+
+static int ling_serve_handler(SamosaHttpServer *server, int fd, const SamosaHttpRequest *request, void *opaque) {
+    samosa_last_status = 0;
+    int rc = ling_serve_dispatch(server, fd, request, opaque);
+    fprintf(stderr,"[server] %s %s -> %d\n",request->method,request->path,samosa_last_status); fflush(stderr);
+    return rc;
 }
 
 static int run_ling_server(M *m, Buf *buffers, LfmTok *tokenizer, const char *model_id,

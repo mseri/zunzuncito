@@ -1521,6 +1521,41 @@ static jval *mp_json_field(jval *object, const char *key, jtype type) {
     jval *v = json_get(object, key); return v && v->t == type ? v : NULL;
 }
 
+/* OpenAI content is either a plain string or an array of content-part objects (used by
+ * clients that also attach images), e.g. [{"type":"text","text":"..."}, ...]. Text parts
+ * are concatenated in order; non-text parts (image_url, etc.) are silently dropped since
+ * this model takes no visual input over this endpoint. */
+static int mp_msg_has_text(jval *msg) {
+    jval *content = json_get(msg, "content");
+    if (!content) return 0;
+    if (content->t == J_STR) return 1;
+    if (content->t != J_ARR) return 0;
+    for (int i = 0; i < content->len; i++) {
+        jval *part = content->kids[i];
+        if (part->t != J_OBJ) continue;
+        jval *type = json_get(part, "type"), *text = json_get(part, "text");
+        if (type && type->t == J_STR && strcmp(type->str, "text")) continue;
+        if (text && text->t == J_STR) return 1;
+    }
+    return 0;
+}
+
+static int mp_append_content(MpString *dst, jval *msg) {
+    jval *content = json_get(msg, "content");
+    if (!content) return 1;
+    if (content->t == J_STR) return mp_string_append(dst, content->str, strlen(content->str));
+    if (content->t != J_ARR) return 1;
+    for (int i = 0; i < content->len; i++) {
+        jval *part = content->kids[i];
+        if (part->t != J_OBJ) continue;
+        jval *type = json_get(part, "type"), *text = json_get(part, "text");
+        if (type && type->t == J_STR && strcmp(type->str, "text")) continue;
+        if (!text || text->t != J_STR) continue;
+        if (!mp_string_append(dst, text->str, strlen(text->str))) return 0;
+    }
+    return 1;
+}
+
 static int mp_build_chat_prompt(jval *messages, MpString *prompt) {
     if (!messages || messages->t != J_ARR) return 0;
     #define PUT(s) do { const char *_s = (s); \
@@ -1528,14 +1563,13 @@ static int mp_build_chat_prompt(jval *messages, MpString *prompt) {
     for (int i = 0; i < messages->len; i++) {
         jval *message = messages->kids[i];
         jval *role = mp_json_field(message, "role", J_STR);
-        jval *content = mp_json_field(message, "content", J_STR);
-        if (!role || !content) continue;
+        if (!role || !mp_msg_has_text(message)) continue;
         if (strcmp(role->str, "system") && strcmp(role->str, "user") &&
             strcmp(role->str, "assistant")) continue;
         PUT("<|im_start|>");
         PUT(role->str);
         PUT("\n");
-        PUT(content->str);
+        if (!mp_append_content(prompt, message)) return 0;
         PUT("<|im_end|>\n");
     }
     /* The template's generation prompt opens a reasoning block unconditionally, and
@@ -1580,8 +1614,7 @@ static int mp_serve_chat(MapleServerContext *ctx, int fd, jval *root) {
     for (int i = 0; i < messages->len; i++) {
         jval *msg = messages->kids[i];
         jval *role = mp_json_field(msg,"role",J_STR);
-        jval *content = mp_json_field(msg,"content",J_STR);
-        if (role && content && !strcmp(role->str,"user")) has_user = 1;
+        if (role && !strcmp(role->str,"user") && mp_msg_has_text(msg)) has_user = 1;
     }
     if (!has_user) return samosa_http_json_error(fd,400,"invalid_messages","A text user message is required.");
 
@@ -1704,7 +1737,7 @@ static int mp_serve_chat(MapleServerContext *ctx, int fd, jval *root) {
     free(answer.data); pthread_mutex_unlock(&ctx->generation_mu); free(ids); free(logits); free(pbuf); free(seen); return 0;
 }
 
-static int mp_serve_handler(SamosaHttpServer *server, int fd, const SamosaHttpRequest *request, void *opaque) {
+static int mp_serve_dispatch(SamosaHttpServer *server, int fd, const SamosaHttpRequest *request, void *opaque) {
     MapleServerContext *ctx = opaque;
     if (!strcmp(request->method,"GET") && !strcmp(request->path,"/healthz"))
         return samosa_http_response(fd,200,"application/json","{\"status\":\"ok\"}",NULL);
@@ -1715,8 +1748,42 @@ static int mp_serve_handler(SamosaHttpServer *server, int fd, const SamosaHttpRe
             ctx->model_id, ctx->model->c.ctx, ctx->model->c.ctx);
         return samosa_http_response(fd,200,"application/json",body,NULL);
     }
+    if (!strcmp(request->method,"GET") && !strcmp(request->path,"/models")) {
+        char body[512]; snprintf(body,sizeof body,
+            "{\"data\":[{\"id\":\"%s\",\"status\":{\"value\":\"loaded\"},"
+            "\"meta\":{\"n_ctx\":%d}}]}",
+            ctx->model_id, ctx->model->c.ctx);
+        return samosa_http_response(fd,200,"application/json",body,NULL);
+    }
+    if (!strcmp(request->method,"GET") && !strcmp(request->path,"/models/sse")) {
+        /* Not a router: there is nothing to notify. Hold the stream open (as llama.cpp's
+         * router does between events) so clients that watch for model-status changes
+         * block here instead of hammering us with reconnects. */
+        if (!samosa_http_stream_headers(fd)) return 0;
+        char buf[256];
+        while (!atomic_load(&server->stopping)) {
+            ssize_t n = recv(fd, buf, sizeof buf, 0);
+            if (n == 0) break;
+            if (n < 0) { if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue; break; }
+        }
+        return 1;
+    }
+    if (!strcmp(request->method,"GET") && !strcmp(request->path,"/props")) {
+        char body[768]; snprintf(body,sizeof body,
+            "{\"default_generation_settings\":{\"n_ctx\":%d},"
+            "\"total_slots\":1,\"model_path\":\"%s\",\"model_alias\":\"%s\","
+            "\"chat_template\":\"\",\"bos_token\":\"\",\"eos_token\":\"\","
+            "\"build_info\":\"zunzuncito\",\"endpoint_slots\":false,"
+            "\"endpoint_props\":false,\"endpoint_metrics\":false}",
+            ctx->model->c.ctx, ctx->model_id, ctx->model_id);
+        return samosa_http_response(fd,200,"application/json",body,NULL);
+    }
+    if (!strcmp(request->method,"POST") && !strcmp(request->path,"/props")) {
+        return samosa_http_json_error(fd,501,"not_supported",
+            "This server does not support changing global properties.");
+    }
     if (!strcmp(request->method,"POST") && !strcmp(request->path,"/v1/cancel")) {
-        atomic_store(&ctx->cancel,1); samosa_http_response(fd,200,"application/json","{\"cancelled\":true}",NULL);
+        atomic_store(&ctx->cancel,1); return samosa_http_response(fd,200,"application/json","{\"cancelled\":true}",NULL);
     }
     if (!strcmp(request->method,"POST") && !strcmp(request->path,"/v1/chat/completions")) {
         char *arena=NULL; jval *root=json_parse(request->body,&arena);
@@ -1727,6 +1794,13 @@ static int mp_serve_handler(SamosaHttpServer *server, int fd, const SamosaHttpRe
         atomic_store(&ctx->cancel,1); samosa_http_response(fd,200,"application/json","{\"shutting_down\":true}",NULL); samosa_http_server_stop(server); return 1;
     }
     return samosa_http_json_error(fd,404,"not_found","Endpoint not found.");
+}
+
+static int mp_serve_handler(SamosaHttpServer *server, int fd, const SamosaHttpRequest *request, void *opaque) {
+    samosa_last_status = 0;
+    int rc = mp_serve_dispatch(server, fd, request, opaque);
+    fprintf(stderr,"[server] %s %s -> %d\n",request->method,request->path,samosa_last_status); fflush(stderr);
+    return rc;
 }
 
 static int run_maple_server(M *m, Buf *buffers, LfmTok *tokenizer, int vlimit,

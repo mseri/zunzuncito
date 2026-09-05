@@ -41,6 +41,8 @@ typedef struct SamosaHttpServer {
     void *handler_ctx;
 } SamosaHttpServer;
 
+static __thread int samosa_last_status = 0;
+
 static int samosa_send_all(int fd, const void *data, size_t size) {
     const char *cursor=(const char *)data;
     while (size) {
@@ -64,6 +66,7 @@ static const char *samosa_http_reason(int status) {
         case 409: return "Conflict"; case 413: return "Payload Too Large";
         case 429: return "Too Many Requests";
         case 500: return "Internal Server Error";
+        case 501: return "Not Implemented";
         case 503: return "Service Unavailable";
         default: return "Error";
     }
@@ -71,6 +74,7 @@ static const char *samosa_http_reason(int status) {
 
 static int samosa_http_headers(int fd, int status, const char *content_type,
                                size_t content_length, const char *extra) {
+    samosa_last_status = status;
     char header[2048];
     int n=snprintf(header,sizeof(header),
         "HTTP/1.1 %d %s\r\n"
@@ -104,6 +108,7 @@ static int samosa_http_json_error(int fd, int status, const char *code,
 }
 
 static int samosa_http_stream_headers(int fd) {
+    samosa_last_status = 200;
     const char *header=
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: text/event-stream; charset=utf-8\r\n"
