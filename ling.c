@@ -2573,6 +2573,16 @@ static int ling_serve_chat(LingServerContext *ctx, int fd, jval *root) {
     }
     if (max_tokens > c->ctx - np) max_tokens = c->ctx - np;   /* clamp, do not fail */
 
+    /* The response opens before the lock and the prefill, not after: both can take
+     * minutes on a long prompt, and a client that has seen no bytes at all since it sent
+     * the request times out waiting. Everything that could still fail with a 4xx has been
+     * checked by this point. */
+    char id[64]; snprintf(id,sizeof id,"ling-%llu",(unsigned long long)time(NULL));
+    SamosaKeepalive keepalive = {0};
+    if (stream) {
+        if (!samosa_http_stream_headers(fd)) { free(ids); free(logits); free(pbuf); free(seen); return 1; }
+        samosa_keepalive_start(&keepalive, fd);
+    }
     pthread_mutex_lock(&ctx->generation_mu);
     atomic_store(&ctx->cancel, 0);
     /* Prefix reuse is restricted here. The KDA state and the short-conv state only move
@@ -2585,10 +2595,10 @@ static int ling_serve_chat(LingServerContext *ctx, int fd, jval *root) {
         forward(m, ids + common, np - common, common, logits, 1, ctx->buffers);
     else
         forward(m, ids, np, 0, logits, 1, ctx->buffers);
+    samosa_keepalive_stop(&keepalive);
 
-    char id[64]; snprintf(id,sizeof id,"ling-%llu",(unsigned long long)time(NULL));
-    if (stream && !samosa_http_stream_headers(fd)) { pthread_mutex_unlock(&ctx->generation_mu); free(ids); free(logits); free(pbuf); free(seen); return 1; }
     LingString answer = {0}, reasoning = {0};
+    size_t sent = 0; int saw_tool_tag = 0;   /* tools_present streaming, see below */
     /* think means the prompt ended on an open <think>, so generation starts in it. */
     LingThink split = { .in_think = think };
     uint64_t rng = seed ? (uint64_t)seed : 0x853c49e6748fea9bULL;
@@ -2604,11 +2614,18 @@ static int ling_serve_chat(LingServerContext *ctx, int fd, jval *root) {
         if (stream) {
             if (reasoning.len > was_r && !ling_send_chunk(fd,id,"reasoning_content",reasoning.data+was_r,reasoning.len-was_r))
                 { atomic_store(&ctx->cancel,1); break; }
-            /* With tools in play, the answer is buffered whole below and scanned for
-             * <tool_call> blocks -- streaming it token-by-token would leak the raw XML
-             * tags into the client's rendered "content" before we know it was a call. */
-            if (!tools_present && answer.len > was_c && !ling_send_chunk(fd,id,"content",answer.data+was_c,answer.len-was_c))
+            /* With tools in play the answer still streams, but only up to the point where
+             * a <tool_call> tag might be starting: those bytes belong to the tool_calls
+             * delta, and leaking the raw XML into the client's rendered content is exactly
+             * what the hold-back avoids. Once a tag has actually appeared, content stops. */
+            size_t upto = answer.len;
+            if (tools_present)
+                upto = saw_tool_tag ? sent
+                     : oai_streamable_len(answer.data, answer.len, "<tool_call>", &saw_tool_tag);
+            size_t from = tools_present ? sent : was_c;
+            if (upto > from && !ling_send_chunk(fd,id,"content",answer.data+from,upto-from))
                 { atomic_store(&ctx->cancel,1); break; }
+            if (upto > sent) sent = upto;
         }
         ids[np + generated++] = token;
         if (generated < max_tokens) forward(m, &token, 1, np + generated - 1, logits, 1, ctx->buffers);
@@ -2630,11 +2647,13 @@ static int ling_serve_chat(LingServerContext *ctx, int fd, jval *root) {
     }
     const char *final_reason = calls.len ? "tool_calls" : reason;
     if (stream) {
+        /* Whatever the hold-back kept back: the tail of the spoken text before the first
+         * tool call, or -- when the tag never materialised -- the tail of the answer. */
         if (calls.len) {
-            if (leading.len) ling_send_chunk(fd,id,"content",leading.data,leading.len);
+            if (leading.len > sent) ling_send_chunk(fd,id,"content",leading.data+sent,leading.len-sent);
             ling_send_tool_call_chunk(fd,id,&calls);
-        } else if (tools_present && answer.len) {
-            ling_send_chunk(fd,id,"content",answer.data,answer.len);
+        } else if (tools_present && answer.len > sent) {
+            ling_send_chunk(fd,id,"content",answer.data+sent,answer.len-sent);
         }
         ling_send_done(fd,id,np,generated,final_reason);
     } else {

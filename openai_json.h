@@ -256,6 +256,24 @@ static inline int oai_is_number_literal(const char *v, size_t n) {
     return i==n;
 }
 
+/* How much of a completion is safe to stream to the client right now, given that a
+ * tool call announces itself with `open_tag` and everything from that tag on belongs to
+ * the tool_calls delta rather than to content. Returns the length of the prefix that
+ * cannot become part of a tag: the text before an open tag if one has already appeared,
+ * otherwise everything except a trailing run that is still a proper prefix of one.
+ * *saw_tag is set once the tag itself is in the buffer, after which nothing more of the
+ * answer should be streamed as content. */
+static size_t oai_streamable_len(const char *text, size_t len, const char *open_tag,
+                                 int *saw_tag) {
+    size_t t = strlen(open_tag);
+    const char *hit = text ? strstr(text, open_tag) : NULL;
+    if (hit) { *saw_tag = 1; return (size_t)(hit - text); }
+    size_t max = len < t - 1 ? len : t - 1;
+    for (size_t k = max; k > 0; k--)
+        if (!memcmp(text + len - k, open_tag, k)) return len - k;
+    return len;
+}
+
 /* A parsed OpenAI-style tool call (function name + JSON arguments string), as extracted
  * from a model's own wire format. Shared bookkeeping type: every model server collects
  * the same (name, arguments) pairs, only the parser that fills them differs. */

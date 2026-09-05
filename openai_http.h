@@ -120,6 +120,33 @@ static int samosa_http_json_error(int fd, int status, const char *code,
                                 status==429?"Retry-After: 1\r\n":NULL);
 }
 
+/* Keeps an already-opened SSE response alive while the handler is busy doing something
+ * that produces no tokens -- waiting for the generation lock, then prefilling. A long
+ * prompt can prefill for minutes on these engines, and a client that has seen no bytes
+ * since its request gives up long before the first token. SSE comment lines are ignored
+ * by every conforming client, so this costs nothing but the socket write. */
+typedef struct { int fd; atomic_int stop; pthread_t thread; int running; } SamosaKeepalive;
+
+static void *samosa_keepalive_main(void *opaque) {
+    SamosaKeepalive *k=(SamosaKeepalive *)opaque;
+    for (;;) {
+        for (int i=0;i<100 && !atomic_load(&k->stop);i++) usleep(100000);   /* 10s, checked often */
+        if (atomic_load(&k->stop)) break;
+        if (!samosa_send_all(k->fd,": keepalive\n\n",13)) break;
+    }
+    return NULL;
+}
+
+static void samosa_keepalive_start(SamosaKeepalive *k, int fd) {
+    k->fd=fd; atomic_init(&k->stop,0);
+    k->running = pthread_create(&k->thread,NULL,samosa_keepalive_main,k)==0;
+}
+
+static void samosa_keepalive_stop(SamosaKeepalive *k) {
+    if (!k->running) return;
+    atomic_store(&k->stop,1); pthread_join(k->thread,NULL); k->running=0;
+}
+
 static int samosa_http_stream_headers(int fd) {
     samosa_log_status(200);
     const char *header=
@@ -188,7 +215,10 @@ static int samosa_http_read_request(int fd, SamosaHttpRequest *request,
     while (used<SAMOSA_HTTP_MAX_HEADER) {
         ssize_t n=recv(fd,buffer+used,SAMOSA_HTTP_MAX_HEADER-used,0);
         if (n<0 && errno==EINTR) continue;
-        if (n<=0) { free(buffer); return 0; }
+        /* A connection that closed or timed out without sending a single byte never made
+         * a request: clients routinely open spare sockets they end up not using. Answering
+         * those with 400 is both wrong and noise in the log. */
+        if (n<=0) { free(buffer); if (!used) *error_status=0; return 0; }
         used+=(size_t)n; buffer[used]=0;
         char *end=strstr(buffer,"\r\n\r\n");
         if (end) { header_bytes=(size_t)(end-buffer)+4; break; }
@@ -248,9 +278,11 @@ static void *samosa_http_connection_main(void *opaque) {
     int one=1; setsockopt(fd,SOL_SOCKET,SO_NOSIGPIPE,&one,sizeof(one));
 #endif
     SamosaHttpRequest request; int error_status=400;
-    if (!samosa_http_read_request(fd,&request,&error_status))
-        samosa_http_json_error(fd,error_status,"invalid_http_request",
-                               "Invalid or oversized HTTP request.");
+    if (!samosa_http_read_request(fd,&request,&error_status)) {
+        if (error_status)
+            samosa_http_json_error(fd,error_status,"invalid_http_request",
+                                   "Invalid or oversized HTTP request.");
+    }
     else {
         samosa_current_request=&request;
         fprintf(stderr,"[server] %s %s\n",request.method,request.path); fflush(stderr);

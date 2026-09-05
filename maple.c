@@ -1809,6 +1809,16 @@ static int mp_serve_chat(MapleServerContext *ctx, int fd, jval *root) {
     }
     if (max_tokens > c->ctx - np) max_tokens = c->ctx - np;   /* clamp, do not fail */
 
+    /* The response opens before the lock and the prefill, not after: both can take
+     * minutes on a long prompt, and a client that has seen no bytes at all since it sent
+     * the request times out waiting. Everything that could still fail with a 4xx has been
+     * checked by this point. */
+    char id[64]; snprintf(id,sizeof id,"maple-%llu",(unsigned long long)time(NULL));
+    SamosaKeepalive keepalive = {0};
+    if (stream) {
+        if (!samosa_http_stream_headers(fd)) { free(ids); free(logits); free(pbuf); free(seen); return 1; }
+        samosa_keepalive_start(&keepalive, fd);
+    }
     pthread_mutex_lock(&ctx->generation_mu);
     atomic_store(&ctx->cancel, 0);
     /* Prefix reuse. Every layer here is attention with a position-addressed KV, so
@@ -1822,9 +1832,9 @@ static int mp_serve_chat(MapleServerContext *ctx, int fd, jval *root) {
         forward(m, ids + common, np - common, common, logits, 1, ctx->buffers);
     else
         forward(m, ids, np, 0, logits, 1, ctx->buffers);
+    samosa_keepalive_stop(&keepalive);
 
-    char id[64]; snprintf(id,sizeof id,"maple-%llu",(unsigned long long)time(NULL));
-    if (stream && !samosa_http_stream_headers(fd)) { pthread_mutex_unlock(&ctx->generation_mu); free(ids); free(logits); free(pbuf); free(seen); return 1; }
+    size_t sent = 0; int saw_tool_tag = 0;   /* tools_present streaming, see below */
     MpString answer = {0}; uint64_t rng = seed ? (uint64_t)seed : 0x853c49e6748fea9bULL;
     int generated = 0; const char *reason = "length";
     while (generated < max_tokens && !atomic_load(&ctx->cancel)) {
@@ -1834,9 +1844,20 @@ static int mp_serve_chat(MapleServerContext *ctx, int fd, jval *root) {
         char piece[4096]; int n = lfmtok_decode(tok, &token, 1, piece, sizeof piece - 1);
         if (n <= 0) { reason = "stop"; break; }
         if (!mp_string_append(&answer, piece, (size_t)n)) { atomic_store(&ctx->cancel,1); break; }
-        /* With tools in play, the answer is buffered whole and scanned for <tool_call>
-         * blocks below -- streaming it token-by-token would leak the raw tags. */
-        if (stream && !tools_present && !mp_send_chunk(fd,id,"content",piece,(size_t)n)) { atomic_store(&ctx->cancel,1); break; }
+        /* With tools in play the answer still streams, but only up to the point where a
+         * <tool_call> tag might be starting: those bytes belong to the tool_calls delta,
+         * and leaking the raw tags into the client's rendered content is exactly what the
+         * hold-back avoids. Once a tag has actually appeared, content stops. */
+        if (stream) {
+            size_t upto = answer.len;
+            if (tools_present)
+                upto = saw_tool_tag ? sent
+                     : oai_streamable_len(answer.data, answer.len, "<tool_call>", &saw_tool_tag);
+            size_t from = tools_present ? sent : answer.len - (size_t)n;
+            if (upto > from && !mp_send_chunk(fd,id,"content",answer.data+from,upto-from))
+                { atomic_store(&ctx->cancel,1); break; }
+            if (upto > sent) sent = upto;
+        }
         ids[np + generated++] = token;
         if (generated < max_tokens) forward(m, &token, 1, np + generated - 1, logits, 1, ctx->buffers);
     }
@@ -1849,11 +1870,13 @@ static int mp_serve_chat(MapleServerContext *ctx, int fd, jval *root) {
     }
     const char *final_reason = calls.len ? "tool_calls" : reason;
     if (stream) {
+        /* Whatever the hold-back kept back: the tail of the spoken text before the first
+         * tool call, or -- when the tag never materialised -- the tail of the answer. */
         if (calls.len) {
-            if (leading.len) mp_send_chunk(fd,id,"content",leading.data,leading.len);
+            if (leading.len > sent) mp_send_chunk(fd,id,"content",leading.data+sent,leading.len-sent);
             mp_send_tool_call_chunk(fd,id,&calls);
-        } else if (tools_present && answer.len) {
-            mp_send_chunk(fd,id,"content",answer.data,answer.len);
+        } else if (tools_present && answer.len > sent) {
+            mp_send_chunk(fd,id,"content",answer.data+sent,answer.len-sent);
         }
         mp_send_done(fd,id,np,generated,final_reason);
     } else {
