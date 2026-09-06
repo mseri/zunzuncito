@@ -2258,6 +2258,66 @@ static int lfm_json_escape(LfmString *s, const char *text, size_t len) {
     return 1;
 }
 
+/* Unlike the CLI, the server never pre-fills <think>: this model decides for itself
+ * whether to reason, so the opening tag is part of the completion rather than of the
+ * prompt. Split on both tags -- what lies between them is the turn's reasoning_content,
+ * everything else is content -- so that a client is not handed a raw <think> block as
+ * prose. Until the first non-space byte has decided the question the stream is held,
+ * and so is any tail that is still a proper prefix of a tag, since either can straddle
+ * a decode boundary. */
+#define LFM_THINK_OPEN  "<think>"
+#define LFM_THINK_CLOSE "</think>"
+enum { LFM_THINK_BEFORE, LFM_THINK_INSIDE, LFM_THINK_AFTER };
+typedef struct { int state; char hold[sizeof LFM_THINK_CLOSE]; size_t nhold; } LfmThink;
+
+static int lfm_think_feed(LfmThink *s, const char *piece, size_t len,
+                          LfmString *reasoning, LfmString *content) {
+    static const size_t open_len = sizeof LFM_THINK_OPEN - 1;
+    static const size_t close_len = sizeof LFM_THINK_CLOSE - 1;
+    if (s->state == LFM_THINK_AFTER) return lfm_string_append(content, piece, len);
+    char buf[4096 + sizeof LFM_THINK_CLOSE];
+    if (len > sizeof buf - s->nhold - 1) len = sizeof buf - s->nhold - 1;  /* cannot happen */
+    memcpy(buf, s->hold, s->nhold);
+    memcpy(buf + s->nhold, piece, len);
+    size_t m = s->nhold + len;
+    buf[m] = 0;
+    s->nhold = 0;
+    if (s->state == LFM_THINK_BEFORE) {
+        /* Leading whitespace belongs to neither field and is dropped: it is the template's
+         * own separator, and keeping it would put a stray newline in front of every answer. */
+        size_t i = 0;
+        while (i < m && (buf[i]==' '||buf[i]=='\n'||buf[i]=='\r'||buf[i]=='\t')) i++;
+        size_t rest = m - i;
+        if (rest >= open_len && !memcmp(buf + i, LFM_THINK_OPEN, open_len)) {
+            s->state = LFM_THINK_INSIDE;
+            memmove(buf, buf + i + open_len, m = rest - open_len);
+        } else if (rest && memcmp(buf + i, LFM_THINK_OPEN, rest)) {
+            s->state = LFM_THINK_AFTER;                  /* cannot become an opening tag */
+            memmove(buf, buf + i, m = rest);
+        } else {                                          /* still undecided: hold it all */
+            memcpy(s->hold, buf + i, rest); s->nhold = rest;
+            return 1;
+        }
+    }
+    if (s->state == LFM_THINK_AFTER) return lfm_string_append(content, buf, m);
+    char *cut = memmem(buf, m, LFM_THINK_CLOSE, close_len);
+    if (cut) {
+        s->state = LFM_THINK_AFTER;
+        return lfm_string_append(reasoning, buf, (size_t)(cut - buf)) &&
+               lfm_string_append(content, cut + close_len, m - (size_t)(cut - buf) - close_len);
+    }
+    size_t h = m < close_len - 1 ? m : close_len - 1;      /* longest held-back tag prefix */
+    while (h > 0 && memcmp(buf + m - h, LFM_THINK_CLOSE, h) != 0) h--;
+    memcpy(s->hold, buf + m - h, h); s->nhold = h;
+    return lfm_string_append(reasoning, buf, m - h);
+}
+
+/* End of generation: whatever is still held back was never a tag. */
+static int lfm_think_flush(LfmThink *s, LfmString *reasoning, LfmString *content) {
+    size_t h = s->nhold; s->nhold = 0;
+    return lfm_string_append(s->state == LFM_THINK_INSIDE ? reasoning : content, s->hold, h);
+}
+
 static jval *lfm_json_field(jval *object, const char *key, jtype type) {
     jval *v = json_get(object, key); return v && v->t == type ? v : NULL;
 }
@@ -2379,7 +2439,11 @@ static int lfm_parse_arg_value(const char *v, size_t n, LfmString *out) {
 
 /* Parses <|tool_call_start|>[name(k='v', k2=42), ...]<|tool_call_end|> out of the raw
  * completion text. Commas and '=' inside quotes/brackets are not split points, tracked
- * with lfm_scan_top_level rather than a real Python-expression parser. */
+ * with lfm_scan_top_level rather than a real Python-expression parser.
+ * The closing tag is treated as optional: the model drops it often enough that
+ * insisting on it would leak the raw markup into content instead of reporting the call.
+ * A block therefore ends at <|tool_call_end|> if it is there, otherwise at the next
+ * <|tool_call_start|> or at the end of the text. */
 static int lfm_extract_tool_calls(const char *text, OaiToolCalls *calls, LfmString *leading) {
     const char *open_tag = "<|tool_call_start|>", *close_tag = "<|tool_call_end|>";
     size_t open_len = strlen(open_tag), close_len = strlen(close_tag);
@@ -2389,7 +2453,13 @@ static int lfm_extract_tool_calls(const char *text, OaiToolCalls *calls, LfmStri
     while (first) {
         const char *body_start = first + open_len;
         const char *body_end = strstr(body_start, close_tag);
-        if (!body_end) break;
+        const char *next_open = strstr(body_start, open_tag);
+        const char *resume;
+        if (!body_end || (next_open && next_open < body_end)) {
+            body_end = next_open ? next_open : body_start + strlen(body_start);
+            resume = next_open;                       /* already an open tag; do not rescan */
+        } else
+            resume = strstr(body_end + close_len, open_tag);
         const char *s = body_start, *e = body_end;
         while (s < e && isspace((unsigned char)*s)) s++;
         while (e > s && isspace((unsigned char)e[-1])) e--;
@@ -2435,14 +2505,16 @@ static int lfm_extract_tool_calls(const char *text, OaiToolCalls *calls, LfmStri
                         q = (ksep < args_end) ? ksep + 1 : args_end;
                     }
                     ok = ok && lfm_string_append(&args, "}", 1);
-                    if (ok) { int pushed = oai_tool_calls_push(calls, p, (size_t)(name_end - p), args.data, args.len); ok = pushed; }
+                    /* A nameless block is a truncation, not a call: report nothing
+                     * rather than a call the client cannot dispatch. */
+                    if (ok && name_end > p) ok = oai_tool_calls_push(calls, p, (size_t)(name_end - p), args.data, args.len);
                     free(args.data);
                 }
             }
             p = (sep < e) ? sep + 1 : e;
         }
         if (!ok) return 0;
-        first = strstr(body_end + close_len, open_tag);
+        first = resume;
     }
     return 1;
 }
@@ -2644,7 +2716,9 @@ static int lfm_serve_chat(LfmServerContext *ctx, int fd, jval *root) {
     double t_decode = samosa_now();
 
     size_t sent = 0; int saw_tool_tag = 0;   /* tools_present streaming, see below */
-    LfmString answer = {0}; uint64_t rng = seed ? (uint64_t)seed : 0x853c49e6748fea9bULL;
+    LfmString answer = {0}, reasoning = {0};
+    LfmThink split = { .state = LFM_THINK_BEFORE };
+    uint64_t rng = seed ? (uint64_t)seed : 0x853c49e6748fea9bULL;
     int generated = 0; const char *reason = "length";
     while (generated < max_tokens && !atomic_load(&ctx->cancel)) {
         repetition_penalty(logits, c->vocab, ids, np + generated, penalty, seen);
@@ -2652,23 +2726,34 @@ static int lfm_serve_chat(LfmServerContext *ctx, int fd, jval *root) {
         if (token == ctx->eos || token == ctx->eot) { reason = "stop"; break; }
         char piece[4096]; int n = lfmtok_decode(tok, &token, 1, piece, sizeof piece - 1);
         if (n <= 0) { reason = "stop"; break; }
-        if (!lfm_string_append(&answer, piece, (size_t)n)) { atomic_store(&ctx->cancel,1); break; }
-        /* With tools in play the answer still streams, but only up to the point where a
-         * <|tool_call_start|> tag might be starting: those bytes belong to the tool_calls
-         * delta, and leaking the raw wire syntax into the client's rendered content is
-         * exactly what the hold-back avoids. Once a tag has appeared, content stops. */
+        size_t was_r = reasoning.len, was_c = answer.len;
+        if (!lfm_think_feed(&split, piece, (size_t)n, &reasoning, &answer)) { atomic_store(&ctx->cancel,1); break; }
         if (stream) {
+            if (reasoning.len > was_r && !lfm_send_chunk(fd,id,"reasoning_content",reasoning.data+was_r,reasoning.len-was_r))
+                { atomic_store(&ctx->cancel,1); break; }
+            /* With tools in play the answer still streams, but only up to the point where a
+             * <|tool_call_start|> tag might be starting: those bytes belong to the tool_calls
+             * delta, and leaking the raw wire syntax into the client's rendered content is
+             * exactly what the hold-back avoids. Once a tag has appeared, content stops. */
             size_t upto = answer.len;
             if (tools_present)
                 upto = saw_tool_tag ? sent
                      : oai_streamable_len(answer.data, answer.len, "<|tool_call_start|>", &saw_tool_tag);
-            size_t from = tools_present ? sent : answer.len - (size_t)n;
+            size_t from = tools_present ? sent : was_c;
             if (upto > from && !lfm_send_chunk(fd,id,"content",answer.data+from,upto-from))
                 { atomic_store(&ctx->cancel,1); break; }
             if (upto > sent) sent = upto;
         }
         ids[np + generated++] = token;
         if (generated < max_tokens) forward(m, &token, 1, np + generated - 1, logits, 1, ctx->buffers);
+    }
+    {   /* a held-back tag prefix at the end of the stream was never a tag */
+        size_t was_r = reasoning.len, was_c = answer.len;
+        lfm_think_flush(&split, &reasoning, &answer);
+        if (stream) {
+            if (reasoning.len > was_r) lfm_send_chunk(fd,id,"reasoning_content",reasoning.data+was_r,reasoning.len-was_r);
+            if (!tools_present && answer.len > was_c) lfm_send_chunk(fd,id,"content",answer.data+was_c,answer.len-was_c);
+        }
     }
     t_decode = samosa_now() - t_decode;
     if (atomic_load(&ctx->cancel)) reason = "cancelled";
@@ -2678,6 +2763,10 @@ static int lfm_serve_chat(LfmServerContext *ctx, int fd, jval *root) {
         oai_tool_calls_free(&calls);
         free(leading.data); leading.data = NULL; leading.len = leading.cap = 0;
     }
+    /* True whenever a tool call was attempted, parsed or not; in both branches it selects
+     * `leading` (the text before the first tag) over the raw answer as the content. */
+    int had_tag = tools_present && answer.data && strstr(answer.data, "<|tool_call_start|>") != NULL;
+    saw_tool_tag = saw_tool_tag || had_tag;
     const char *final_reason = calls.len ? "tool_calls" : reason;
     if (stream) {
         /* Whatever the hold-back kept back: the tail of the spoken text before the first
@@ -2685,18 +2774,25 @@ static int lfm_serve_chat(LfmServerContext *ctx, int fd, jval *root) {
         if (calls.len) {
             if (leading.len > sent) lfm_send_chunk(fd,id,"content",leading.data+sent,leading.len-sent);
             lfm_send_tool_call_chunk(fd,id,&calls);
+        } else if (saw_tool_tag) {
+            /* A tag opened but nothing parsed out of it. Release the text up to the tag
+             * and drop the rest: raw tool-call markup rendered as prose is worse than a
+             * short answer, and it is what a client would otherwise try to read. */
+            if (leading.len > sent) lfm_send_chunk(fd,id,"content",leading.data+sent,leading.len-sent);
         } else if (tools_present && answer.len > sent) {
             lfm_send_chunk(fd,id,"content",answer.data+sent,answer.len-sent);
         }
         lfm_send_done(fd,id,np,generated,final_reason);
     } else {
         LfmString body={0}; char prefix[512], suffix[256];
-        int n=snprintf(prefix,sizeof prefix,"{\"id\":\"%s\",\"object\":\"chat.completion\",\"model\":\"%s\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":",id,ctx->model_id);
-        int ok=n>0&&lfm_string_append(&body,prefix,(size_t)n);
+        int n=snprintf(prefix,sizeof prefix,"{\"id\":\"%s\",\"object\":\"chat.completion\",\"model\":\"%s\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"reasoning_content\":\"",id,ctx->model_id);
+        int ok=n>0&&lfm_string_append(&body,prefix,(size_t)n)&&lfm_json_escape(&body,reasoning.data?reasoning.data:"",reasoning.len);
+        ok=ok&&lfm_string_append(&body,"\",\"content\":",strlen("\",\"content\":"));
         if (calls.len && !leading.len) ok=ok&&lfm_string_append(&body,"null",4);
         else {
+            const char *ctext = had_tag ? (leading.data?leading.data:"") : (answer.data?answer.data:"");
             ok=ok&&lfm_string_append(&body,"\"",1);
-            ok=ok&&lfm_json_escape(&body, calls.len ? leading.data : (answer.data?answer.data:""), calls.len ? leading.len : answer.len);
+            ok=ok&&lfm_json_escape(&body, ctext, had_tag ? leading.len : answer.len);
             ok=ok&&lfm_string_append(&body,"\"",1);
         }
         if (calls.len) {
@@ -2730,7 +2826,7 @@ static int lfm_serve_chat(LfmServerContext *ctx, int fd, jval *root) {
         memcpy(ctx->cached_ids, ids, (size_t)final_len * sizeof *ids);
         ctx->cached_len = final_len;
     }
-    free(answer.data); pthread_mutex_unlock(&ctx->generation_mu); free(ids); free(logits); free(pbuf); free(seen); return 0;
+    free(answer.data); free(reasoning.data); pthread_mutex_unlock(&ctx->generation_mu); free(ids); free(logits); free(pbuf); free(seen); return 0;
 }
 
 static int lfm_serve_handler(SamosaHttpServer *server, int fd, const SamosaHttpRequest *request, void *opaque) {

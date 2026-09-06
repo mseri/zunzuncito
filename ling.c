@@ -2290,7 +2290,10 @@ static int ling_value_is_json_literal(const char *v, size_t n) {
  * text. Text before the first tag is returned via *leading (the template only ever
  * appends tool calls after any spoken content, never before). Tolerant of the exact
  * whitespace the model puts around tags, since that varies a little from the template's
- * own byte-for-byte rendering of training examples. */
+ * own byte-for-byte rendering of training examples -- including a missing closing tag,
+ * which the model drops often enough that insisting on it would leak the raw markup
+ * into content instead of reporting the call. A block therefore ends at </tool_call> if
+ * it is there, otherwise at the next <tool_call> or at the end of the text. */
 static int ling_extract_tool_calls(const char *text, OaiToolCalls *calls, LingString *leading) {
     const char *open_tag = "<tool_call>", *close_tag = "</tool_call>";
     size_t open_len = strlen(open_tag), close_len = strlen(close_tag);
@@ -2300,7 +2303,13 @@ static int ling_extract_tool_calls(const char *text, OaiToolCalls *calls, LingSt
     while (first) {
         const char *name_start = first + open_len;
         const char *block_end = strstr(name_start, close_tag);
-        if (!block_end) break;
+        const char *next_open = strstr(name_start, open_tag);
+        const char *resume;
+        if (!block_end || (next_open && next_open < block_end)) {
+            block_end = next_open ? next_open : name_start + strlen(name_start);
+            resume = next_open;                       /* already an open tag; do not rescan */
+        } else
+            resume = strstr(block_end + close_len, open_tag);
         const char *name_end = ling_find_bounded(name_start, block_end, "<arg_key>");
         if (!name_end) name_end = block_end;
         const char *nl = memchr(name_start, '\n', (size_t)((name_end < block_end ? name_end : block_end) - name_start));
@@ -2338,10 +2347,13 @@ static int ling_extract_tool_calls(const char *text, OaiToolCalls *calls, LingSt
         }
         if (ok) ok = ling_string_append(&args, "}", 1);
         if (!ok) { free(args.data); return 0; }
-        int pushed = oai_tool_calls_push(calls, name_start, (size_t)(name_end - name_start), args.data, args.len);
+        /* A nameless block is a truncation, not a call: report nothing rather than a
+         * call the client cannot dispatch. */
+        int pushed = name_end <= name_start ? 1 :
+            oai_tool_calls_push(calls, name_start, (size_t)(name_end - name_start), args.data, args.len);
         free(args.data);
         if (!pushed) return 0;
-        first = strstr(block_end + close_len, open_tag);
+        first = resume;
     }
     return 1;
 }
@@ -2653,6 +2665,10 @@ static int ling_serve_chat(LingServerContext *ctx, int fd, jval *root) {
         oai_tool_calls_free(&calls);
         free(leading.data); leading.data = NULL; leading.len = leading.cap = 0;
     }
+    /* True whenever a tool call was attempted, parsed or not; in both branches it selects
+     * `leading` (the text before the first tag) over the raw answer as the content. */
+    int had_tag = tools_present && answer.data && strstr(answer.data, "<tool_call>") != NULL;
+    saw_tool_tag = saw_tool_tag || had_tag;
     const char *final_reason = calls.len ? "tool_calls" : reason;
     if (stream) {
         /* Whatever the hold-back kept back: the tail of the spoken text before the first
@@ -2660,6 +2676,11 @@ static int ling_serve_chat(LingServerContext *ctx, int fd, jval *root) {
         if (calls.len) {
             if (leading.len > sent) ling_send_chunk(fd,id,"content",leading.data+sent,leading.len-sent);
             ling_send_tool_call_chunk(fd,id,&calls);
+        } else if (saw_tool_tag) {
+            /* A tag opened but nothing parsed out of it. Release the text up to the tag
+             * and drop the rest: raw <tool_call> markup rendered as prose is worse than
+             * a short answer, and it is what a client would otherwise try to read. */
+            if (leading.len > sent) ling_send_chunk(fd,id,"content",leading.data+sent,leading.len-sent);
         } else if (tools_present && answer.len > sent) {
             ling_send_chunk(fd,id,"content",answer.data+sent,answer.len-sent);
         }
@@ -2671,8 +2692,9 @@ static int ling_serve_chat(LingServerContext *ctx, int fd, jval *root) {
         ok=ok&&ling_string_append(&body,"\",\"content\":",strlen("\",\"content\":"));
         if (calls.len && !leading.len) ok=ok&&ling_string_append(&body,"null",4);
         else {
+            const char *ctext = had_tag ? (leading.data?leading.data:"") : (answer.data?answer.data:"");
             ok=ok&&ling_string_append(&body,"\"",1);
-            ok=ok&&ling_json_escape(&body, calls.len ? leading.data : (answer.data?answer.data:""), calls.len ? leading.len : answer.len);
+            ok=ok&&ling_json_escape(&body, ctext, had_tag ? leading.len : answer.len);
             ok=ok&&ling_string_append(&body,"\"",1);
         }
         if (calls.len) {

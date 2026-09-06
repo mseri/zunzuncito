@@ -1517,6 +1517,43 @@ static int mp_json_escape(MpString *s, const char *text, size_t len) {
     return 1;
 }
 
+/* The generation prompt leaves <think> open, so a completion begins *inside* the
+ * reasoning block and only ever emits the closing tag. Split there: what precedes
+ * </think> is the turn's reasoning_content, what follows is the content. The tag is
+ * several tokens long and can straddle a decode boundary, so any tail of the stream
+ * that is still a proper prefix of it is held back until the next piece decides. */
+#define MP_THINK_CLOSE "</think>"
+typedef struct { int in_think; char hold[sizeof MP_THINK_CLOSE - 1]; size_t nhold; } MpThink;
+
+static int mp_think_feed(MpThink *s, const char *piece, size_t len,
+                         MpString *reasoning, MpString *content) {
+    if (!s->in_think) return mp_string_append(content, piece, len);
+    static const size_t tag = sizeof MP_THINK_CLOSE - 1;
+    char buf[4096 + sizeof MP_THINK_CLOSE];
+    if (len > sizeof buf - s->nhold - 1) len = sizeof buf - s->nhold - 1;  /* cannot happen */
+    memcpy(buf, s->hold, s->nhold);
+    memcpy(buf + s->nhold, piece, len);
+    size_t m = s->nhold + len;
+    buf[m] = 0;
+    s->nhold = 0;
+    char *cut = memmem(buf, m, MP_THINK_CLOSE, tag);
+    if (cut) {
+        s->in_think = 0;
+        return mp_string_append(reasoning, buf, (size_t)(cut - buf)) &&
+               mp_string_append(content, cut + tag, m - (size_t)(cut - buf) - tag);
+    }
+    size_t h = m < tag - 1 ? m : tag - 1;            /* longest held-back tag prefix */
+    while (h > 0 && memcmp(buf + m - h, MP_THINK_CLOSE, h) != 0) h--;
+    memcpy(s->hold, buf + m - h, h); s->nhold = h;
+    return mp_string_append(reasoning, buf, m - h);
+}
+
+/* End of generation: whatever is still held back was never a tag. */
+static int mp_think_flush(MpThink *s, MpString *reasoning, MpString *content) {
+    size_t h = s->nhold; s->nhold = 0;
+    return mp_string_append(s->in_think ? reasoning : content, s->hold, h);
+}
+
 static jval *mp_json_field(jval *object, const char *key, jtype type) {
     jval *v = json_get(object, key); return v && v->t == type ? v : NULL;
 }
@@ -1591,7 +1628,12 @@ static int mp_append_tool_calls_block(MpString *prompt, jval *tool_calls, int ha
 
 /* Parses <tool_call>{"name": "...", "arguments": {...}}</tool_call> blocks out of the raw
  * completion text. Since this wire format is real JSON, the existing parser does the
- * work; no bespoke tag scanning needed beyond finding the block boundaries. */
+ * work; no bespoke tag scanning needed beyond finding the block boundaries.
+ * The closing tag is treated as optional: the model drops it often enough (it is a
+ * single token that a stop-like sampling step can skip, and a run of calls tends to
+ * open the next tag straight away) that insisting on it would leak the raw tags into
+ * content instead of reporting the calls. A block therefore ends at </tool_call> if it
+ * is there, otherwise at the next <tool_call> or at the end of the text. */
 static int mp_extract_tool_calls(const char *text, OaiToolCalls *calls, MpString *leading) {
     const char *open_tag = "<tool_call>", *close_tag = "</tool_call>";
     size_t open_len = strlen(open_tag), close_len = strlen(close_tag);
@@ -1601,7 +1643,13 @@ static int mp_extract_tool_calls(const char *text, OaiToolCalls *calls, MpString
     while (first) {
         const char *body_start = first + open_len;
         const char *body_end = strstr(body_start, close_tag);
-        if (!body_end) break;
+        const char *next_open = strstr(body_start, open_tag);
+        const char *resume;
+        if (!body_end || (next_open && next_open < body_end)) {
+            body_end = next_open ? next_open : body_start + strlen(body_start);
+            resume = next_open;                       /* already an open tag; do not rescan */
+        } else
+            resume = strstr(body_end + close_len, open_tag);
         size_t blen = (size_t)(body_end - body_start);
         char *buf = malloc(blen + 1);
         if (!buf) return 0;
@@ -1614,12 +1662,14 @@ static int mp_extract_tool_calls(const char *text, OaiToolCalls *calls, MpString
             const char *name_str = (name && name->t == J_STR) ? name->str : "";
             jbuf ab = {0};
             int ok = args ? json_encode(&ab, args) : jbuf_append(&ab, "{}", 2);
-            if (ok) ok = oai_tool_calls_push(calls, name_str, strlen(name_str), ab.data ? ab.data : "{}", ab.len);
+            /* A nameless block is a truncation, not a call: report nothing rather than a
+             * call the client cannot dispatch. */
+            if (ok && *name_str) ok = oai_tool_calls_push(calls, name_str, strlen(name_str), ab.data ? ab.data : "{}", ab.len);
             free(ab.data);
             if (!ok) { json_free(obj); free(arena); free(buf); return 0; }
         }
         json_free(obj); free(arena); free(buf);
-        first = strstr(body_end + close_len, open_tag);
+        first = resume;
     }
     return 1;
 }
@@ -1666,8 +1716,9 @@ static int mp_build_chat_prompt(jval *messages, MpString *prompt, jval *tools) {
     }
     /* The template's generation prompt opens a reasoning block unconditionally, and
      * this is a reasoning model, so the server follows it rather than the CLI's
-     * --nothink. The reasoning therefore arrives as `content`, with the model's own
-     * </think> marking where the answer starts. */
+     * --nothink. Generation therefore starts inside the block and the model's own
+     * </think> marks where the answer starts; mp_think_feed splits there so the
+     * reasoning goes out as reasoning_content rather than as `content`. */
     PUT("<|im_start|>assistant\n<think>\n");
     #undef PUT
     return 1;
@@ -1842,7 +1893,10 @@ static int mp_serve_chat(MapleServerContext *ctx, int fd, jval *root) {
     double t_decode = samosa_now();
 
     size_t sent = 0; int saw_tool_tag = 0;   /* tools_present streaming, see below */
-    MpString answer = {0}; uint64_t rng = seed ? (uint64_t)seed : 0x853c49e6748fea9bULL;
+    MpString answer = {0}, reasoning = {0};
+    /* mp_build_chat_prompt always ends on an open <think>, so generation starts in it. */
+    MpThink split = { .in_think = 1 };
+    uint64_t rng = seed ? (uint64_t)seed : 0x853c49e6748fea9bULL;
     int generated = 0; const char *reason = "length";
     while (generated < max_tokens && !atomic_load(&ctx->cancel)) {
         repetition_penalty(logits, ctx->vlimit, ids, np + generated, penalty, seen);
@@ -1850,23 +1904,34 @@ static int mp_serve_chat(MapleServerContext *ctx, int fd, jval *root) {
         if (token == ctx->eos || token == ctx->eot) { reason = "stop"; break; }
         char piece[4096]; int n = lfmtok_decode(tok, &token, 1, piece, sizeof piece - 1);
         if (n <= 0) { reason = "stop"; break; }
-        if (!mp_string_append(&answer, piece, (size_t)n)) { atomic_store(&ctx->cancel,1); break; }
-        /* With tools in play the answer still streams, but only up to the point where a
-         * <tool_call> tag might be starting: those bytes belong to the tool_calls delta,
-         * and leaking the raw tags into the client's rendered content is exactly what the
-         * hold-back avoids. Once a tag has actually appeared, content stops. */
+        size_t was_r = reasoning.len, was_c = answer.len;
+        if (!mp_think_feed(&split, piece, (size_t)n, &reasoning, &answer)) { atomic_store(&ctx->cancel,1); break; }
         if (stream) {
+            if (reasoning.len > was_r && !mp_send_chunk(fd,id,"reasoning_content",reasoning.data+was_r,reasoning.len-was_r))
+                { atomic_store(&ctx->cancel,1); break; }
+            /* With tools in play the answer still streams, but only up to the point where a
+             * <tool_call> tag might be starting: those bytes belong to the tool_calls delta,
+             * and leaking the raw tags into the client's rendered content is exactly what the
+             * hold-back avoids. Once a tag has actually appeared, content stops. */
             size_t upto = answer.len;
             if (tools_present)
                 upto = saw_tool_tag ? sent
                      : oai_streamable_len(answer.data, answer.len, "<tool_call>", &saw_tool_tag);
-            size_t from = tools_present ? sent : answer.len - (size_t)n;
+            size_t from = tools_present ? sent : was_c;
             if (upto > from && !mp_send_chunk(fd,id,"content",answer.data+from,upto-from))
                 { atomic_store(&ctx->cancel,1); break; }
             if (upto > sent) sent = upto;
         }
         ids[np + generated++] = token;
         if (generated < max_tokens) forward(m, &token, 1, np + generated - 1, logits, 1, ctx->buffers);
+    }
+    {   /* a held-back tag prefix at the end of the stream was never a tag */
+        size_t was_r = reasoning.len, was_c = answer.len;
+        mp_think_flush(&split, &reasoning, &answer);
+        if (stream) {
+            if (reasoning.len > was_r) mp_send_chunk(fd,id,"reasoning_content",reasoning.data+was_r,reasoning.len-was_r);
+            if (!tools_present && answer.len > was_c) mp_send_chunk(fd,id,"content",answer.data+was_c,answer.len-was_c);
+        }
     }
     t_decode = samosa_now() - t_decode;
     if (atomic_load(&ctx->cancel)) reason = "cancelled";
@@ -1876,6 +1941,10 @@ static int mp_serve_chat(MapleServerContext *ctx, int fd, jval *root) {
         oai_tool_calls_free(&calls);
         free(leading.data); leading.data = NULL; leading.len = leading.cap = 0;
     }
+    /* True whenever a tool call was attempted, parsed or not; in both branches it selects
+     * `leading` (the text before the first tag) over the raw answer as the content. */
+    int had_tag = tools_present && answer.data && strstr(answer.data, "<tool_call>") != NULL;
+    saw_tool_tag = saw_tool_tag || had_tag;
     const char *final_reason = calls.len ? "tool_calls" : reason;
     if (stream) {
         /* Whatever the hold-back kept back: the tail of the spoken text before the first
@@ -1883,18 +1952,25 @@ static int mp_serve_chat(MapleServerContext *ctx, int fd, jval *root) {
         if (calls.len) {
             if (leading.len > sent) mp_send_chunk(fd,id,"content",leading.data+sent,leading.len-sent);
             mp_send_tool_call_chunk(fd,id,&calls);
+        } else if (saw_tool_tag) {
+            /* A tag opened but nothing parsed out of it. Release the text up to the tag
+             * and drop the rest: raw <tool_call> markup rendered as prose is worse than
+             * a short answer, and it is what a client would otherwise try to read. */
+            if (leading.len > sent) mp_send_chunk(fd,id,"content",leading.data+sent,leading.len-sent);
         } else if (tools_present && answer.len > sent) {
             mp_send_chunk(fd,id,"content",answer.data+sent,answer.len-sent);
         }
         mp_send_done(fd,id,np,generated,final_reason);
     } else {
         MpString body={0}; char prefix[512], suffix[256];
-        int n=snprintf(prefix,sizeof prefix,"{\"id\":\"%s\",\"object\":\"chat.completion\",\"model\":\"%s\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":",id,ctx->model_id);
-        int ok=n>0&&mp_string_append(&body,prefix,(size_t)n);
+        int n=snprintf(prefix,sizeof prefix,"{\"id\":\"%s\",\"object\":\"chat.completion\",\"model\":\"%s\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"reasoning_content\":\"",id,ctx->model_id);
+        int ok=n>0&&mp_string_append(&body,prefix,(size_t)n)&&mp_json_escape(&body,reasoning.data?reasoning.data:"",reasoning.len);
+        ok=ok&&mp_string_append(&body,"\",\"content\":",strlen("\",\"content\":"));
         if (calls.len && !leading.len) ok=ok&&mp_string_append(&body,"null",4);
         else {
+            const char *ctext = had_tag ? (leading.data?leading.data:"") : (answer.data?answer.data:"");
             ok=ok&&mp_string_append(&body,"\"",1);
-            ok=ok&&mp_json_escape(&body, calls.len ? leading.data : (answer.data?answer.data:""), calls.len ? leading.len : answer.len);
+            ok=ok&&mp_json_escape(&body, ctext, had_tag ? leading.len : answer.len);
             ok=ok&&mp_string_append(&body,"\"",1);
         }
         if (calls.len) {
@@ -1928,7 +2004,7 @@ static int mp_serve_chat(MapleServerContext *ctx, int fd, jval *root) {
         memcpy(ctx->cached_ids, ids, (size_t)final_len * sizeof *ids);
         ctx->cached_len = final_len;
     }
-    free(answer.data); pthread_mutex_unlock(&ctx->generation_mu); free(ids); free(logits); free(pbuf); free(seen); return 0;
+    free(answer.data); free(reasoning.data); pthread_mutex_unlock(&ctx->generation_mu); free(ids); free(logits); free(pbuf); free(seen); return 0;
 }
 
 static int mp_serve_handler(SamosaHttpServer *server, int fd, const SamosaHttpRequest *request, void *opaque) {

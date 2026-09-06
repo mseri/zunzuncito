@@ -2976,6 +2976,11 @@ static int g4_parse_value(G4Cursor *c, jbuf *out) {
     return json_encode_str(out, tok_start, tn);
 }
 
+/* Parses <|tool_call>call:name{args}<tool_call|> blocks out of the raw completion text.
+ * The closing tag is treated as optional: the model drops it often enough that
+ * insisting on it would leak the raw markup into content instead of reporting the call.
+ * A block therefore ends at <tool_call|> if it is there, otherwise at the next
+ * <|tool_call>call: or at the end of the text. */
 static int g4_extract_tool_calls(const char *text, OaiToolCalls *calls, G4String *leading) {
     const char *open_tag = "<|tool_call>call:", *close_tag = "<tool_call|>";
     size_t open_len = strlen(open_tag), close_len = strlen(close_tag);
@@ -2985,7 +2990,13 @@ static int g4_extract_tool_calls(const char *text, OaiToolCalls *calls, G4String
     while (first) {
         const char *name_start = first + open_len;
         const char *block_end = strstr(name_start, close_tag);
-        if (!block_end) break;
+        const char *next_open = strstr(name_start, open_tag);
+        const char *resume;
+        if (!block_end || (next_open && next_open < block_end)) {
+            block_end = next_open ? next_open : name_start + strlen(name_start);
+            resume = next_open;                       /* already an open tag; do not rescan */
+        } else
+            resume = strstr(block_end + close_len, open_tag);
         const char *brace = memchr(name_start, '{', (size_t)(block_end - name_start));
         const char *name_end = brace ? brace : block_end;
         while (name_end > name_start && isspace((unsigned char)name_end[-1])) name_end--;
@@ -2993,10 +3004,13 @@ static int g4_extract_tool_calls(const char *text, OaiToolCalls *calls, G4String
         int ok;
         if (brace) { G4Cursor cur = { brace, block_end }; ok = g4_parse_value(&cur, &args_jb); }
         else ok = jbuf_append(&args_jb, "{}", 2);
-        if (ok) ok = oai_tool_calls_push(calls, name_start, (size_t)(name_end - name_start), args_jb.data ? args_jb.data : "{}", args_jb.len);
+        /* A nameless block is a truncation, not a call: report nothing rather than a
+         * call the client cannot dispatch. */
+        if (ok && name_end > name_start)
+            ok = oai_tool_calls_push(calls, name_start, (size_t)(name_end - name_start), args_jb.data ? args_jb.data : "{}", args_jb.len);
         free(args_jb.data);
         if (!ok) return 0;
-        first = strstr(block_end + close_len, open_tag);
+        first = resume;
     }
     return 1;
 }
@@ -3257,6 +3271,10 @@ static int g4_serve_chat(G4ServerContext *ctx, int fd, jval *root) {
         oai_tool_calls_free(&calls);
         free(leading.data); leading.data = NULL; leading.len = leading.cap = 0;
     }
+    /* True whenever a tool call was attempted, parsed or not; in both branches it selects
+     * `leading` (the text before the first tag) over the raw answer as the content. */
+    int had_tag = tools_present && answer.data && strstr(answer.data, "<|tool_call>call:") != NULL;
+    saw_tool_tag = saw_tool_tag || had_tag;
     const char *final_reason = calls.len ? "tool_calls" : reason;
     if (stream) {
         /* Whatever the hold-back kept back: the tail of the spoken text before the first
@@ -3264,6 +3282,11 @@ static int g4_serve_chat(G4ServerContext *ctx, int fd, jval *root) {
         if (calls.len) {
             if (leading.len > sent) g4_send_chunk(fd,id,"content",leading.data+sent,leading.len-sent);
             g4_send_tool_call_chunk(fd,id,&calls);
+        } else if (saw_tool_tag) {
+            /* A tag opened but nothing parsed out of it. Release the text up to the tag
+             * and drop the rest: raw tool-call markup rendered as prose is worse than a
+             * short answer, and it is what a client would otherwise try to read. */
+            if (leading.len > sent) g4_send_chunk(fd,id,"content",leading.data+sent,leading.len-sent);
         } else if (tools_present && answer.len > sent) {
             g4_send_chunk(fd,id,"content",answer.data+sent,answer.len-sent);
         }
@@ -3274,8 +3297,9 @@ static int g4_serve_chat(G4ServerContext *ctx, int fd, jval *root) {
         int ok=n>0&&g4_string_append(&body,prefix,(size_t)n);
         if (calls.len && !leading.len) ok=ok&&g4_string_append(&body,"null",4);
         else {
+            const char *ctext = had_tag ? (leading.data?leading.data:"") : (answer.data?answer.data:"");
             ok=ok&&g4_string_append(&body,"\"",1);
-            ok=ok&&g4_json_escape(&body, calls.len ? leading.data : (answer.data?answer.data:""), calls.len ? leading.len : answer.len);
+            ok=ok&&g4_json_escape(&body, ctext, had_tag ? leading.len : answer.len);
             ok=ok&&g4_string_append(&body,"\"",1);
         }
         if (calls.len) {
