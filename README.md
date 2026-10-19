@@ -85,7 +85,7 @@ python3 tools/convert_lfm_tokenizer.py /path/to/LFM2.5-24B-A2B/tokenizer.json ./
 
 At 64 experts per layer the default `--expert-edge 2` costs more cache than on the 8B:
 slots are sized by the largest expert, so the four q8_0 layers halve the slots on every
-layer (at `--ram 4`, 8/64 instead of 17/64). `--expert-edge 0` trades that edge precision
+layer (at `--ram 4`, 8/64 instead of 15/64; at `--ram 8`, 19 instead of 36). `--expert-edge 0` trades that edge precision
 back for cache.
 
 LiquidAI also ships it as a QAD Q4_0 GGUF
