@@ -60,7 +60,10 @@ class Container:
                     try:
                         self.cfg[t[1]] = int(v)
                     except ValueError:
-                        self.cfg[t[1]] = float(v)
+                        try:
+                            self.cfg[t[1]] = float(v)
+                        except ValueError:
+                            self.cfg[t[1]] = v          # model_id
             elif t[0] == "eszl":
                 li = int(t[1])
                 self.esz[li], self.gb[li], self.db[li] = int(t[2]), int(t[3]), int(t[4])

@@ -192,6 +192,17 @@ check-lfm25: lfm25 lfm25-exact test_lfmtok
 	./lfm25       $(LFMFIX) --check-gpu        # Metal vs CPU (no-op without Metal)
 	./lfm25       $(LFMFIX) --check --metal    # engine with the GPU path enabled
 
+# The GGUF and fused-safetensors import paths of convert_lfm25.py (needs `gguf`).
+# No int8-activation run: this container is q4_0 throughout, and on random weights
+# two of its rows have top-2 gaps under the int8 error, so its argmax test is a coin.
+LFMGGUF ?= /tmp/lfmgguf
+
+check-lfm25-gguf: lfm25-exact
+	$(PYTHON) tools/lfm25_gguf_check.py $(LFMGGUF)
+	$(PYTHON) tools/lfm25_oracle.py $(LFMGGUF)
+	./lfm25-exact $(LFMGGUF) --check            # engine vs oracle on copied blocks
+	./lfm25-exact $(LFMGGUF) --check --nobatch
+
 # maple regression: the ternary/q4a kernels against an independent reference, the
 # tokenizer against HF, and the engine against a numpy oracle run on the DEQUANTISED
 # container weights.
@@ -243,4 +254,4 @@ clean:
 	rm -f gemma4 gemma4-exact lfm25 lfm25-exact maple maple-exact ling ling-exact \
 	      test_q40 test_kvarn test_metal_sim test_lfmtok test_tq2 metal.o
 
-.PHONY: all check check-lfm25 check-maple check-ling clean
+.PHONY: all check check-lfm25 check-lfm25-gguf check-maple check-ling clean

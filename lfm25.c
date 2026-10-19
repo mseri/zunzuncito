@@ -1,4 +1,5 @@
-/* lfm25.c — LiquidAI LFM2.5-8B-A1B on a small-RAM machine, by streaming experts.
+/* lfm25.c — LiquidAI LFM2.5-8B-A1B and -24B-A2B on a small-RAM machine, by
+ * streaming experts.
  *
  * The sibling of gemma4.c, sharing its streaming machinery: an expert-granular
  * per-layer LRU instead of the OS page cache, batch-union prefill, a learned pin
@@ -9,6 +10,11 @@
  * firing per token. A miss is cheap and a layer's whole expert set is only 32 of
  * them, so a modest cache holds a large fraction of the model. (Gemma-4, for
  * contrast: 25 GB, 3.19 MiB experts, 128 per layer.)
+ *
+ * The 24B-A2B is the same architecture at another shape, and the same binary runs it
+ * off the manifest: 40 layers (30 conv, 10 attention), 64 experts per layer at
+ * moe_intermediate_size 1536 (~5.1 MiB at q4_0), still 4 firing. Twice the experts
+ * per layer means a given RAM budget caches half the fraction of them.
  *
  * Being hybrid costs the engine two things. Only 6 of the 24 layers are attention and
  * the rest hold no KV, so the KV costs a quarter of what the layer count suggests.
@@ -73,6 +79,7 @@ typedef struct {
     int flash_n_clusters, flash_cluster_size, flash_n_probes;
     int flash_scaled_centroids, flash_n_force;
     float eps, rope_theta, routed_scaling;
+    char model_id[64];                     /* what /v1/models reports */
 } Cfg;
 
 /* a weight: q4_0 / q8_0 blob or f32 vector, all views into the resident dense blob */
@@ -321,6 +328,8 @@ static void manifest(M *m, const char *dir) {
             else if (!strcmp(k, "flash_n_probes"))     c->flash_n_probes = atoi(v);
             else if (!strcmp(k, "flash_scaled_centroids")) c->flash_scaled_centroids = atoi(v);
             else if (!strcmp(k, "flash_n_force"))      c->flash_n_force = atoi(v);
+            else if (!strcmp(k, "model_id"))
+                snprintf(c->model_id, sizeof c->model_id, "%.*s", (int)strcspn(v, " \r\n"), v);
             continue;
         }
         int li, e, fm, nexp;
@@ -354,10 +363,12 @@ static void manifest(M *m, const char *dir) {
         fprintf(stderr, "n_experts=%d exceeds MAXEXPERTS=%d\n", c->n_experts, MAXEXPERTS);
         exit(1);
     }
-    if (c->n_layers > MAXL) {
-        fprintf(stderr, "n_layers=%d exceeds MAXL=%d\n", c->n_layers, MAXL);
+    if (c->n_layers > MAXL - 1) {                 /* L[MAXL-1] holds the tied head */
+        fprintf(stderr, "n_layers=%d exceeds MAXL-1=%d\n", c->n_layers, MAXL - 1);
         exit(1);
     }
+    /* containers older than the 24B predate the key, and were all the 8B */
+    if (!c->model_id[0]) snprintf(c->model_id, sizeof c->model_id, "lfm2.5-8b-a1b");
 
     /* dense.bin: read whole -- it is the resident set */
     snprintf(p, sizeof p, "%s/dense.bin", dir);
@@ -2887,6 +2898,8 @@ static int check_gpu(void) {
         {FMT_Q40, 1792, 2048, "expert gate/up (q4_0)"},
         {FMT_Q40, 2048, 1792, "expert down (q4_0)"},
         {FMT_Q80, 1792, 2048, "edge expert gate/up (q8_0)"},
+        {FMT_Q40, 1536, 2048, "24B expert gate/up (q4_0)"},
+        {FMT_Q40, 2048, 1536, "24B expert down (q4_0)"},
     };
     int fail = 0;
     for (unsigned t = 0; t < sizeof shp / sizeof *shp; t++) {
@@ -3152,7 +3165,7 @@ int main(int argc, char **argv) {
         char tp[4096]; snprintf(tp, sizeof tp, "%s/tok.bin", dir);
         LfmTok *server_tokenizer = lfmtok_load(tp);
         if (!server_tokenizer) { fprintf(stderr, "--serve needs %s\n", tp); return 1; }
-        return run_lfm_server(&m, b, server_tokenizer, "lfm2.5-8b-a1b", serve_port);
+        return run_lfm_server(&m, b, server_tokenizer, m.c.model_id, serve_port);
     }
 
     if (check) {

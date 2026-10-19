@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-convert_lfm25.py — LiquidAI LFM2.5-8B-A1B (HF safetensors) -> lfm25 container.
+convert_lfm25.py — LiquidAI LFM2.5-8B-A1B / -24B-A2B (HF safetensors, or a
+llama.cpp GGUF) -> lfm25 container.
 
 Same container shape as convert_gemma4.py (manifest.txt + dense.bin + experts.bin,
 one expert = one contiguous 4096-aligned pread), but two things differ.
@@ -33,10 +34,26 @@ The depthwise conv weight is f32 for a structural reason, not a quality one: it 
 [hidden, 1, conv_L] with conv_L = 3, and a block format needs the contracted
 dimension to be a multiple of 32.
 
+Weights can also come from a GGUF (--gguf FILE; src still supplies config.json and
+the tokenizer). Its Q4_0/Q8_0 tensors are copied block for block and keep their
+format whatever the policy above says, so --expert-edge does nothing to a Q4_0
+layer. That is the path for LiquidAI's QAD-Q4_0 checkpoints: QAD (quantisation-aware
+distillation) retrains the weights to sit on the plain q4_0 grid, and the quantiser
+itself is stock ggml Q4_0, which q40_quant_rows already reproduces bit for bit on
+bf16 inputs. So there is nothing to borrow from the quantiser; the gain is in the
+weights, and only survives if they are not re-rounded. Any other GGUF type is
+dequantised and re-encoded, to q8_0 when the policy wants a block format, so the
+second rounding is as small as it can be.
+
+The 24B checkpoint may be saved in transformers 5's fused expert layout
+(experts.gate_up_proj / experts.down_proj per layer); both layouts are read.
+
     python3 tools/convert_lfm25.py ./lfm ./lfm-ct --ram 8 --ctx 4096
+    python3 tools/convert_lfm25.py ./lfm24 ./lfm24-ct --ram 8 \
+        --gguf ./LFM2.5-24B-A2B-QAD-Q4_0.gguf
     python3 tools/convert_lfm25.py --fixture ./lfm-fix          # tiny random model
 """
-import argparse, json, os, struct, sys
+import argparse, json, os, re, struct, sys
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -178,6 +195,189 @@ class Shards:
             a = np.frombuffer(raw, _DT[e["dtype"]]).astype(np.float32)
         return a.reshape(e["shape"])
 
+    def get_slab(self, n, i):
+        """The i-th slice along the leading axis, reading only its bytes: a fused
+        expert tensor is [n_experts, ...] and ~800 MB a layer at 24B."""
+        if n not in self.wmap:
+            sys.exit(f"missing tensor {n}")
+        f, (hdr, base) = self._open(self.wmap[n])
+        e = hdr[n]
+        sh = e["shape"]
+        isz = 2 if e["dtype"] in ("BF16", "F16") else np.dtype(_DT[e["dtype"]]).itemsize
+        slab = int(np.prod(sh[1:])) * isz
+        f.seek(base + e["data_offsets"][0] + i * slab)
+        raw = f.read(slab)
+        if e["dtype"] == "BF16":
+            a = (np.frombuffer(raw, np.uint16).astype(np.uint32) << 16).view(np.float32)
+        else:
+            a = np.frombuffer(raw, _DT[e["dtype"]]).astype(np.float32)
+        return a.reshape(sh[1:])
+
+    def fmt_of(self, n):
+        return None                    # every tensor here is floating point
+
+
+# gguf
+# HF checkpoint name -> llama.cpp lfm2moe name, per layer and global. Mirrors
+# gguf-py's tensor_mapping for LFM2; embedding_norm lands in token_embd_norm (it is
+# applied at the output, llama.cpp's own "fix for wrong tensor name").
+_GG_GLOBAL = {"model.embed_tokens.weight": "token_embd.weight",
+              "model.embedding_norm.weight": "token_embd_norm.weight"}
+_GG_LAYER = {
+    "operator_norm.weight": "attn_norm.weight", "ffn_norm.weight": "ffn_norm.weight",
+    "self_attn.q_proj.weight": "attn_q.weight", "self_attn.k_proj.weight": "attn_k.weight",
+    "self_attn.v_proj.weight": "attn_v.weight", "self_attn.out_proj.weight": "attn_output.weight",
+    "self_attn.q_layernorm.weight": "attn_q_norm.weight",
+    "self_attn.k_layernorm.weight": "attn_k_norm.weight",
+    "conv.in_proj.weight": "shortconv.in_proj.weight", "conv.conv.weight": "shortconv.conv.weight",
+    "conv.out_proj.weight": "shortconv.out_proj.weight",
+    "feed_forward.w1.weight": "ffn_gate.weight", "feed_forward.w3.weight": "ffn_up.weight",
+    "feed_forward.w2.weight": "ffn_down.weight",
+    "feed_forward.gate.weight": "ffn_gate_inp.weight",
+    "feed_forward.expert_bias": "exp_probs_b.bias"}
+_GG_EXPERT = {"w1": "ffn_gate_exps.weight", "w3": "ffn_up_exps.weight",
+              "w2": "ffn_down_exps.weight"}
+
+
+class GGUFSource:
+    """Weights from a llama.cpp GGUF of arch lfm2moe, served under the HF checkpoint's
+    tensor names so build() does not care where they came from.
+
+    The point is the blocks themselves. q40.h is bit-identical to ggml's block_q4_0
+    and q8_0 likewise, and a row of either is contiguous over the contracted dim in
+    both layouts, so a Q4_0/Q8_0 tensor is copied byte for byte (fmt_of / raw) and
+    never touches a float. That matters for LiquidAI's QAD-Q4_0 release: its weights
+    were distilled to sit on the q4_0 grid, so the blocks ARE the model, and any
+    requantisation -- even up to q8_0 -- moves them off it. Every other type is
+    dequantised by gguf-py (get) and re-encoded by the caller."""
+
+    def __init__(self, path):
+        try:
+            from gguf import GGUFReader, GGMLQuantizationType, quants
+        except ImportError:
+            sys.exit("--gguf needs the gguf package (pip install gguf)")
+        self.r = GGUFReader(path)
+        self.quants, Q = quants, GGMLQuantizationType
+        arch = self.r.fields["general.architecture"].contents()
+        if arch != "lfm2moe":
+            sys.exit(f"expected a GGUF of arch lfm2moe, got {arch}")
+        self.t = {t.name: t for t in self.r.tensors}
+        self.native = {Q.Q4_0: FMT_Q40, Q.Q8_0: FMT_Q80}
+        self.floats = {Q.F32, Q.F16, Q.BF16}
+
+    def meta(self, key):
+        f = self.r.fields.get(f"lfm2moe.{key}")
+        return None if f is None else f.contents()
+
+    def check(self, cfg):
+        for key, want in (("block_count", cfg["n_layers"]),
+                          ("embedding_length", cfg["hidden"]),
+                          ("expert_count", cfg["n_experts"]),
+                          ("expert_used_count", cfg["topk"]),
+                          ("expert_feed_forward_length", cfg["moe_inter"])):
+            got = self.meta(key)
+            if got is not None and got != want:
+                sys.exit(f"GGUF {key}={got} but config.json says {want}: "
+                         f"the GGUF and the config are not the same model")
+
+    def _resolve(self, n):
+        """-> (tensor, expert index or None, row range or None)"""
+        if n in _GG_GLOBAL:
+            return self.t.get(_GG_GLOBAL[n]), None, None
+        m = re.fullmatch(r"model\.layers\.(\d+)\.feed_forward\.experts\.(\d+)\.(w[123])\.weight", n)
+        if m:
+            return self.t.get(f"blk.{m[1]}.{_GG_EXPERT[m[3]]}"), int(m[2]), None
+        m = re.fullmatch(r"model\.layers\.(\d+)\.(.+)", n)
+        if not m or m[2] not in _GG_LAYER:
+            return None, None, None
+        t = self.t.get(f"blk.{m[1]}.{_GG_LAYER[m[2]]}")
+        if t is None and m[2] in ("self_attn.q_proj.weight", "self_attn.k_proj.weight",
+                                  "self_attn.v_proj.weight"):
+            # fused attn_qkv: q is n_embd rows, then k and v split the rest evenly
+            t = self.t.get(f"blk.{m[1]}.attn_qkv.weight")
+            if t is not None:
+                O, D = int(t.shape[1]), int(t.shape[0])
+                kv = (O - D) // 2
+                r = {"q": (0, D), "k": (D, D + kv), "v": (D + kv, O)}[m[2][10]]
+                return t, None, r
+        return t, None, None
+
+    def _data(self, n):
+        t, e, r = self._resolve(n)
+        if t is None:
+            sys.exit(f"missing tensor {n} in the GGUF")
+        a = t.data if e is None else t.data[e]
+        if r is not None:
+            a = a[r[0]:r[1]]
+        return t, a
+
+    def has(self, n):
+        return self._resolve(n)[0] is not None
+
+    def fmt_of(self, n):
+        """FMT_Q40/FMT_Q80 for a tensor raw() can hand over as is, -1 for any other
+        quantised type, None for floating point."""
+        t = self._resolve(n)[0]
+        if t is None or t.tensor_type in self.floats:
+            return None
+        return self.native.get(t.tensor_type, -1)
+
+    def raw(self, n):
+        t, a = self._data(n)
+        return np.ascontiguousarray(a).tobytes()
+
+    def get(self, n):
+        t, a = self._data(n)
+        if t.tensor_type.name not in ("F32", "F16"):
+            a = self.quants.dequantize(a, t.tensor_type)
+        return np.asarray(a, dtype=np.float32)
+
+
+def pick_fmt(S, n, fmt):
+    """The format weight `n` lands in, given the policy's `fmt`. A source block that
+    is already q4_0/q8_0 stays what it is (see GGUFSource); one in some other quantised
+    type goes to q8_0, so the second rounding adds as little as it can. Policy f32 is
+    always honoured: those tensors are f32 for structural reasons, not size."""
+    if fmt == FMT_F32:
+        return fmt
+    f = S.fmt_of(n)
+    if f is None:
+        return fmt
+    return f if f in (FMT_Q40, FMT_Q80) else FMT_Q80
+
+
+def encode(S, n, fmt):
+    """-> (bytes, O, I) of weight `n` in `fmt`, copying the source's own blocks when
+    they are already in it."""
+    if fmt != FMT_F32 and S.fmt_of(n) == fmt:
+        b = S.raw(n)
+        t, a = S._data(n)
+        O = a.shape[0] if a.ndim > 1 else 1
+        I = len(b) // O // (BLK40 if fmt == FMT_Q40 else BLK80) * QK
+        return b, O, I
+    w = np.ascontiguousarray(S.get(n), dtype=np.float32)
+    if w.ndim == 1:
+        w = w.reshape(1, -1)
+    return quant_rows(fmt, w), int(w.shape[0]), int(w.shape[1])
+
+
+def expert_names(li, e):
+    q = f"model.layers.{li}.feed_forward.experts.{e}."
+    return q + "w1.weight", q + "w3.weight", q + "w2.weight"
+
+
+def expert_floats(S, li, e):
+    """(gate, up, down) of one expert, from either checkpoint layout: one tensor per
+    expert, or the fused [n_experts, 2*moe_inter, hidden] gate_up_proj and
+    [n_experts, hidden, moe_inter] down_proj that transformers >= 5 saves (gate rows
+    first, as its WeightConverter concatenates w1 then w3)."""
+    p = f"model.layers.{li}.feed_forward.experts."
+    if S.has(p + "gate_up_proj"):
+        gu = S.get_slab(p + "gate_up_proj", e)
+        h = gu.shape[0] // 2
+        return gu[:h], gu[h:], S.get_slab(p + "down_proj", e)
+    return tuple(S.get(n) for n in expert_names(li, e))
+
 
 # dense writer
 class Dense:
@@ -194,6 +394,13 @@ class Dense:
         self.f.write(b)
         self.idx[name] = {"off": self.off, "len": len(b), "fmt": fmt,
                           "shape": [int(w.shape[0]), int(w.shape[1])]}
+        self.off += len(b)
+        return b
+
+    def put(self, name, b, fmt, O, I):
+        """an already-encoded weight (see encode)"""
+        self.f.write(b)
+        self.idx[name] = {"off": self.off, "len": len(b), "fmt": fmt, "shape": [O, I]}
         self.off += len(b)
         return b
 
@@ -326,14 +533,25 @@ class DictShards:
             sys.exit(f"missing tensor {n}")
         return self.T[n]
 
+    def get_slab(self, n, i):
+        return self.get(n)[i]
+
+    def fmt_of(self, n):
+        return None
+
 
 # build
+# what /v1/models reports, by layer count; anything else falls back to the dir name
+MODEL_IDS = {24: "lfm2.5-8b-a1b", 40: "lfm2.5-24b-a2b"}
+
+
 def build(src, dst, ctx, ram, expert_edge, embed_q8, verify, want_flash=True,
-          flash_probes=0, flash_iters=10, fixture=False):
+          flash_probes=0, flash_iters=10, fixture=False, gguf=None, model_id=None,
+          fixture_cfg=None):
     os.makedirs(dst, exist_ok=True)
 
     if fixture:
-        cfg, T = make_fixture(dst)
+        cfg, T = fixture_cfg or make_fixture(dst)
         S = DictShards(T)
     else:
         t = json.load(open(os.path.join(src, "config.json")))
@@ -360,10 +578,16 @@ def build(src, dst, ctx, ram, expert_edge, embed_q8, verify, want_flash=True,
             layer_types=types)
         if t.get("conv_bias"):
             sys.exit("conv_bias is not supported")
-        if not t.get("tie_word_embeddings", True):
+        # older LFM2 configs spell it tie_embedding
+        if not t.get("tie_word_embeddings", t.get("tie_embedding", True)):
             sys.exit("untied embeddings are not supported (lm_head reuses embed_tokens)")
         S = Shards(src)
 
+    if gguf:
+        S = GGUFSource(gguf)
+        S.check(cfg)
+    cfg["model_id"] = model_id or MODEL_IDS.get(cfg["n_layers"]) or (
+        os.path.basename(os.path.normpath(src)).lower() if src else "lfm2.5-moe")
     cfg["ctx"] = ctx
     D, MI, DI = cfg["hidden"], cfg["moe_inter"], cfg["dense_inter"]
     L, NE, CL = cfg["n_layers"], cfg["n_experts"], cfg["conv_L"]
@@ -372,16 +596,26 @@ def build(src, dst, ctx, ram, expert_edge, embed_q8, verify, want_flash=True,
     # the apex precision gradient, resolved to a per-layer expert format
     moe_layers = [li for li in range(L) if li >= ND]
     edge = set(moe_layers[:expert_edge] + moe_layers[-expert_edge:]) if expert_edge else set()
+    # A layer's three expert matrices share one format (the manifest has one per
+    # layer), so a source that mixes them gets the widest of the three.
     expert_fmt = [0] * L
     for li in moe_layers:
-        expert_fmt[li] = FMT_Q80 if li in edge else FMT_Q40
+        pol = FMT_Q80 if li in edge else FMT_Q40
+        fs = {pick_fmt(S, n, pol) for n in expert_names(li, 0)}
+        expert_fmt[li] = FMT_Q80 if FMT_Q80 in fs else FMT_Q40
 
     # dense
     dn = Dense(os.path.join(dst, "dense.bin"))
     ALWAYS = FMT_Q80                          # attention / conv / dense MLP
-    emb = S.get("model.embed_tokens.weight")
-    dn.add("embed_tokens", emb, FMT_Q80 if embed_q8 else FMT_Q40)
-    dn.add("embedding_norm", S.get("model.embedding_norm.weight"), FMT_F32)
+
+    def w(oname, hfname, fmt):
+        f = pick_fmt(S, hfname, fmt)
+        b, O, I = encode(S, hfname, f)
+        dn.put(oname, b, f, O, I)
+
+    w("embed_tokens", "model.embed_tokens.weight", FMT_Q80 if embed_q8 else FMT_Q40)
+    w("embedding_norm", "model.embedding_norm.weight", FMT_F32)
+    emb = S.get("model.embed_tokens.weight") if want_flash else None
 
     # FlashHead, built from the same table before anything else needs it: the
     # clustering normalises `emb` in place, so this consumes it.
@@ -404,32 +638,32 @@ def build(src, dst, ctx, ram, expert_edge, embed_q8, verify, want_flash=True,
     for li in range(L):
         p = f"model.layers.{li}."
         o = f"layers.{li}."
-        dn.add(o + "operator_norm", S.get(p + "operator_norm.weight"), FMT_F32)
-        dn.add(o + "ffn_norm", S.get(p + "ffn_norm.weight"), FMT_F32)
+        w(o + "operator_norm", p + "operator_norm.weight", FMT_F32)
+        w(o + "ffn_norm", p + "ffn_norm.weight", FMT_F32)
 
         if cfg["layer_types"][li]:
-            dn.add(o + "q_proj", S.get(p + "self_attn.q_proj.weight"), ALWAYS)
-            dn.add(o + "k_proj", S.get(p + "self_attn.k_proj.weight"), ALWAYS)
-            dn.add(o + "v_proj", S.get(p + "self_attn.v_proj.weight"), ALWAYS)
-            dn.add(o + "o_proj", S.get(p + "self_attn.out_proj.weight"), ALWAYS)
-            dn.add(o + "q_norm", S.get(p + "self_attn.q_layernorm.weight"), FMT_F32)
-            dn.add(o + "k_norm", S.get(p + "self_attn.k_layernorm.weight"), FMT_F32)
+            w(o + "q_proj", p + "self_attn.q_proj.weight", ALWAYS)
+            w(o + "k_proj", p + "self_attn.k_proj.weight", ALWAYS)
+            w(o + "v_proj", p + "self_attn.v_proj.weight", ALWAYS)
+            w(o + "o_proj", p + "self_attn.out_proj.weight", ALWAYS)
+            w(o + "q_norm", p + "self_attn.q_layernorm.weight", FMT_F32)
+            w(o + "k_norm", p + "self_attn.k_layernorm.weight", FMT_F32)
         else:
-            dn.add(o + "conv_in", S.get(p + "conv.in_proj.weight"), ALWAYS)
+            w(o + "conv_in", p + "conv.in_proj.weight", ALWAYS)
             # [D,1,CL] -> [D,CL]; f32 because CL=3 is not a multiple of the block size
             dn.add(o + "conv_w",
                    np.ascontiguousarray(S.get(p + "conv.conv.weight")).reshape(D, CL),
                    FMT_F32)
-            dn.add(o + "conv_out", S.get(p + "conv.out_proj.weight"), ALWAYS)
+            w(o + "conv_out", p + "conv.out_proj.weight", ALWAYS)
 
         if li < ND:
-            dn.add(o + "mlp_gate", S.get(p + "feed_forward.w1.weight"), ALWAYS)
-            dn.add(o + "mlp_up", S.get(p + "feed_forward.w3.weight"), ALWAYS)
-            dn.add(o + "mlp_down", S.get(p + "feed_forward.w2.weight"), ALWAYS)
+            w(o + "mlp_gate", p + "feed_forward.w1.weight", ALWAYS)
+            w(o + "mlp_up", p + "feed_forward.w3.weight", ALWAYS)
+            w(o + "mlp_down", p + "feed_forward.w2.weight", ALWAYS)
         else:
             # f32: a routing error is not a small numeric error, it picks a
             # different expert entirely.
-            dn.add(o + "router", S.get(p + "feed_forward.gate.weight"), FMT_F32)
+            w(o + "router", p + "feed_forward.gate.weight", FMT_F32)
             bias = (S.get(p + "feed_forward.expert_bias") if cfg["use_expert_bias"]
                     else np.zeros(NE, np.float32))
             dn.add(o + "expert_bias", bias, FMT_F32)
@@ -451,12 +685,14 @@ def build(src, dst, ctx, ram, expert_edge, embed_q8, verify, want_flash=True,
         for li in moe_layers:
             f = expert_fmt[li]
             for e in range(NE):
-                q = f"model.layers.{li}.feed_forward.experts.{e}."
-                g = np.ascontiguousarray(S.get(q + "w1.weight"))
-                u = np.ascontiguousarray(S.get(q + "w3.weight"))
-                d = np.ascontiguousarray(S.get(q + "w2.weight"))
-                bg, bu, bd = quant_rows(f, g), quant_rows(f, u), quant_rows(f, d)
-                assert len(bg) == gb_l[li] and len(bd) == db_l[li]
+                if S.fmt_of(expert_names(li, e)[0]) is None:
+                    g, u, d = (np.ascontiguousarray(x) for x in expert_floats(S, li, e))
+                    bg, bu, bd = quant_rows(f, g), quant_rows(f, u), quant_rows(f, d)
+                else:
+                    bg, bu, bd = (encode(S, n, f)[0] for n in expert_names(li, e))
+                    if verify:
+                        g, u, d = (S.get(n) for n in expert_names(li, e))
+                assert len(bg) == gb_l[li] and len(bu) == gb_l[li] and len(bd) == db_l[li]
                 if verify:
                     worst = max(worst,
                                 float(np.abs(g - dequant_rows(f, bg, MI, D)).max()),
@@ -533,17 +769,25 @@ def main():
                          "the fraction Maple's shipped head uses)")
     ap.add_argument("--flash-iters", type=int, default=10,
                     help="k-means iterations for the FlashHead clustering")
+    ap.add_argument("--gguf", metavar="FILE",
+                    help="take the weights from this llama.cpp GGUF (arch lfm2moe) "
+                         "instead of src's safetensors; src still supplies config.json "
+                         "and the tokenizer. Q4_0/Q8_0 blocks are copied as they are, "
+                         "which is what LiquidAI's QAD-Q4_0 release wants")
+    ap.add_argument("--model-id", help="the id /v1/models reports (default: from "
+                    "the layer count, else the src directory name)")
     ap.add_argument("--fixture", action="store_true",
                     help="build a tiny random model for the oracle check")
     a = ap.parse_args()
     if a.fixture:
         build(None, a.dst, a.ctx, a.ram, a.expert_edge, a.embed_q8, a.verify,
-              a.flash, a.flash_probes, a.flash_iters, fixture=True)
+              a.flash, a.flash_probes, a.flash_iters, fixture=True,
+              model_id=a.model_id)
     else:
         if not a.src:
             ap.error("src is required unless --fixture")
         build(a.src, a.dst, a.ctx, a.ram, a.expert_edge, a.embed_q8, a.verify,
-              a.flash, a.flash_probes, a.flash_iters)
+              a.flash, a.flash_probes, a.flash_iters, gguf=a.gguf, model_id=a.model_id)
 
 
 if __name__ == "__main__":

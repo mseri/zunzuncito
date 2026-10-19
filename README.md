@@ -12,6 +12,7 @@ Ready-made containers and converted weights are published at [huggingface.co/mse
 |---|---|---|
 | `gemma4` | `gemma-4-26b-a4b` | Gemma-4 26B-A4B; 30 attention layers, 128 experts per layer, top-8 routing; MTP and DFlash drafting |
 | `lfm25` | `lfm2.5-8b-a1b` | LFM2.5-8B-A1B; 18 short-convolution layers plus 6 attention layers, 32 experts per layer; DSpark drafting |
+| `lfm25` | `lfm2.5-24b-a2b` | LFM2.5-24B-A2B; 30 short-convolution layers plus 10 attention layers, 64 experts per layer; same binary, shape read from the container |
 | `maple` | `maple-preview` | Maple-preview 20B-A1B; native ternary `tq2` weights, 256 experts per layer, sliding and full attention |
 | `ling` | `ling-3.0-tiny` | Ling-3.0-tiny 7.9B-A1.3B; 3:1 KDA/MLA mix, 128 routed experts plus one shared expert per layer, absorbed MLA cache |
 
@@ -72,6 +73,18 @@ python3 tools/convert_tokenizer.py /path/to/checkpoint/tokenizer.json ./g4-ct/to
 ```sh
 python3 tools/convert_lfm25.py /path/to/LFM2.5-8B-A1B ./lfm-ct --ram 4 --ctx 4096
 python3 tools/convert_lfm_tokenizer.py /path/to/LFM2.5-8B-A1B/tokenizer.json ./lfm-ct/tok.bin
+```
+
+The 24B-A2B converts the same way. LiquidAI also ships it as a QAD Q4_0 GGUF
+(quantisation-aware distilled: the weights are retrained to live on the Q4_0 grid).
+Pass it with `--gguf` to have its Q4_0 blocks copied into the container unchanged;
+the checkpoint directory then only needs `config.json` and `tokenizer.json`
+(`pip install gguf` first):
+
+```sh
+python3 tools/convert_lfm25.py /path/to/LFM2.5-24B-A2B ./lfm24-ct --ram 8 --ctx 4096 \
+    --gguf /path/to/LFM2.5-24B-A2B-QAD-Q4_0.gguf
+python3 tools/convert_lfm_tokenizer.py /path/to/LFM2.5-24B-A2B/tokenizer.json ./lfm24-ct/tok.bin
 ```
 
 ### Maple
@@ -186,7 +199,7 @@ Start the OpenAI server with `--serve`. It loads the model and offers the follow
 | `POST /v1/cancel` | Stops a generation in progress. |
 | `POST /v1/shutdown` | Stops the server cleanly. |
 
-`/v1/models` reports `gemma-4-26b-a4b`, `lfm2.5-8b-a1b`, `maple-preview`, or `ling-3.0-tiny`, according to the executable.
+`/v1/models` reports `gemma-4-26b-a4b`, `lfm2.5-8b-a1b` (or `lfm2.5-24b-a2b`), `maple-preview`, or `ling-3.0-tiny`, according to the executable and, for `lfm25`, the container.
 
 
 
