@@ -75,7 +75,20 @@ python3 tools/convert_lfm25.py /path/to/LFM2.5-8B-A1B ./lfm-ct --ram 4 --ctx 409
 python3 tools/convert_lfm_tokenizer.py /path/to/LFM2.5-8B-A1B/tokenizer.json ./lfm-ct/tok.bin
 ```
 
-The 24B-A2B converts the same way. LiquidAI also ships it as a QAD Q4_0 GGUF
+The 24B-A2B converts the same way, from the bf16 safetensors (either expert layout
+transformers writes):
+
+```sh
+python3 tools/convert_lfm25.py /path/to/LFM2.5-24B-A2B ./lfm24-ct --ram 8 --ctx 4096
+python3 tools/convert_lfm_tokenizer.py /path/to/LFM2.5-24B-A2B/tokenizer.json ./lfm24-ct/tok.bin
+```
+
+At 64 experts per layer the default `--expert-edge 2` costs more cache than on the 8B:
+slots are sized by the largest expert, so the four q8_0 layers halve the slots on every
+layer (at `--ram 4`, 8/64 instead of 17/64). `--expert-edge 0` trades that edge precision
+back for cache.
+
+LiquidAI also ships it as a QAD Q4_0 GGUF
 (quantisation-aware distilled: the weights are retrained to live on the Q4_0 grid).
 Pass it with `--gguf` to have its Q4_0 blocks copied into the container unchanged;
 the checkpoint directory then only needs `config.json` and `tokenizer.json`
